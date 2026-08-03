@@ -25,6 +25,71 @@ this copy.
 
 ---
 
+# Attention backend
+
+`MiniMaxH3SigmaShiftZi` also selects the attention backend for the H3 DiT, via
+an `attention_backend` widget (`sage` default, `comfy` for a baseline).
+
+That node already clones the MODEL and writes into
+`model_options["transformer_options"]`, which makes it the right seam: core's
+`wrap_attn` consults `optimized_attention_override` in the transformer_options
+it is handed, so the override reaches only models whose forward pass carries
+these options — the H3 DiT — and leaves every other model on the global default.
+No core modification, no second attention implementation to maintain.
+
+The override calls the backend's undecorated `__wrapped__` function, so it does
+not re-enter itself. Core's `wrap_attn` also injects an `_inside_attn_wrapper`
+guard that rides along into the impl, so Sage's own internal fallback to
+PyTorch does not re-trigger the override either.
+
+## Measured
+
+Synthetic benchmark at H3's real attention shape (56 heads x 128 dim,
+`skip_reshape=True`), RTX 4070, torch 2.10.0+cu130:
+
+| packed seq | comfy | sage | speedup | rel. error |
+| --- | --- | --- | --- | --- |
+| 9,394 (22f, as probed) | 44.5 ms | 25.0 ms | **1.78x** | 0.0105 |
+| 13,966 (22f hi-res) | 98.1 ms | 54.5 ms | **1.80x** | 0.0106 |
+| 37,000 (~5s / 124f) | 700.9 ms | 386.0 ms | **1.82x** | 0.0105 |
+
+Times are one attention call; a forward pass runs 50 of them. The ~1% relative
+error is expected — SageAttention quantizes Q/K to INT8.
+
+## Installing SageAttention
+
+`sageattention` is deliberately **not** in a `requirements.txt`. The suitable
+build depends on Python, Torch, CUDA and GPU architecture, and a wrong one is
+worse than none.
+
+Install a build compatible with the Python/Torch/CUDA environment running
+ComfyUI, then restart ComfyUI. On Windows, PyPI's `sageattention` (1.0.6) is
+Triton-based and needs a matching `triton-windows`:
+
+```bash
+pip install triton-windows==3.6.0.post26   # for torch 2.10
+pip install --no-deps sageattention==1.0.6
+```
+
+`--no-deps` keeps pip from touching your torch install. Verify with
+`tests/test_attention_backend.py`, which asserts Sage is actually selected and
+did *not* silently fall back.
+
+Selecting `sage` when it is unavailable **raises** rather than falling back
+silently — a silent fallback makes benchmarks untrustworthy. Note that core's
+`attention_sage` has its own *runtime* fallback if the kernel itself throws, so
+benchmark logs should still be checked for:
+
+```text
+Error running sage attention ... using pytorch attention instead
+```
+
+The attention probe composes with this: it records Q/K and then delegates to the
+original attention function with the same `transformer_options`, so the
+delegated call goes through the selected backend. Both are covered by tests.
+
+---
+
 # The attention probe
 
 **Status: stage 1 of the sparse-attention work.** The probe measures what a mask
@@ -203,7 +268,12 @@ statistics with synthetic Q/K whose attention target is known in advance:
 ```bash
 cd /path/to/ComfyUI
 python custom_nodes/ComfyUI-H3-Extended/tests/test_probe.py
+python custom_nodes/ComfyUI-H3-Extended/tests/test_attention_backend.py
 ```
+
+The backend test verifies routing with a registered stand-in (so it runs
+anywhere) and, when SageAttention and CUDA are present, additionally checks the
+real kernel's accuracy and that it did not silently fall back.
 
 ## Notes on the fork
 

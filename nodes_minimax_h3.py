@@ -13,6 +13,7 @@ sampling runs on the flat pack with any stock sampler (the model handles the
 audio stream's shifted schedule internally).
 """
 
+import logging
 import math
 
 import torch
@@ -24,6 +25,7 @@ import comfy.model_sampling
 import comfy.nested_tensor
 import comfy.utils
 import node_helpers
+from comfy.ldm.modules.attention import REGISTERED_ATTENTION_FUNCTIONS, get_attention_function
 from comfy_api.latest import ComfyExtension, io
 
 CANVAS_MULTIPLE = 32
@@ -341,6 +343,39 @@ class MiniMaxH3ReferenceToVideo(io.ComfyNode):
         return io.NodeOutput(cond, latent)
 
 
+def _set_h3_attention_backend(transformer_options, backend):
+    """Point H3's DiT attention at a specific backend, H3-scoped.
+
+    Core's `wrap_attn` consults `optimized_attention_override` in the
+    transformer_options it is handed, so writing the key here reaches only the
+    models whose forward pass carries these options - the H3 DiT - and leaves
+    every other model on the global default.
+    """
+    if backend == "comfy":
+        logging.info("[H3 Extended] Using Comfy default attention")
+        return
+
+    attention = get_attention_function(backend, default=None)
+    if attention is None:
+        raise RuntimeError(
+            "Attention backend '%s' is not available in the Python environment "
+            "running ComfyUI (registered: %s). Install a compatible build - for "
+            "'sage', a sageattention package matching this Python/Torch/CUDA - "
+            "or select 'comfy' as the attention backend." % (
+                backend, ", ".join(sorted(REGISTERED_ATTENTION_FUNCTIONS)) or "none"))
+
+    # Registered attention functions are themselves wrap_attn-decorated so they
+    # can honor an override; call the undecorated function so this override does
+    # not re-enter itself.
+    attention_impl = getattr(attention, "__wrapped__", attention)
+
+    def attention_override(_original, *args, **kwargs):
+        return attention_impl(*args, **kwargs)
+
+    transformer_options["optimized_attention_override"] = attention_override
+    logging.info("[H3 Extended] Using '%s' for H3 DiT attention", backend)
+
+
 class MiniMaxH3SigmaShift(io.ComfyNode):
     """Set the video/audio flow shifts coherently.
 
@@ -360,12 +395,22 @@ class MiniMaxH3SigmaShift(io.ComfyNode):
                 io.Model.Input("model"),
                 io.Float.Input("shift_video", default=12.0, min=0.01, max=100.0, step=0.01),
                 io.Float.Input("shift_audio", default=3.0, min=0.01, max=100.0, step=0.01),
+                io.Combo.Input(
+                    "attention_backend",
+                    options=["sage", "comfy"],
+                    default="sage",
+                    tooltip=(
+                        "Attention backend for the H3 DiT. SageAttention is faster dense "
+                        "attention when a compatible sageattention package is installed. "
+                        "Errors rather than falling back silently, so benchmarks stay honest."
+                    ),
+                ),
             ],
             outputs=[io.Model.Output()],
         )
 
     @classmethod
-    def execute(cls, model, shift_video, shift_audio) -> io.NodeOutput:
+    def execute(cls, model, shift_video, shift_audio, attention_backend="sage") -> io.NodeOutput:
         m = model.clone()
 
         class ModelSamplingAdvanced(comfy.model_sampling.ModelSamplingDiscreteFlow, comfy.model_sampling.CONST):
@@ -381,6 +426,7 @@ class MiniMaxH3SigmaShift(io.ComfyNode):
         to = m.model_options["transformer_options"] = m.model_options.get("transformer_options", {}).copy()
         to["minimax_h3_sigma_shift_video"] = shift_video
         to["minimax_h3_sigma_shift_audio"] = shift_audio
+        _set_h3_attention_backend(to, attention_backend)
         return io.NodeOutput(m)
 
 
