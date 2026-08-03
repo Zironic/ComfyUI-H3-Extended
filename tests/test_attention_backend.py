@@ -87,6 +87,15 @@ def main():
     finally:
         capture.uninstall()
 
+    print("explicit pytorch baseline")
+    to_pt = {}
+    _set_h3_attention_backend(to_pt, "pytorch")
+    check("optimized_attention_override" in to_pt,
+          "'pytorch' pins a dense baseline regardless of --use-sage-attention")
+    got_pt = A.optimized_attention(q, k, v, 4, mask=None, skip_reshape=True, transformer_options=to_pt)
+    check(torch.equal(got_pt, A.attention_pytorch(q, k, v, 4, mask=None, skip_reshape=True)),
+          "pinned pytorch matches attention_pytorch exactly")
+
     print("real sage backend")
     if "sage" not in A.REGISTERED_ATTENTION_FUNCTIONS:
         print("  SKIP: sageattention not installed in this environment")

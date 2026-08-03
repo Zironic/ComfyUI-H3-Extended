@@ -397,11 +397,13 @@ class MiniMaxH3SigmaShift(io.ComfyNode):
                 io.Float.Input("shift_audio", default=3.0, min=0.01, max=100.0, step=0.01),
                 io.Combo.Input(
                     "attention_backend",
-                    options=["sage", "comfy"],
+                    options=["sage", "comfy", "pytorch"],
                     default="sage",
                     tooltip=(
-                        "Attention backend for the H3 DiT. SageAttention is faster dense "
-                        "attention when a compatible sageattention package is installed. "
+                        "Attention backend for the H3 DiT. 'sage' is faster dense attention "
+                        "when a compatible sageattention package is installed. 'comfy' follows "
+                        "the global default, which --use-sage-attention makes Sage - so use "
+                        "'pytorch' for a guaranteed dense baseline regardless of launch flags. "
                         "Errors rather than falling back silently, so benchmarks stay honest."
                     ),
                 ),

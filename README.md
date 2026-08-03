@@ -28,7 +28,18 @@ this copy.
 # Attention backend
 
 `MiniMaxH3SigmaShiftZi` also selects the attention backend for the H3 DiT, via
-an `attention_backend` widget (`sage` default, `comfy` for a baseline).
+an `attention_backend` widget:
+
+| option | meaning |
+| --- | --- |
+| `sage` (default) | SageAttention, error if unavailable |
+| `comfy` | whatever the global default is |
+| `pytorch` | pinned dense baseline |
+
+Note that `comfy` is **not** a reliable baseline: launching with
+`--use-sage-attention` sets `optimized_attention = attention_sage` globally, so
+`comfy` then means Sage too and an A/B against it compares Sage with Sage. Use
+`pytorch` for a baseline that holds regardless of launch flags.
 
 That node already clones the MODEL and writes into
 `model_options["transformer_options"]`, which makes it the right seam: core's
