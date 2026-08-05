@@ -9,6 +9,7 @@ except ImportError:
 
 from .attention import ATTENTION_MODES, FALLBACK_MODES, resolve_attention
 from .config import ACTIVATION_MODES, MemoryOptimizerConfig
+from .cuda_pool import configure_cuda_async_soft_gc
 from .patch import apply
 
 
@@ -24,7 +25,10 @@ class MiniMaxH3MemoryOptimizer(io.ComfyNode):
                 "Sage path on SageAttention-supported NVIDIA SM80, SM86, SM89, "
                 "SM90, SM120, or SM121 devices. Unsupported architectures or "
                 "incomplete Sage builds preserve the incoming attention backend. "
-                "BF16 MLP chunking remains available on fallback systems."
+                "BF16 MLP chunking remains available on fallback systems. An "
+                "optional cudaMallocAsync soft-GC policy can discourage the CUDA "
+                "pool from retaining an obsolete high-water footprint without "
+                "setting a hard allocation limit."
             ),
             inputs=[
                 io.Model.Input("model"),
@@ -88,6 +92,30 @@ class MiniMaxH3MemoryOptimizer(io.ComfyNode):
                         "the portable default and permits same-graph fallbacks."
                     ),
                 ),
+                io.Boolean.Input(
+                    "cuda_async_soft_gc",
+                    default=False,
+                    tooltip=(
+                        "When PyTorch uses cudaMallocAsync, replace its unlimited "
+                        "default-pool retention policy with the soft threshold below. "
+                        "CUDA may still grow above the threshold when live demand "
+                        "requires it. This does not set a hard VRAM limit, empty the "
+                        "cache, trim the pool, or intentionally cause an early OOM."
+                    ),
+                ),
+                io.Float.Input(
+                    "cuda_async_release_threshold_gib",
+                    default=11.0,
+                    min=0.25,
+                    max=256.0,
+                    step=0.25,
+                    tooltip=(
+                        "Soft amount of backing memory the cudaMallocAsync default "
+                        "pool should retain before trying to return excess memory "
+                        "on a later CUDA synchronization. Ignored when soft GC is "
+                        "off or the allocator backend is not cudaMallocAsync."
+                    ),
+                ),
             ],
             outputs=[io.Model.Output()],
         )
@@ -103,6 +131,8 @@ class MiniMaxH3MemoryOptimizer(io.ComfyNode):
         chunk_rows=DEFAULT_CHUNK_ROWS,
         prefer_held_weights=True,
         activation_strict=False,
+        cuda_async_soft_gc=False,
+        cuda_async_release_threshold_gib=11.0,
     ):
         if not enabled:
             return io.NodeOutput(model)
@@ -114,14 +144,27 @@ class MiniMaxH3MemoryOptimizer(io.ComfyNode):
             chunk_rows=int(chunk_rows),
             prefer_held_weights=bool(prefer_held_weights),
             activation_strict=bool(activation_strict),
+            cuda_async_soft_gc=bool(cuda_async_soft_gc),
+            cuda_async_release_threshold_gib=float(
+                cuda_async_release_threshold_gib
+            ),
         )
 
+        pool_policy = configure_cuda_async_soft_gc(
+            config.cuda_async_soft_gc,
+            config.cuda_async_release_threshold_gib,
+        )
         decision = resolve_attention(
             config.attention,
             config.attention_fallback,
         )
         patched = model.clone()
-        apply(patched, config=config, decision=decision)
+        apply(
+            patched,
+            config=config,
+            decision=decision,
+            pool_policy=pool_policy,
+        )
         return io.NodeOutput(patched)
 
 
