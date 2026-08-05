@@ -1,17 +1,10 @@
-"""Run directory, manifest and asset reuse.
+"""Run directory, manifest and asset persistence for the Ref2V harness.
 
-The expensive thing in this harness is Chunk A: one full sampling run plus a
-decode, and every Chunk B experiment shares it. Adding a ninth experiment six
-weeks from now must not regenerate it, so Chunk A is keyed on the things that
-actually determine it - source frames, prompt, static references, canvas,
-geometry, seed, sampler, sigmas, checkpoint - and on nothing else.
-
-Chunk B experiment settings deliberately do *not* enter that key. Changing the
-suite, adding an arm, or switching a position policy leaves Chunk A valid.
-
-Assets are safetensors written through a `.tmp` + `os.replace`, so a run killed
-mid-write leaves a temp file nothing will ever read rather than a half-file that
-loads and quietly poisons the comparison.
+Chunk A can be explicitly reused through the node's `reuse_run` input. Automatic
+identity-based reuse is disabled by default because a trustworthy identity must
+include checkpoint, CLIP, VAE, model patches and sampler options; Python class
+names are not sufficient provenance. Set `H3_HARNESS_AUTO_REUSE=1` only when the
+operator deliberately accepts that limitation.
 """
 
 import hashlib
@@ -26,6 +19,7 @@ import comfy.utils
 
 LOG_PREFIX = "[H3 Extended] harness"
 MANIFEST_VERSION = 2
+AUTO_REUSE_ENV = "H3_HARNESS_AUTO_REUSE"
 
 
 def _hash_tensor(h, tensor):
@@ -47,13 +41,14 @@ def _hash_value(h, value):
 
 def chunk_a_identity(*, source_frames, prompt, ref_pixels, canvas, geometry,
                      seed, sampler_name, sigmas, checkpoint):
-    """Digest of everything that determines Chunk A.
+    """Best-effort digest of the inputs represented by the current node API.
 
-    Deliberately hashes the source *frames used*, not the whole input video: a
-    longer source that starts identically still yields the same Chunk A.
+    This remains useful for validating an explicitly selected `reuse_run`, but
+    it is not strong enough to authorize automatic reuse across arbitrary model
+    changes. See `find_reusable_run`.
     """
     h = hashlib.blake2b(digest_size=16)
-    h.update(b"h3-ref2v-harness-chunk-a-v2")
+    h.update(b"h3-ref2v-harness-chunk-a-v3")
     _hash_tensor(h, source_frames)
     _hash_value(h, prompt)
     for pixels in ref_pixels or []:
@@ -68,8 +63,6 @@ def chunk_a_identity(*, source_frames, prompt, ref_pixels, canvas, geometry,
 
 
 class RunStore:
-    """One `<output>/h3_ref2v_harness/<run_id>/` directory."""
-
     def __init__(self, root, run_id):
         self.root = os.path.join(root, run_id)
         self.run_id = run_id
@@ -80,8 +73,6 @@ class RunStore:
             os.makedirs(path, exist_ok=True)
         self.manifest_path = os.path.join(self.root, "manifest.json")
         self.manifest = self._read_manifest()
-
-    # --- manifest -------------------------------------------------------
 
     def _read_manifest(self):
         try:
@@ -116,13 +107,10 @@ class RunStore:
     def write_text(self, name, text):
         self._atomic_write(os.path.join(self.root, name), text)
 
-    # --- tensors --------------------------------------------------------
-
     def _asset_path(self, group, name):
         return os.path.join(getattr(self, group), name + ".safetensors")
 
     def save_tensors(self, group, name, tensors, identity=None):
-        """Store a dict of CPU tensors, recording the identity it belongs to."""
         path = self._asset_path(group, name)
         payload = {k: v.detach().to("cpu").contiguous()
                    for k, v in tensors.items() if v is not None}
@@ -133,7 +121,7 @@ class RunStore:
         except Exception:
             _unlink(tmp)
             raise
-        self.manifest.setdefault("assets", {})[("%s/%s" % (group, name))] = {
+        self.manifest.setdefault("assets", {})["%s/%s" % (group, name)] = {
             "identity": identity,
             "stored": time.time(),
             "keys": sorted(payload),
@@ -141,17 +129,11 @@ class RunStore:
         return path
 
     def load_tensors(self, group, name, identity=None):
-        """Return the stored dict, or None on a miss, a mismatch or corruption.
-
-        A corrupt asset returns None rather than raising: the harness can always
-        regenerate it, and a run that dies loading its own cache is strictly
-        worse than one that spends the time again.
-        """
         record = self.manifest.get("assets", {}).get("%s/%s" % (group, name))
         if record is None:
             return None
         if identity is not None and record.get("identity") != identity:
-            logging.info("%s asset %s/%s belongs to a different run identity - ignoring",
+            logging.info("%s asset %s/%s belongs to a different identity - ignoring",
                          LOG_PREFIX, group, name)
             return None
         path = self._asset_path(group, name)
@@ -172,8 +154,6 @@ class RunStore:
         prefix = group + "/"
         for key in [k for k in self.manifest.get("assets", {}) if k.startswith(prefix)]:
             self.invalidate(*key.split("/", 1))
-
-    # --- experiment output ----------------------------------------------
 
     def experiment_dir(self, experiment_id):
         path = os.path.join(self.experiments, experiment_id)
@@ -202,7 +182,6 @@ def _unlink(path):
 
 
 def save_frames(directory, frames, prefix="frame", limit=None):
-    """Write an IMAGE batch as PNGs. Lossless, because later chunks read them."""
     from PIL import Image
     import numpy as np
 
@@ -231,8 +210,15 @@ def new_run_id(identity):
     return "%s_%s" % (time.strftime("%Y%m%d_%H%M%S"), identity[:8])
 
 
+def _auto_reuse_enabled():
+    return os.environ.get(AUTO_REUSE_ENV, "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
 def find_reusable_run(root, identity):
-    """The most recent run directory whose Chunk A matches `identity`."""
+    """Return a matching run only when automatic reuse is explicitly enabled."""
+    if not _auto_reuse_enabled():
+        return None
     if not os.path.isdir(root):
         return None
     candidates = []

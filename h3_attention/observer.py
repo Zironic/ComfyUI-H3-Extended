@@ -1,45 +1,29 @@
 """Shared observation seam for H3 attention.
 
-Instrumentation used to hang off the module-global `optimized_attention` name in
-`comfy.ldm.minimax.model`, which works only while every attention call goes
-through that binding. A custom block forward does not - it calls its backend
-directly - so the probe would go dark the moment one is installed.
-
-This module is the seam both paths publish to instead:
-
-    legacy adapter (h3_probe.capture)  -> notify_attention(..., layer_index=None)
-    H3 block forward (h3_attention)    -> notify_attention(..., layer_index=i)
-
-Observers live in `transformer_options` rather than a module global, so their
-lifetime is exactly the diffusion-model invocation that installed them and
-concurrent runs cannot see each other's.
-
-Q and K arrive post-RMSNorm and post-RoPE in HND layout, `[batch, heads, seq,
-dim]` - what the probe already expects. A backend holding NHD tensors should
-pass `.transpose(1, 2)` views; that is free and copies nothing.
+Observers live in ``transformer_options`` so their lifetime is the current
+model invocation. The custom block forward supplies explicit layer indices;
+the legacy module-global adapter supplies ``None`` and counts calls.
 """
 
 import contextlib
 import logging
 
 OBSERVER_KEY = "minimax_h3_attention_observers"
+OBSERVED_KEY = "minimax_h3_attention_already_observed"
 
 
 def notify_attention(q, k, *, layer_index, transformer_options):
-    """Publish one attention call to whatever observers are installed.
-
-    `layer_index` is the DiT block index when the caller knows it, or None when
-    it does not and the observer should fall back to counting calls.
-
-    Observation is instrumentation: a failing observer is logged and skipped, it
-    never interrupts inference. The no-observer path is a dict lookup.
-    """
+    """Publish one attention call without allowing instrumentation to fail inference."""
     if not transformer_options:
+        return
+    # A custom forward already notified observers before entering a legacy
+    # attention adapter. Suppress only that adapter's anonymous observation.
+    if layer_index is None and transformer_options.get(OBSERVED_KEY):
         return
     observers = transformer_options.get(OBSERVER_KEY)
     if not observers:
         return
-    for observer in observers:
+    for observer in tuple(observers):
         try:
             observer(q, k, layer_index)
         except Exception:
@@ -48,11 +32,7 @@ def notify_attention(q, k, *, layer_index, transformer_options):
 
 @contextlib.contextmanager
 def observing(transformer_options, observer):
-    """Install `observer` for the duration of the block, then restore.
-
-    Rebinds the list rather than mutating in place so a nested or concurrent
-    invocation that captured the previous list is unaffected.
-    """
+    """Append an observer for one invocation, restoring the previous value."""
     previous = transformer_options.get(OBSERVER_KEY)
     transformer_options[OBSERVER_KEY] = list(previous or ()) + [observer]
     try:
@@ -62,3 +42,17 @@ def observing(transformer_options, observer):
             transformer_options.pop(OBSERVER_KEY, None)
         else:
             transformer_options[OBSERVER_KEY] = previous
+
+
+@contextlib.contextmanager
+def marked_observed(transformer_options):
+    """Mark that the H3-owned forward already emitted the observer event."""
+    previous = transformer_options.get(OBSERVED_KEY)
+    transformer_options[OBSERVED_KEY] = True
+    try:
+        yield
+    finally:
+        if previous is None:
+            transformer_options.pop(OBSERVED_KEY, None)
+        else:
+            transformer_options[OBSERVED_KEY] = previous

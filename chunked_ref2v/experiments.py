@@ -6,7 +6,8 @@ that is the whole description of an arm - the runner reads nothing else.
 
 from dataclasses import dataclass
 
-from .strategies import get_strategy
+from . import prompts
+from .strategies import StrategyDependencies, get_strategy
 
 PROMPT_POLICIES = ("original", "keyframe_completion", "video2", "composite")
 POSITION_POLICIES = ("copy_target", "stock", "none")
@@ -32,7 +33,17 @@ class ExperimentSpec:
         return get_strategy(self.carry_strategy)
 
     def dependencies(self):
-        return self.strategy().dependencies()
+        """Everything this arm needs before Chunk B can be sampled.
+
+        Prompt variants are dependencies in their own right. A direct-latent
+        strategy normally needs no dynamic Qwen pass, but the same strategy with
+        `keyframe_completion` does. Keeping that fact here prevents the runner
+        from silently falling back to the original prompt conditioning.
+        """
+        deps = self.strategy().dependencies()
+        if prompts.encode_key(self.prompt_policy) not in ("chunk_a", "chunk_b"):
+            deps = deps.union(StrategyDependencies(needs_dynamic_qwen=True))
+        return deps
 
     def as_dict(self):
         return {
@@ -238,8 +249,6 @@ def resolve_suite(suite, custom_experiments=""):
 
 def union_dependencies(experiment_ids):
     """Everything Phase D must prepare for the selected experiments, combined."""
-    from .strategies import StrategyDependencies
-
     deps = StrategyDependencies()
     for experiment_id in experiment_ids:
         deps = deps.union(CATALOG[experiment_id].dependencies())
