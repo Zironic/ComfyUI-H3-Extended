@@ -1,8 +1,19 @@
-"""H3-owned attention: observation seam, block forward, and backends.
+"""H3-owned attention observation, forward patching, and efficient Sage backend."""
 
-See PLAN.md for scope and the measurement that gates the kernel work.
-"""
+from .observer import (
+    OBSERVER_KEY,
+    OBSERVED_KEY,
+    notify_attention,
+    observing,
+    marked_observed,
+)
+from .sage_mem_eff import SM89SageMemoryEfficientBackend
 
-from .observer import OBSERVER_KEY, notify_attention, observing
-
-__all__ = ["OBSERVER_KEY", "notify_attention", "observing"]
+__all__ = [
+    "OBSERVER_KEY",
+    "OBSERVED_KEY",
+    "notify_attention",
+    "observing",
+    "marked_observed",
+    "SM89SageMemoryEfficientBackend",
+]
