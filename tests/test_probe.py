@@ -18,6 +18,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(_HERE))                       # the package
 sys.path.insert(0, os.path.abspath(os.path.join(_HERE, "..", "..", "..")))  # ComfyUI root
 
+from h3_attention.observer import OBSERVER_KEY, notify_attention, observing  # noqa: E402
 from h3_probe import capture, layout as h3_layout, metrics  # noqa: E402
 
 TEXT_LEN = 50
@@ -168,13 +169,95 @@ def test_patch():
 
     torch.manual_seed(0)
     q, k, v = (torch.randn(1, 2, 64, 16) for _ in range(3))
-    check(getattr(capture._active, "probe", None) is None, "no probe armed outside a run")
     got = mm.optimized_attention(q, k, v, 2, mask=None, skip_reshape=True)
     want = original(q, k, v, 2, mask=None, skip_reshape=True)
     check(torch.equal(got, want), "idle probe delegates bit-identically")
 
+    # no transformer_options at all is the token-refiner / bare-call shape
+    got = mm.optimized_attention(q, k, v, 2, mask=None, skip_reshape=True,
+                                 transformer_options={})
+    check(torch.equal(got, want), "empty transformer_options delegates bit-identically")
+
     capture.uninstall()
     check(mm.optimized_attention is original, "uninstall restores the original binding")
+
+
+def test_observer_seam():
+    """Both attention paths must reach the probe through one seam."""
+    print("observer seam")
+    seen = []
+
+    def observer(q, k, layer_index):
+        seen.append((tuple(q.shape), layer_index))
+
+    to = {}
+    check(OBSERVER_KEY not in to, "no observer key before install")
+    notify_attention(torch.zeros(1, 2, 4, 8), torch.zeros(1, 2, 4, 8),
+                     layer_index=3, transformer_options=to)
+    check(seen == [], "notify with no observers installed is a no-op")
+
+    with observing(to, observer):
+        check(len(to[OBSERVER_KEY]) == 1, "observer installed into transformer_options")
+        notify_attention(torch.zeros(1, 2, 4, 8), torch.zeros(1, 2, 4, 8),
+                         layer_index=7, transformer_options=to)
+    check(OBSERVER_KEY not in to, "observing() removes the key it added")
+    check(seen == [((1, 2, 4, 8), 7)], "observer received shape and explicit layer index")
+
+    # a failing observer must not reach the caller
+    def boom(q, k, layer_index):
+        raise RuntimeError("observer blew up")
+
+    with observing(to, boom):
+        notify_attention(torch.zeros(1, 2, 4, 8), torch.zeros(1, 2, 4, 8),
+                         layer_index=0, transformer_options=to)
+    check(True, "observer exception is isolated from inference")
+
+    # nesting restores the outer list rather than clearing it
+    with observing(to, observer):
+        with observing(to, boom):
+            check(len(to[OBSERVER_KEY]) == 2, "nested observers stack")
+        check(len(to[OBSERVER_KEY]) == 1, "inner observer removed, outer retained")
+
+
+def test_layer_attribution(lay):
+    """Counted and explicit layer identification, and no double capture."""
+    print("layer attribution")
+
+    class FakeRun:
+        def __init__(self, layers):
+            self.layers = layers
+            self.records = []
+            self.n_time, self.n_spatial, self.block = 1, 1, 32
+            self.include_audio, self.include_text = False, False
+
+    seq = lay.seq_len
+    q = torch.zeros(1, HEADS, seq, DIM)
+    k = torch.zeros(1, HEADS, seq, DIM)
+    short = torch.zeros(1, HEADS, 8, DIM)
+
+    # counted: layer index comes from call order, refiner calls do not advance it
+    probe = capture.ForwardProbe(FakeRun({2}), lay, step=0, sigma=1.0, cond_or_uncond=0)
+    for _ in range(5):
+        probe.observe(short, short)                    # token refiner, wrong seq_len
+    check(probe.layer == -1, "short-sequence calls never advance the layer counter")
+    for _ in range(4):
+        probe.observe(q, k)
+    check(probe.layer == 3, "counted path advances once per full-sequence call")
+    check([r["layer"] for r in probe.run.records] == [2], "only the selected layer recorded")
+
+    # explicit: the block index is taken from the caller, not the call order
+    probe = capture.ForwardProbe(FakeRun({0, 49}), lay, step=0, sigma=1.0, cond_or_uncond=0)
+    probe.observe(q, k, layer_index=49)
+    probe.observe(q, k, layer_index=0)
+    check([r["layer"] for r in probe.run.records] == [49, 0],
+          "explicit indices are recorded as given, out of order")
+    check(probe.layer == -1, "explicit path leaves the counter untouched")
+
+    # once a caller identifies itself, counted observations are ignored
+    probe = capture.ForwardProbe(FakeRun({0, 1}), lay, step=0, sigma=1.0, cond_or_uncond=0)
+    probe.observe(q, k, layer_index=0)
+    probe.observe(q, k)                                 # would be counted layer 0 -> duplicate
+    check([r["layer"] for r in probe.run.records] == [0], "no double capture of the same layer")
 
 
 def main():
@@ -184,6 +267,8 @@ def main():
     stats = test_block_stats(lay)
     test_metrics(lay, stats)
     test_patch()
+    test_observer_seam()
+    test_layer_attribution(lay)
     print("\nall probe self-tests passed")
 
 

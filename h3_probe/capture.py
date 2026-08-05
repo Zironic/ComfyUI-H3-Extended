@@ -1,9 +1,12 @@
 """Selective attention instrumentation for MiniMax H3.
 
-Interception point is the module-global `optimized_attention` name inside
-`comfy.ldm.minimax.model`, so the patch is H3-scoped by construction: no other
-architecture resolves attention through that binding. When no probe is armed the
-patched function is a straight delegation, so normal inference is unaffected.
+Captures reach the probe through `h3_attention.observer`, which both attention
+paths publish to: the module-global `optimized_attention` binding inside
+`comfy.ldm.minimax.model` (used by the `sage`/`comfy`/`pytorch` backends), and any
+backend that owns the H3 block forward outright. The module-global patch is
+H3-scoped by construction - no other architecture resolves attention through that
+binding - and when no probe is armed it is a straight delegation, so normal
+inference is unaffected.
 
 For each *selected* (layer, step, query block) the probe computes that block's
 exact dense attention against all keys, reduces the softmax rows to their mean
@@ -21,16 +24,19 @@ head chunk at a time exist transiently.
 import logging
 import math
 import os
-import threading
 
 import torch
 
 from . import layout as h3_layout
 
+try:                                                    # loaded as a custom node
+    from ..h3_attention.observer import notify_attention, observing
+except ImportError:                                     # tests put the package dir on sys.path
+    from h3_attention.observer import notify_attention, observing
+
 BLOCK = 128
 HEAD_CHUNK = 4
 
-_active = threading.local()
 _orig_attention = None
 
 _KINDS = (h3_layout.KIND_TEXT, h3_layout.KIND_COND, h3_layout.KIND_REF_IMG,
@@ -176,14 +182,35 @@ class ForwardProbe:
         self.cond_or_uncond = cond_or_uncond
         self.layer = -1
         self.queries = None
+        self.explicit = False
 
-    def observe(self, q, k):
+    def observe(self, q, k, layer_index=None):
+        """Record one attention call.
+
+        `layer_index` is supplied by a backend that owns the block forward and so
+        knows which block it is in. Without one the layer is inferred by counting
+        full-sequence calls, which is all the module-global interception can do.
+
+        Once any caller has identified itself explicitly, counted observations are
+        ignored: a backend that both patched the block forward and fell through to
+        the module-global path would otherwise record the same layer twice, and
+        the counter would no longer mean anything either.
+        """
         # the token refiner shares this attention path but runs on the text span
         # alone; only full packed-sequence calls are DiT layers
         if q.shape[2] != self.layout.seq_len:
             return
-        self.layer += 1
-        if self.layer not in self.run.layers:
+
+        if layer_index is None:
+            if self.explicit:
+                return
+            self.layer += 1
+            layer = self.layer
+        else:
+            self.explicit = True
+            layer = layer_index
+
+        if layer not in self.run.layers:
             return
         if self.queries is None:
             self.queries = select_query_blocks(
@@ -193,19 +220,21 @@ class ForwardProbe:
             stats = _block_stats(q, k, self.layout, spec["start"], spec["stop"], self.run.block)
             rec = dict(spec)
             rec.update(stats)
-            rec.update({"layer": self.layer, "step": self.step, "sigma": self.sigma,
+            rec.update({"layer": layer, "step": self.step, "sigma": self.sigma,
                         "cond_or_uncond": self.cond_or_uncond})
             self.run.records.append(rec)
 
 
 def _probed_attention(q, k, v, heads, *args, **kwargs):
-    state = getattr(_active, "probe", None)
-    if state is not None:
-        try:
-            with torch.no_grad():
-                state.observe(q, k)
-        except Exception:
-            logging.exception("[H3 probe] capture failed; continuing inference")
+    """Legacy adapter: the module-global path cannot name its own layer.
+
+    Kept because `sage`, `comfy` and `pytorch` still reach attention through this
+    binding. A backend owning the block forward publishes to the same observers
+    directly and supplies a real block index.
+    """
+    with torch.no_grad():
+        notify_attention(q, k, layer_index=None,
+                         transformer_options=kwargs.get("transformer_options"))
     return _orig_attention(q, k, v, heads, *args, **kwargs)
 
 
@@ -375,11 +404,11 @@ def make_wrapper(session):
         if not armed:
             return executor(*args, **kwargs)
 
-        _active.probe = ForwardProbe(run, layout, step, sigma, cond_or_uncond)
+        probe = ForwardProbe(run, layout, step, sigma, cond_or_uncond)
         try:
-            return executor(*args, **kwargs)
+            with observing(transformer_options, probe.observe):
+                return executor(*args, **kwargs)
         finally:
-            _active.probe = None
             try:
                 from .report import write_run
                 write_run(run)
