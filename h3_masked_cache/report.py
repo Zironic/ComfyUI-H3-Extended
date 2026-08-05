@@ -1,17 +1,4 @@
-"""Persistence for masked-cache measurement runs.
-
-    output/h3_masked_cache/<run_tag>_<timestamp>/
-    |-- summary.json    run metadata, config, per-step rows, aggregate sweep
-    |-- steps.jsonl     one line per observed forward, append-friendly
-    |-- mask.npz        token score maps and expanded masks, compressed
-    `-- report.txt      the same thing, readable
-
-No pickles: the score maps are the evidence a threshold gets chosen from, and
-they have to be loadable a year from now by something that is not this code.
-
-Rewritten in full after every observed forward, so a cancelled or OOM-killed run
-still leaves everything it had measured up to that point.
-"""
+"""Persistence and summaries for masked-cache measurement runs."""
 
 import json
 import os
@@ -25,21 +12,7 @@ def _pct(x):
     return "  n/a " if x is None else "%5.1f%%" % (100.0 * x)
 
 
-# --------------------------------------------------------------------------
-# aggregation
-# --------------------------------------------------------------------------
-
 def aggregate(run):
-    """Run-level answers to the Stage 0 gate questions.
-
-    Three numbers decide whether compaction is worth building:
-
-    * how small the mask gets (`active_expanded` at the end of the run);
-    * how stable consecutive masks are (`jaccard`);
-    * how much of a late mask escapes the *union of everything seen so far*
-      (`escaped_union`) - the direct measure of what freezing an early mask
-      would lose.
-    """
     steps = run.steps
     if not steps:
         return None
@@ -48,11 +21,12 @@ def aggregate(run):
         return [s[key] for s in steps if s.get(key) is not None]
 
     jac = series("jaccard_prev")
-    esc = series("escaped_union")
+    esc_union = series("escaped_union")
+    esc_frozen = series("escaped_frozen")
+    missed_mass = series("missed_score_mass_frozen")
     core = series("active_core")
     expanded = series("active_expanded")
 
-    # sweep averaged over steps, so one threshold can be read off the whole run
     sweep = []
     for i, thr in enumerate(THRESHOLD_SWEEP):
         vals_core = [s["threshold_sweep"][i]["active_core"] for s in steps]
@@ -68,45 +42,51 @@ def aggregate(run):
     return {
         "observed_forwards": len(steps),
         "distinct_sigmas": run.sigma_count,
+        "warmup_steps": run.config.warmup_steps,
+        "frozen_active": (float(run.frozen_mask.float().mean().item())
+                          if run.frozen_mask is not None else None),
         "active_core": {"first": core[0], "last": core[-1], "min": min(core), "max": max(core)},
         "active_expanded": {"first": expanded[0], "last": expanded[-1],
                             "min": min(expanded), "max": max(expanded)},
         "jaccard_consecutive": {"min": min(jac), "mean": sum(jac) / len(jac)} if jac else None,
-        "escaped_union": {"max": max(esc), "mean": sum(esc) / len(esc)} if esc else None,
+        "escaped_running_union": ({"max": max(esc_union), "mean": sum(esc_union) / len(esc_union)}
+                                  if esc_union else None),
+        "escaped_frozen": ({"max": max(esc_frozen), "mean": sum(esc_frozen) / len(esc_frozen)}
+                           if esc_frozen else None),
+        "missed_score_mass_frozen": ({"max": max(missed_mass), "mean": sum(missed_mass) / len(missed_mass)}
+                                     if missed_mass else None),
         "union_active": (float(run.union_mask.float().mean().item())
                          if run.union_mask is not None else None),
+        "final": run.final,
         "threshold_sweep": sweep,
     }
 
 
-# --------------------------------------------------------------------------
-# rendering
-# --------------------------------------------------------------------------
-
 def render(run, summary):
     cfg = run.config
     layout = run.layout
-    lines = []
-    lines.append("MiniMax H3 masked Ref2V - measurement - %s" % run.tag)
-    lines.append("=" * 78)
-    lines.append("mode:        %s (strict=%s)" % (cfg.mode, cfg.strict))
-    lines.append("source:      %s" % (run.source.describe() if run.source else "n/a"))
-    lines.append("layout:      %s" % (layout.describe() if layout else "n/a"))
+    lines = [
+        "MiniMax H3 masked Ref2V - measurement - %s" % run.tag,
+        "=" * 78,
+        "mode:        %s (strict=%s)" % (cfg.mode, cfg.strict),
+        "source:      %s" % (run.source.describe() if run.source else "n/a"),
+        "layout:      %s" % (layout.describe() if layout else "n/a"),
+    ]
     if layout:
         t, ph, pw = layout.video_shape
         lines.append("token grid:  t=%d %dx%d = %d target-video rows of %d packed"
                      % (t, ph, pw, t * ph * pw, layout.seq_len))
-    lines.append("threshold:   %.4g (absolute floor %.3g)" % (cfg.score_threshold,
-                                                              cfg.score_absolute_floor))
-    lines.append("tiles:       %dx%d tokens, spatial halo %d tiles, temporal halo %d frames"
-                 % (cfg.tile_h, cfg.tile_w, cfg.spatial_halo, cfg.temporal_halo))
+    lines.extend([
+        "threshold:   %.4g (absolute floor %.3g)" % (cfg.score_threshold, cfg.score_absolute_floor),
+        "tiles:       %dx%d tokens, spatial halo %d tiles, temporal halo %d frames"
+        % (cfg.tile_h, cfg.tile_w, cfg.spatial_halo, cfg.temporal_halo),
+        "warmup:      %d guided predictions; frozen mask never grows afterwards"
+        % cfg.warmup_steps,
+    ])
     for k, v in sorted(run.notes.items()):
         lines.append("%-18s %s" % (k + ":", v))
     if run.disabled_reason:
-        lines.append("")
-        lines.append("!! MEASUREMENT DISABLED: %s" % run.disabled_reason)
-        lines.append("!! the rows below, if any, stop at that point - this is not a "
-                     "complete observation of the run")
+        lines.extend(["", "!! MEASUREMENT DISABLED: %s" % run.disabled_reason])
     if run.fallbacks:
         lines.append("")
         lines.append("fallbacks:")
@@ -115,46 +95,46 @@ def render(run, summary):
     lines.append("")
 
     if summary:
-        lines.append("SUMMARY")
-        lines.append("-" * 78)
-        lines.append("  observed forwards:      %d over %d distinct sigmas"
+        lines.extend(["SUMMARY", "-" * 78])
+        lines.append("  observed guided predictions: %d over %d distinct sigmas"
                      % (summary["observed_forwards"], summary["distinct_sigmas"]))
-        a = summary["active_core"]
-        lines.append("  active (threshold only):  first %s  last %s  max %s"
-                     % (_pct(a["first"]), _pct(a["last"]), _pct(a["max"])))
+        lines.append("  frozen after warmup:          %s" % _pct(summary["frozen_active"]))
         a = summary["active_expanded"]
-        lines.append("  active (tiles + halo):    first %s  last %s  max %s"
+        lines.append("  active (tiles + halo):        first %s  last %s  max %s"
                      % (_pct(a["first"]), _pct(a["last"]), _pct(a["max"])))
-        lines.append("  union over the run:       %s" % _pct(summary["union_active"]))
-        if summary["jaccard_consecutive"]:
-            j = summary["jaccard_consecutive"]
-            lines.append("  mask stability (J):       min %.3f  mean %.3f" % (j["min"], j["mean"]))
-        if summary["escaped_union"]:
-            e = summary["escaped_union"]
-            lines.append("  escaped the running union: max %s  mean %s"
+        if summary["escaped_frozen"]:
+            e = summary["escaped_frozen"]
+            lines.append("  escaped immutable frozen mask: max %s  mean %s"
                          % (_pct(e["max"]), _pct(e["mean"])))
-            lines.append("    (share of a step's active tokens that no earlier step covered -")
-            lines.append("     this is what freezing an early mask would miss)")
-        lines.append("")
-        lines.append("  THRESHOLD SWEEP (mean over observed forwards)")
-        lines.append("    threshold   active core        active after tiles+halo")
+        if summary["missed_score_mass_frozen"]:
+            e = summary["missed_score_mass_frozen"]
+            lines.append("  score mass outside frozen:     max %s  mean %s"
+                         % (_pct(e["max"]), _pct(e["mean"])))
+        if summary["final"]:
+            f = summary["final"]
+            lines.append("  FINAL sampled latent:")
+            lines.append("    active after tiles+halo:      %s" % _pct(f["active_expanded"]))
+            lines.append("    covered by frozen mask:       %s" % _pct(f["coverage_by_frozen"]))
+            lines.append("    escaped frozen mask:          %s" % _pct(f["escaped_frozen"]))
+            lines.append("    final score mass missed:      %s" % _pct(f["missed_score_mass_frozen"]))
+        else:
+            lines.append("  FINAL sampled latent:           not captured")
+        lines.extend(["", "  THRESHOLD SWEEP (mean over guided predictions)",
+                      "    threshold   active core        active after tiles+halo"])
         for row in summary["threshold_sweep"]:
             lines.append("    %9.4g   %s (max %s)   %s (max %s)" % (
                 row["threshold"], _pct(row["active_core_mean"]), _pct(row["active_core_max"]),
                 _pct(row["active_expanded_mean"]), _pct(row["active_expanded_max"])))
         lines.append("")
 
-    lines.append("PER OBSERVED FORWARD")
-    lines.append("-" * 78)
-    lines.append("  step   sigma    active core   +tiles/halo   J(prev)  escaped(union)")
+    lines.extend(["PER GUIDED PREDICTION", "-" * 78,
+                  "  step   sigma    active core   +tiles/halo   J(prev)  escaped(frozen)"])
     for s in run.steps:
         lines.append("  %4d %8.4f   %s        %s     %s   %s" % (
             s["step"], s["sigma"], _pct(s["active_core"]), _pct(s["active_expanded"]),
             "  n/a" if s["jaccard_prev"] is None else "%5.3f" % s["jaccard_prev"],
-            _pct(s["escaped_union"])))
-    lines.append("")
-    lines.append("SCORE QUANTILES (token resolution)")
-    lines.append("-" * 78)
+            _pct(s["escaped_frozen"])))
+    lines.extend(["", "SCORE QUANTILES (guided relative token score)", "-" * 78])
     if run.steps:
         keys = list(run.steps[0]["score_quantiles"].keys())
         lines.append("  step  " + "  ".join("%8s" % ("q" + k) for k in keys))
@@ -164,13 +144,8 @@ def render(run, summary):
     return "\n".join(lines)
 
 
-# --------------------------------------------------------------------------
-# writing
-# --------------------------------------------------------------------------
-
 def write_run(run):
-    """Write every artifact for `run`. Safe to call after each observed forward."""
-    if not run.steps and run.disabled_reason is None:
+    if not run.steps and run.disabled_reason is None and run.final is None:
         return None
     os.makedirs(run.out_dir, exist_ok=True)
     summary = aggregate(run)
@@ -179,41 +154,50 @@ def write_run(run):
     with open(report_path, "w", encoding="utf-8") as f:
         f.write(render(run, summary))
 
+    payload = {
+        "tag": run.tag,
+        "config": run.config.as_dict(),
+        "layout": run.layout.as_dict() if run.layout else None,
+        "source": ({"ref_ordinal": run.source.ref_ordinal,
+                    "payload_index": run.source.payload_index,
+                    "kind": run.source.kind,
+                    "latent_shape": list(run.source.latent.shape)}
+                   if run.source and run.source.valid else None),
+        "notes": run.notes,
+        "disabled_reason": run.disabled_reason,
+        "fallbacks": [{"reason": r, "count": n} for r, n in run.fallbacks],
+        "summary": summary,
+        "final": run.final,
+        "steps": run.steps,
+    }
     with open(os.path.join(run.out_dir, "summary.json"), "w", encoding="utf-8") as f:
-        json.dump({
-            "tag": run.tag,
-            "config": run.config.as_dict(),
-            "layout": run.layout.as_dict() if run.layout else None,
-            "source": {
-                "ref_ordinal": run.source.ref_ordinal,
-                "payload_index": run.source.payload_index,
-                "kind": run.source.kind,
-                "latent_shape": list(run.source.latent.shape),
-            } if run.source and run.source.valid else None,
-            "notes": run.notes,
-            "disabled_reason": run.disabled_reason,
-            "fallbacks": [{"reason": r, "count": n} for r, n in run.fallbacks],
-            "summary": summary,
-            "steps": run.steps,
-        }, f, indent=2)
-
+        json.dump(payload, f, indent=2)
     with open(os.path.join(run.out_dir, "steps.jsonl"), "w", encoding="utf-8") as f:
         for s in run.steps:
             f.write(json.dumps(s) + "\n")
 
     arrays = {}
-    for label, scores in run.score_maps:
-        arrays["score_" + label] = scores.numpy().astype(np.float16)
-    for label, m in run.masks:
-        arrays["mask_" + label] = m.numpy()
+    for label, x in run.score_maps:
+        arrays["score_" + label] = x.numpy().astype(np.float32)
+    for label, x in run.error_maps:
+        arrays["error_rms_" + label] = x.numpy().astype(np.float32)
+    for label, x in run.source_maps:
+        arrays["source_rms_" + label] = x.numpy().astype(np.float32)
+    for label, x in run.saliency_maps:
+        arrays["saliency_" + label] = x.numpy().astype(np.float32)
+    for label, x in run.masks:
+        arrays["mask_" + label] = x.numpy()
     if run.union_mask is not None:
-        arrays["mask_union"] = run.union_mask.detach().to("cpu").numpy()
+        arrays["mask_union"] = run.union_mask.detach().cpu().numpy()
+    if run.frozen_mask is not None:
+        arrays["mask_frozen"] = run.frozen_mask.detach().cpu().numpy()
     arrays["index"] = np.array(json.dumps({
         "tag": run.tag,
         "config": run.config.as_dict(),
         "video_shape": list(run.layout.video_shape) if run.layout else None,
         "steps": [{"i": i, "step": s["step"], "sigma": s["sigma"],
-                   "cond_or_uncond": s["cond_or_uncond"]} for i, s in enumerate(run.steps)],
+                   "source_kind": s.get("source_kind")} for i, s in enumerate(run.steps)],
+        "has_final": run.final is not None,
     }))
     np.savez_compressed(os.path.join(run.out_dir, "mask.npz"), **arrays)
     return report_path

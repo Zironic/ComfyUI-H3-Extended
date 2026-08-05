@@ -1,13 +1,4 @@
-"""The masked Ref2V node.
-
-Separate from `MiniMaxH3SigmaShiftZi` on purpose: the shift node owns the flow
-schedule, the attention backend and the VRAM guard, and this one owns nothing
-but masked-Ref2V behaviour. Keeping them apart is what makes an A/B honest -
-removing this node from the graph removes the entire feature and nothing else.
-
-Only `measure` is implemented. It installs two wrappers that observe and never
-modify, so a `measure` run is a dense run that also writes a report.
-"""
+"""ComfyUI node for output-neutral H3 Ref2V mask measurement."""
 
 import logging
 import os
@@ -18,7 +9,12 @@ from comfy_api.latest import ComfyExtension, io
 
 from .config import IMPLEMENTED_MODES, MODES, MaskedCacheConfig
 from .session import MaskedCacheSession
-from .wrappers import LOG_PREFIX, make_diffusion_wrapper, make_outer_wrapper
+from .wrappers import (
+    LOG_PREFIX,
+    make_diffusion_wrapper,
+    make_outer_wrapper,
+    make_post_cfg_observer,
+)
 
 WRAPPER_KEY = "h3_masked_cache"
 
@@ -28,13 +24,6 @@ def _output_dir():
 
 
 class MiniMaxH3MaskedRef2VCache(io.ComfyNode):
-    """Measure whether unchanged target regions can be dropped from H3's blocks.
-
-    Compares H3's predicted clean latent against the source video reference at
-    every step and reports how large, how stable and how early-determined the
-    edited region is. Does not change the output.
-    """
-
     @classmethod
     def define_schema(cls):
         return io.Schema(
@@ -42,75 +31,33 @@ class MiniMaxH3MaskedRef2VCache(io.ComfyNode):
             display_name="MiniMax H3 Masked Ref2V Cache (Zi)",
             category="model/patch/minimax",
             description=(
-                "Ref2V edit-mask measurement. Compares the predicted clean latent "
-                "against the selected source video reference and writes score maps, "
-                "threshold sweeps and mask-stability figures to "
-                "output/h3_masked_cache/<run_tag>_<timestamp>/. In 'measure' mode the "
-                "model output is untouched - sampling is exactly as dense as without "
-                "the node."
+                "Output-neutral Ref2V edit-mask measurement. Observes the guided "
+                "post-CFG denoised prediction and final sampled latent; writes raw "
+                "float32 error/source maps, threshold sweeps and frozen-warmup "
+                "coverage to output/h3_masked_cache/<run_tag>_<timestamp>/."
             ),
             inputs=[
                 io.Model.Input("model"),
                 io.Boolean.Input("enabled", default=True),
-                io.Combo.Input(
-                    "mode", options=list(MODES), default="measure",
-                    tooltip=("measure: observe only, output unchanged. "
-                             "fixed/dynamic apply the mask to the computation and are "
-                             "not implemented yet - selecting one errors rather than "
-                             "quietly measuring."),
-                ),
-                io.Int.Input(
-                    "source_video_ref", default=1, min=1, max=16,
-                    tooltip=("Which reference video the target is edited from, "
-                             "one-based over video references only (reference images "
-                             "and standalone audio do not count). Its latent must match "
-                             "the target latent exactly in time and size."),
-                ),
-                io.Float.Input(
-                    "score_threshold", default=0.1, min=0.0, max=10.0, step=0.005,
-                    tooltip=("Relative per-token difference above which a token counts "
-                             "as edited. The report sweeps a range around this value; "
-                             "the default is a placeholder until measurement picks one."),
-                ),
-                io.Float.Input(
-                    "score_floor", default=0.001, min=1e-6, max=1.0, step=0.001,
-                    tooltip=("Added to the source magnitude before dividing, so flat "
-                             "regions do not score high on a tiny absolute error."),
-                ),
-                io.Combo.Input(
-                    "tile_size", options=[1, 2, 4], default=2,
-                    tooltip="Token tile the mask is quantized to. Any active token activates its whole tile.",
-                ),
-                io.Int.Input(
-                    "spatial_halo", default=1, min=0, max=16,
-                    tooltip="Dilate the mask by this many tiles in each spatial direction.",
-                ),
-                io.Int.Input(
-                    "temporal_halo", default=1, min=0, max=16,
-                    tooltip=("Dilate the mask by this many latent frames in each temporal "
-                             "direction. Latent frames cover unequal amounts of real time."),
-                ),
-                io.Int.Input(
-                    "warmup_steps", default=2, min=1, max=32,
-                    tooltip="Dense steps before a mask may be used. Recorded only, in measure mode.",
-                ),
-                io.Int.Input(
-                    "refresh_interval", default=0, min=0, max=64,
-                    tooltip="Distinct sigmas between dense mask refreshes; 0 freezes the mask. Recorded only, in measure mode.",
-                ),
-                io.Float.Input(
-                    "dense_fallback_fraction", default=0.8, min=0.0, max=1.0, step=0.01,
-                    tooltip="Above this active fraction a compact pass is not worth its complexity. Recorded only, in measure mode.",
-                ),
-                io.Boolean.Input(
-                    "strict", default=True,
-                    tooltip=("Stop the run when the source cannot be resolved or the "
-                             "geometry does not match, instead of sampling dense and "
-                             "reporting the fallback. A measurement run that quietly "
-                             "measured nothing is worse than one that stopped."),
-                ),
-                io.String.Input("run_tag", default="h3mask",
-                                tooltip="Output subdirectory prefix. One tag per test-matrix entry."),
+                io.Combo.Input("mode", options=list(MODES), default="measure",
+                    tooltip="Only measure is implemented; fixed/dynamic error explicitly."),
+                io.Int.Input("source_video_ref", default=1, min=1, max=16,
+                    tooltip="One-based ordinal over video references only."),
+                io.Float.Input("score_threshold", default=0.1, min=0.0, max=10.0, step=0.005,
+                    tooltip="Relative token score threshold. The report sweeps 0.01 through 10."),
+                io.Float.Input("score_floor", default=0.001, min=1e-6, max=1.0, step=0.001,
+                    tooltip="Added to source RMS for the online relative score."),
+                io.Combo.Input("tile_size", options=[1, 2, 4], default=2),
+                io.Int.Input("spatial_halo", default=1, min=0, max=16),
+                io.Int.Input("temporal_halo", default=1, min=0, max=16),
+                io.Int.Input("warmup_steps", default=2, min=1, max=32,
+                    tooltip="Number of guided predictions whose union becomes the immutable frozen mask."),
+                io.Int.Input("refresh_interval", default=0, min=0, max=64,
+                    tooltip="Recorded for later policy simulation; 0 means no refresh."),
+                io.Float.Input("dense_fallback_fraction", default=0.8, min=0.0, max=1.0, step=0.01),
+                io.Boolean.Input("strict", default=True,
+                    tooltip="Refuse invalid measurement, including EasyCache contamination."),
+                io.String.Input("run_tag", default="h3mask"),
             ],
             outputs=[io.Model.Output()],
         )
@@ -121,13 +68,10 @@ class MiniMaxH3MaskedRef2VCache(io.ComfyNode):
                 dense_fallback_fraction, strict, run_tag) -> io.NodeOutput:
         if not enabled:
             return io.NodeOutput(model)
-
         if mode not in IMPLEMENTED_MODES:
             raise NotImplementedError(
-                "%s mode '%s' is not implemented yet - only %s is. Masked execution "
-                "lands after measurement has chosen a threshold; until then this node "
-                "will not pretend to apply a mask." % (
-                    LOG_PREFIX, mode, ", ".join("'%s'" % m for m in IMPLEMENTED_MODES)))
+                "%s mode '%s' is not implemented yet; only %s is available." % (
+                    LOG_PREFIX, mode, ", ".join(IMPLEMENTED_MODES)))
 
         config = MaskedCacheConfig(
             mode=mode,
@@ -146,8 +90,6 @@ class MiniMaxH3MaskedRef2VCache(io.ComfyNode):
         )
 
         m = model.clone()
-        # the sampling object as configured *at this point in the graph*, so a
-        # sigma-shift node upstream is honoured and one downstream is visibly not
         session = MaskedCacheSession(
             config, _output_dir(), model_sampling=m.get_model_object("model_sampling"))
 
@@ -158,11 +100,19 @@ class MiniMaxH3MaskedRef2VCache(io.ComfyNode):
             comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, WRAPPER_KEY,
             make_diffusion_wrapper(session), m.model_options, is_model_options=True)
 
-        logging.info("%s armed: mode=%s tag=%s source_video_ref=%d threshold=%.3g "
-                     "tile=%dx%d halo=(%d,%d) strict=%s",
-                     LOG_PREFIX, mode, config.run_tag, config.source_video_ref,
-                     config.score_threshold, config.tile_h, config.tile_w,
-                     config.spatial_halo, config.temporal_halo, config.strict)
+        # Comfy invokes these after CFG and all earlier post-CFG hooks.  Preserve
+        # existing callbacks and append an observer that returns denoised unchanged.
+        post = list(m.model_options.get("sampler_post_cfg_function", []))
+        post.append(make_post_cfg_observer(session))
+        m.model_options["sampler_post_cfg_function"] = post
+
+        logging.info(
+            "%s armed: mode=%s tag=%s source_video_ref=%d threshold=%.3g "
+            "tile=%dx%d halo=(%d,%d) warmup=%d strict=%s",
+            LOG_PREFIX, mode, config.run_tag, config.source_video_ref,
+            config.score_threshold, config.tile_h, config.tile_w,
+            config.spatial_halo, config.temporal_halo, config.warmup_steps,
+            config.strict)
         return io.NodeOutput(m)
 
 
