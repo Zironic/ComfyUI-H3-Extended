@@ -25,6 +25,24 @@ def build_parser(description):
     p.add_argument("--no-held-weights", action="store_true")
     p.add_argument("--activation-nonstrict", action="store_true")
     p.add_argument("--seed", type=int, default=1234)
+    p.add_argument(
+        "--physical-warning-mb",
+        type=int,
+        default=800,
+        help=(
+            "mark a variant LOW when its minimum measured free physical VRAM "
+            "falls below this many MiB (default 800)"
+        ),
+    )
+    p.add_argument(
+        "--physical-poll-ms",
+        type=float,
+        default=2.0,
+        help=(
+            "poll cudaMemGetInfo at this interval during an untimed residency "
+            "probe; timing iterations run without the poller (default 2 ms)"
+        ),
+    )
 
     p.add_argument("--width", type=int, default=1344)
     p.add_argument("--height", type=int, default=768)

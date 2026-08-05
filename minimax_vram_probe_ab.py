@@ -38,6 +38,10 @@ def main():
         parser.error("--ab-activation-memory requires CUDA")
     if args.ab_warmup < 0 or args.ab_iterations < 1:
         parser.error("--ab-warmup must be >= 0 and --ab-iterations must be >= 1")
+    if args.physical_warning_mb < 0:
+        parser.error("--physical-warning-mb must be >= 0")
+    if args.physical_poll_ms <= 0:
+        parser.error("--physical-poll-ms must be > 0")
 
     arch = dict(base.DEFAULT_ARCH)
     ckpt_gb = None
@@ -71,32 +75,60 @@ def main():
     # Must run before importing the efficient-Sage implementation.
     selected = base.select_attention(True)
 
-    print(f"canvas      {args.width}x{args.height}  ->  latent {args.height // 16}x{args.width // 16}")
+    print(
+        f"canvas      {args.width}x{args.height}  ->  "
+        f"latent {args.height // 16}x{args.width // 16}"
+    )
     print(f"arch        {arch_source}")
-    print("            " + "  ".join(f"{key}={value}" for key, value in arch.items()))
+    print(
+        "            "
+        + "  ".join(f"{key}={value}" for key, value in arch.items())
+    )
     free, total = torch.cuda.mem_get_info(device)
-    print(f"gpu         {torch.cuda.get_device_name(device)}  {total / base.GB:.1f} GB total, {free / base.GB:.1f} GB free")
+    print(
+        f"gpu         {torch.cuda.get_device_name(device)}  "
+        f"{total / base.GB:.1f} GB total, {free / base.GB:.1f} GB free"
+    )
     if ckpt_gb is not None:
         print(
             f"checkpoint  {ckpt_gb:.2f} GB on disk"
-            + (f"  -- exceeds the {args.budget:.1f} GB budget; production streams it"
-               if streamed else "  (fits, held resident)")
+            + (
+                f"  -- exceeds the {args.budget:.1f} GB budget; production streams it"
+                if streamed
+                else "  (fits, held resident)"
+            )
         )
-    print(f"budget      {args.budget:.1f} GB  (reserve {reserve_gb:.2f} GB outside transient)")
+    print(
+        f"budget      {args.budget:.1f} GB  "
+        f"(reserve {reserve_gb:.2f} GB outside transient)"
+    )
     print(f"method      measured A/B on GPU; Comfy selected {selected}")
-    print("weights     random BF16 block weights; activation geometry, not checkpoint INT8 streaming")
+    print(
+        "physical    cudaMemGetInfo sampled every %.2f ms during an untimed "
+        "residency pass; LOW below %d MiB"
+        % (args.physical_poll_ms, args.physical_warning_mb)
+    )
+    print(
+        "weights     random BF16 block weights; activation geometry, "
+        "not checkpoint INT8 streaming"
+    )
 
     if args.mode == "ref2v":
         bits = [f"ref video {args.ref_frames}"]
         if args.ref_width or args.ref_height:
-            bits.append(f"ref canvas {args.ref_width or args.width}x{args.ref_height or args.height}")
+            bits.append(
+                f"ref canvas {args.ref_width or args.width}x"
+                f"{args.ref_height or args.height}"
+            )
         if args.ref_audio:
             bits.append("ref audio")
         if args.anchor:
             bits.append("anchor keyframe")
         if args.static_refs:
             pixels = args.static_ref_pixels or args.width * args.height
-            bits.append(f"{args.static_refs} static ref(s) @ {pixels / 1e6:.2f} MP")
+            bits.append(
+                f"{args.static_refs} static ref(s) @ {pixels / 1e6:.2f} MP"
+            )
         print(f"task        ref2v -- {', '.join(bits)}")
     else:
         print("task        t2va -- target stream only")
@@ -104,20 +136,40 @@ def main():
     block = base.build_block(arch, dtype, device)
     baseline, candidate, backend, config = build_forwards(block, args)
     print(
-        "A/B         baseline=sage_mem_eff; candidate=+%s rows=%d alignment=%d held=%s"
-        % (config.mode, config.chunk_rows, config.alignment, config.prefer_held_weights)
+        "A/B         baseline=sage_mem_eff; candidate=+%s rows=%d "
+        "alignment=%d held=%s"
+        % (
+            config.mode,
+            config.chunk_rows,
+            config.alignment,
+            config.prefer_held_weights,
+        )
     )
     print(
         "Sage        version=%s kernel=%s accumulation=%s"
-        % (backend.api.version, backend.api.kernel_name, backend.api.accumulation)
+        % (
+            backend.api.version,
+            backend.api.kernel_name,
+            backend.api.accumulation,
+        )
     )
     if config.native_swiglu:
-        print("note        BF16 probe weights cannot exercise native TensorWise-INT8 FC2")
+        print(
+            "note        BF16 probe weights cannot exercise native "
+            "TensorWise-INT8 FC2"
+        )
     print()
 
     run_sweep(
-        args, parser, arch, dtype, device, reserve_gb, streamed,
-        baseline, candidate,
+        args,
+        parser,
+        arch,
+        dtype,
+        device,
+        reserve_gb,
+        streamed,
+        baseline,
+        candidate,
     )
 
 
