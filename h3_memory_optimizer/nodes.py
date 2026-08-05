@@ -150,13 +150,14 @@ class MiniMaxH3MemoryOptimizer(io.ComfyNode):
             ),
         )
 
-        pool_policy = configure_cuda_async_soft_gc(
-            config.cuda_async_soft_gc,
-            config.cuda_async_release_threshold_gib,
-        )
         decision = resolve_attention(
             config.attention,
             config.attention_fallback,
+        )
+        pool_policy = configure_cuda_async_soft_gc(
+            config.cuda_async_soft_gc,
+            config.cuda_async_release_threshold_gib,
+            device_index=decision.environment.device_index,
         )
         patched = model.clone()
         apply(
