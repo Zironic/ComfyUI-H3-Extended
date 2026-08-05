@@ -6,10 +6,16 @@ reports steady-state latency plus complete-call peak allocated memory.
 
 import argparse
 import json
+import os
 import statistics
+import sys
 import time
 
 import torch
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(_HERE))
+sys.path.insert(0, os.path.abspath(os.path.join(_HERE, "..", "..", "..")))
 
 from h3_attention.sage_mem_eff import SM89SageMemoryEfficientBackend
 
