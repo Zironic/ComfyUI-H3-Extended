@@ -11,9 +11,9 @@ running into Chunk B as continuous playback. Motion discontinuity is obvious in
 time and nearly invisible in a side-by-side still, so judging seams from the
 column view is a good way to ship a visible seam.
 
-Comfy IMAGE outputs are float32, so returning four source-resolution columns can
-consume gigabytes of RAM. Preview builders therefore cap one tile's longest edge
-before concatenation. Full-resolution frames remain in the artifact directory.
+Comfy IMAGE outputs are float32, so returning source-resolution previews can
+consume gigabytes of RAM. Preview builders cap one tile's longest edge; complete
+frames remain in the artifact directory.
 """
 
 import torch
@@ -35,9 +35,15 @@ def _preview_size(height, width, max_long_edge=DEFAULT_PREVIEW_LONG_EDGE):
     if max_long_edge is None or max_long_edge <= 0 or max(height, width) <= max_long_edge:
         return int(height), int(width)
     scale = max_long_edge / float(max(height, width))
-    out_h = max(1, int(round(height * scale)))
-    out_w = max(1, int(round(width * scale)))
-    return out_h, out_w
+    return max(1, int(round(height * scale))), max(1, int(round(width * scale)))
+
+
+def preview_clip(frames, max_long_edge=DEFAULT_PREVIEW_LONG_EDGE):
+    """Return a CPU float32 clip bounded for in-memory node outputs."""
+    if frames is None or frames.shape[0] == 0:
+        return frames
+    height, width = _preview_size(frames.shape[1], frames.shape[2], max_long_edge)
+    return _match(frames.to("cpu", torch.float32), height, width)
 
 
 def _pad_to(frames, count):
@@ -48,11 +54,7 @@ def _pad_to(frames, count):
 
 
 def columns(clips, height=None, width=None, max_long_edge=DEFAULT_PREVIEW_LONG_EDGE):
-    """Stack IMAGE batches side by side into one bounded preview batch.
-
-    `clips` is a list of (label, frames). Labels are returned rather than drawn -
-    burning text into the pixels would corrupt the same frames the metrics read.
-    """
+    """Stack IMAGE batches side by side into one bounded preview batch."""
     clips = [(label, f) for label, f in clips if f is not None and f.shape[0] > 0]
     if not clips:
         return None, []
@@ -68,7 +70,6 @@ def columns(clips, height=None, width=None, max_long_edge=DEFAULT_PREVIEW_LONG_E
 def overlap_comparison(*, source_pixels, chunk_a_pixels, baseline_pixels,
                        experiment_pixels, geometry,
                        max_long_edge=DEFAULT_PREVIEW_LONG_EDGE):
-    """Columns over the shared global frames `S..C-1`."""
     s, c, o = geometry.stride_frames, geometry.chunk_frames, geometry.overlap_frames
     clips = [
         ("source", _slice(source_pixels, s, c)),
@@ -81,7 +82,6 @@ def overlap_comparison(*, source_pixels, chunk_a_pixels, baseline_pixels,
 
 def boundary_playback(*, chunk_a_pixels, chunk_b_pixels, geometry, lead=12, trail=12,
                       max_long_edge=DEFAULT_PREVIEW_LONG_EDGE):
-    """Chunk A running into Chunk B as continuous playback across the seam."""
     if chunk_a_pixels is None or chunk_b_pixels is None:
         return None
     s = geometry.stride_frames
@@ -106,7 +106,6 @@ def _slice(frames, start, stop):
 
 def contact_sheet(results, geometry, max_experiments=6,
                   max_long_edge=DEFAULT_PREVIEW_LONG_EDGE):
-    """One row per experiment, over the overlap window - a quick visual index."""
     rows = []
     labels = []
     for result in list(results)[:max_experiments]:
