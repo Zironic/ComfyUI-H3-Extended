@@ -23,6 +23,9 @@ sys.path.insert(0, os.path.abspath(os.path.join(_HERE, "..", "..", "..")))
 from h3_activation_memory.linear import swiglu_eager  # noqa: E402
 
 
+CHECKSUM_SAMPLES = 4096
+
+
 def dtype_from_name(name):
     return {
         "fp32": torch.float32,
@@ -34,6 +37,19 @@ def dtype_from_name(name):
 def synchronize(device):
     if device.type == "cuda":
         torch.cuda.synchronize(device)
+
+
+def sampled_checksum(output):
+    """Return a stable diagnostic without materializing a full FP32 copy.
+
+    ``output.float().mean()`` allocates an FP32 tensor as large as the complete
+    output. At H3 C=90 that is 0.921 GiB on top of the 0.461 GiB BF16 output,
+    imposing a 1.382 GiB artificial peak that completely hides chunk-size
+    differences. Sample at most CHECKSUM_SAMPLES evenly spaced elements instead.
+    """
+    flat = output.reshape(-1)
+    stride = max(1, (flat.numel() + CHECKSUM_SAMPLES - 1) // CHECKSUM_SAMPLES)
+    return float(flat[::stride].float().mean())
 
 
 def measure(fn, device, warmup, iterations):
@@ -48,7 +64,9 @@ def measure(fn, device, warmup, iterations):
     started = time.perf_counter()
     checksum = None
     for _ in range(iterations):
-        checksum = float(fn().float().mean())
+        output = fn()
+        checksum = sampled_checksum(output)
+        del output
     synchronize(device)
     elapsed = (time.perf_counter() - started) / iterations
     peak = (
@@ -109,9 +127,11 @@ def main():
             return output
 
         result = measure(chunked, device, args.warmup, args.iterations)
-        result["max_abs_vs_full"] = float(
-            (chunked().float() - stock().float()).abs().max()
-        )
+        with torch.no_grad():
+            got = chunked()
+            want = stock()
+            result["max_abs_vs_full"] = float((got - want).abs().max())
+            del got, want
         rows.append(
             {"mode": "chunked", "chunk_rows": chunk_rows, **result}
         )
