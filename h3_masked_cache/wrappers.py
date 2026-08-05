@@ -1,7 +1,7 @@
 """Output-neutral sampling observers for masked Ref2V measurement.
 
-The diffusion wrapper validates H3/source/layout state.  The post-CFG observer
-scores the denoised prediction actually returned to the sampler.  The outer
+The diffusion wrapper validates H3/source/layout state. The post-CFG observer
+scores the denoised prediction actually returned to the sampler. The outer
 wrapper also scores the final sampled latent, which is the Stage-0 ground truth.
 """
 
@@ -66,10 +66,8 @@ def _score_maps(video_x0, source, cfg):
 
 
 def make_outer_wrapper(session):
-    """One trace per run, plus final-latent ground truth."""
     def wrapper(executor, *args, **kwargs):
-        latent_shapes = kwargs.get("latent_shapes")
-        run = session.begin(latent_shapes=latent_shapes)
+        run = session.begin(latent_shapes=kwargs.get("latent_shapes"))
         result = None
         try:
             result = executor(*args, **kwargs)
@@ -97,7 +95,6 @@ def make_outer_wrapper(session):
 
 
 def make_diffusion_wrapper(session):
-    """Validate each dense H3 call and publish state for the post-CFG observer."""
     def wrapper(executor, *args, **kwargs):
         run = session.run
         if run is None or run.disabled_reason is not None:
@@ -121,7 +118,6 @@ def make_diffusion_wrapper(session):
 
 
 def make_post_cfg_observer(session):
-    """Observe Comfy's final guided denoised prediction without modifying it."""
     def observer(args):
         denoised = args["denoised"]
         run = session.run
@@ -134,11 +130,10 @@ def make_post_cfg_observer(session):
             sigma = float(sigma_t.flatten()[0])
             if not (sigma > MIN_SIGMA):
                 return denoised
-            schedule = run.notes.get("sample_sigmas_tensor")
-            if schedule is None:
+            if run.sample_sigmas_tensor is None:
                 step = -1
             else:
-                step = int(torch.argmin((schedule - sigma).abs()))
+                step = int(torch.argmin((run.sample_sigmas_tensor - sigma).abs()))
             run.observe_sigma(sigma)
             video_x0 = _unpack_video(denoised, run.latent_shapes)
             source = session.sources.get(run.source, video_x0.device, torch.float32)
@@ -178,7 +173,6 @@ def _prepare(session, run, args, transformer_options, payload, video_x):
     _, sigma = _step_index(transformer_options)
     if not (sigma > MIN_SIGMA):
         return
-
     if "easycache" in transformer_options:
         raise MeasurementUnavailable(
             "EasyCache is active; whole-step reuse contaminates the Stage-0 trajectory")
@@ -196,7 +190,7 @@ def _prepare(session, run, args, transformer_options, payload, video_x):
         sched = transformer_options.get("sample_sigmas")
         run.notes["total_steps"] = max(1, sched.numel() - 1) if sched is not None else 0
         run.notes["sample_sigmas"] = sched.detach().cpu().float().tolist() if sched is not None else None
-        run.notes["sample_sigmas_tensor"] = sched.detach().cpu().float() if sched is not None else None
+        run.sample_sigmas_tensor = sched.detach().cpu().float() if sched is not None else None
         override = transformer_options.get("optimized_attention_override")
         run.notes["attention_backend"] = getattr(override, "_h3_backend", None) or (
             "override" if override is not None else "comfy default")
