@@ -33,7 +33,7 @@ class MiniMaxH3MaskedRef2VCache(io.ComfyNode):
             description=(
                 "Output-neutral Ref2V edit-mask measurement. Observes the guided "
                 "post-CFG denoised prediction and final sampled latent; writes raw "
-                "float32 error/source maps, threshold sweeps and frozen-warmup "
+                "float32 error/source maps, threshold sweeps and frozen-policy "
                 "coverage to output/h3_masked_cache/<run_tag>_<timestamp>/."
             ),
             inputs=[
@@ -47,11 +47,17 @@ class MiniMaxH3MaskedRef2VCache(io.ComfyNode):
                     tooltip="Relative token score threshold. The report sweeps 0.01 through 10."),
                 io.Float.Input("score_floor", default=0.001, min=1e-6, max=1.0, step=0.001,
                     tooltip="Added to source RMS for the online relative score."),
-                io.Combo.Input("tile_size", options=[1, 2, 4], default=2),
+                io.Combo.Input("tile_size", options=[1, 2, 4], default=2,
+                    tooltip="Token tile size. Spatial halo is measured in these tiles."),
                 io.Int.Input("spatial_halo", default=1, min=0, max=16),
                 io.Int.Input("temporal_halo", default=1, min=0, max=16),
+                io.Int.Input("burn_in_steps", default=2, min=0, max=32,
+                    tooltip=("Discard this many initial guided predictions before "
+                             "building the frozen mask. H3's first predictions can have "
+                             "a much broader reconstruction-error distribution.")),
                 io.Int.Input("warmup_steps", default=2, min=1, max=32,
-                    tooltip="Number of guided predictions whose union becomes the immutable frozen mask."),
+                    tooltip=("Union this many guided predictions after burn-in to build "
+                             "the immutable frozen mask.")),
                 io.Int.Input("refresh_interval", default=0, min=0, max=64,
                     tooltip="Recorded for later policy simulation; 0 means no refresh."),
                 io.Float.Input("dense_fallback_fraction", default=0.8, min=0.0, max=1.0, step=0.01),
@@ -64,8 +70,8 @@ class MiniMaxH3MaskedRef2VCache(io.ComfyNode):
 
     @classmethod
     def execute(cls, model, enabled, mode, source_video_ref, score_threshold, score_floor,
-                tile_size, spatial_halo, temporal_halo, warmup_steps, refresh_interval,
-                dense_fallback_fraction, strict, run_tag) -> io.NodeOutput:
+                tile_size, spatial_halo, temporal_halo, burn_in_steps, warmup_steps,
+                refresh_interval, dense_fallback_fraction, strict, run_tag) -> io.NodeOutput:
         if not enabled:
             return io.NodeOutput(model)
         if mode not in IMPLEMENTED_MODES:
@@ -76,6 +82,7 @@ class MiniMaxH3MaskedRef2VCache(io.ComfyNode):
         config = MaskedCacheConfig(
             mode=mode,
             source_video_ref=int(source_video_ref),
+            burn_in_steps=int(burn_in_steps),
             warmup_steps=int(warmup_steps),
             refresh_interval=int(refresh_interval),
             score_threshold=float(score_threshold),
@@ -100,7 +107,7 @@ class MiniMaxH3MaskedRef2VCache(io.ComfyNode):
             comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, WRAPPER_KEY,
             make_diffusion_wrapper(session), m.model_options, is_model_options=True)
 
-        # Comfy invokes these after CFG and all earlier post-CFG hooks.  Preserve
+        # Comfy invokes these after CFG and all earlier post-CFG hooks. Preserve
         # existing callbacks and append an observer that returns denoised unchanged.
         post = list(m.model_options.get("sampler_post_cfg_function", []))
         post.append(make_post_cfg_observer(session))
@@ -108,11 +115,11 @@ class MiniMaxH3MaskedRef2VCache(io.ComfyNode):
 
         logging.info(
             "%s armed: mode=%s tag=%s source_video_ref=%d threshold=%.3g "
-            "tile=%dx%d halo=(%d,%d) warmup=%d strict=%s",
+            "tile=%dx%d halo=(%d,%d) burn_in=%d warmup=%d strict=%s",
             LOG_PREFIX, mode, config.run_tag, config.source_video_ref,
             config.score_threshold, config.tile_h, config.tile_w,
-            config.spatial_halo, config.temporal_halo, config.warmup_steps,
-            config.strict)
+            config.spatial_halo, config.temporal_halo, config.burn_in_steps,
+            config.warmup_steps, config.strict)
         return io.NodeOutput(m)
 
 
