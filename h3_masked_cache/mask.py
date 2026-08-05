@@ -1,7 +1,7 @@
 """Build and analyse conservative H3 Ref2V edit masks.
 
 The measurement stage stores the raw per-cell error and source magnitude in
-float32.  Relative scores, floors, token pooling, thresholds, tiles and halos can
+float32. Relative scores, floors, token pooling, thresholds, tiles and halos can
 therefore be recalibrated offline without rerunning an expensive generation.
 """
 
@@ -39,7 +39,7 @@ def latent_score(x0, source, absolute_floor):
 def spatial_saliency(token_scores, eps=1e-6):
     """Robust per-frame excess over ordinary full-frame reconstruction drift.
 
-    Returns ``(score - median) / (MAD + eps)`` at token resolution.  This is a
+    Returns ``(score - median) / (MAD + eps)`` at token resolution. This is a
     diagnostic only; Stage 0 does not use it to alter inference.
     """
     if token_scores.ndim != 3:
@@ -145,15 +145,20 @@ def coverage_fraction(reference, candidate):
     return None if escaped is None else 1.0 - escaped
 
 
-def missed_score_mass(scores, candidate):
-    """Share of non-negative score mass outside ``candidate``."""
+def missed_score_mass(scores, candidate, threshold=0.0):
+    """Share of above-threshold edit-score excess outside ``candidate``.
+
+    Summing the complete relative score makes the metric mostly measure the
+    broad reconstruction-drift baseline. Only ``max(score - threshold, 0)`` is
+    attributable to the mask decision at that threshold.
+    """
     if scores is None or candidate is None or scores.shape != candidate.shape:
         return None
-    scores = scores.float().clamp_min(0)
-    total = float(scores.sum().item())
+    excess = (scores.float() - float(threshold)).clamp_min(0)
+    total = float(excess.sum().item())
     if total == 0.0:
         return 0.0
-    return float(scores[~candidate].sum().item()) / total
+    return float(excess[~candidate].sum().item()) / total
 
 
 def quantiles(t, qs):
