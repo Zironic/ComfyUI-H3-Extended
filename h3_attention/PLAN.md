@@ -167,29 +167,86 @@ output tensor. In the real forward the attention kernel claims a much larger
 workspace, so more of the freed space is reused; live-at-attention is the better
 predictor of end-to-end benefit.
 
-### 2.2 Does the NHD entry point avoid a copy? (Commit 2, same sitting)
+### 2.2 Does the NHD entry point avoid a copy? — **ANSWERED: no, it gains nothing**
 
-Per §1.3. Instrument SageAttention's NHD vs HND entry and compare allocations on
-identical strided inputs. Cheap, and it determines whether the custom forward needs
-to preserve NHD at all.
+Confirmed by reading the dispatch, not by benchmarking.
 
-### 2.3 Does the custom V path enter `_fused.pyd`? (Commit 3, blocking for goal 1)
+H3 calls attention with `skip_reshape=True` ([`model.py:181`]), so core's
+`attention_sage` takes the HND branch and `tensor_layout = "HND"`. The NHD branch
+exists only for callers that did *not* pre-shape, and it is the one that calls
+`_reshape_qkv_to_heads`. H3 never touches it.
 
-This is the requirement the draft never states, and goal 1 fails without it.
+Inside SageAttention, `tensor_layout` is reduced to an integer flag (`0`/`1`)
+handed to the kernels — it selects indexing, not whether a copy happens. And the
+V path copies unconditionally either way: `per_channel_fp8` allocates a full
+`v_transposed_permutted` buffer, padded to a multiple of 64, and fills it.
+
+**§1.3 is confirmed.** Layout was never the win; activation lifetime is. The
+custom forward does not need to preserve NHD, which removes a constraint from
+Commit 3.
+
+### 2.3 Can the V path avoid `_fused.pyd`? — **ANSWERED: not through sage's API**
+
+The confirmed H3 path on this card:
 
 ```
-REQUIREMENT: the sage_mem_eff V path must never reach
-             _fused.transpose_pad_permute_cuda
+attention_sage (skip_reshape=True -> HND, smooth_k=False)
+  -> sageattn -> arch sm89
+  -> sageattn_qk_int8_pv_fp8_cuda(qk_quant_gran="per_thread")   [core.py:612, 618]
+       Q/K -> per_thread_int8_triton                            [core.py:747]
+       V   -> per_channel_fp8 -> _fused.transpose_pad_permute_cuda  [quant.py:282]
 ```
 
-Gate C in the draft — "no forced contiguous copy appears in the custom path" — is
-about *copies*, not about *which kernel runs*, and does not establish this.
+Two things this pins down:
 
-**It cannot be verified by running a long sequence.** S=199,728 is unreachable on
-12 GB. Verify by code path instead: instrument or symbol-trace the V branch and
-assert `_fused` is never entered. Only once that holds can the in-repo
-`comfy/ldm/modules/attention.py` guard be deleted — which is the actual deliverable
-of goal 1.
+- **The Triton `per_thread` kernels really are the H3 Q/K path.** `qk_quant_gran`
+  defaults to `"per_thread"` and the sm89 branch does not override it (sm120
+  explicitly passes `"per_warp"`, which is what makes the default visible). So the
+  site-packages `tl.int64` patch is on the live path, as `sage-int64-offset-patch`
+  claims.
+- **`per_channel_fp8` calls `transpose_pad_permute_cuda` unconditionally.** There
+  is no flag, and both fp8 entry points (sm89 at `core.py:763`, sm90 at `924`)
+  route through it. No sage API gives fp8 V without the closed kernel.
+
+`sageattn_qk_int8_pv_fp16_cuda` — the sm80/86 path — does avoid `per_channel_fp8`
+entirely, so fp16 V is a genuinely `_fused`-free option. It costs a byte per
+element on V (0.253 -> 0.506 GB at C=73) and gives up SM89's fp8 tensor cores.
+
+#### This makes goal 1 much cheaper than the draft assumed
+
+The draft's implicit plan was: replace the closed V kernel, then delete the guard.
+That means writing a transpose+pad+permute+quantize kernel to retire a guard that
+is **inert on this card** — S=199,728 is unreachable when OOM arrives at 120-150k.
+
+The guard does not need to be replaced. It needs to be **relocated**:
+
+```
+today:  comfy/ldm/modules/attention.py   <- reverts on ComfyUI update   (the problem)
+move:   h3_attention/forward.py          <- lives in this repo          (goal 1 closed)
+```
+
+Applying the same `contiguous()` check inside our own forward is a few lines,
+survives every ComfyUI update by construction, stays correct on a larger GPU, and
+costs nothing at H3's real sequence lengths because it never fires.
+
+**Do not delete the ComfyUI-tree edit until `sage_mem_eff` is selectable
+(Commit 4), and understand what deleting it gives up.** The in-repo guard only
+runs when the custom forward is patched in; `sage`, `comfy` and `pytorch` still
+reach attention through core's path. Deleting the upstream edit therefore leaves
+those three backends unguarded. On a 12 GB card that is academic - S=199,728 is
+unreachable - but on a larger GPU it is a real narrowing, and it should be a
+deliberate choice rather than a side effect of tidying.
+
+Goal 1 then reduces to:
+
+| half | fix | effort |
+| --- | --- | --- |
+| Q/K, signed i32, reverts on **sage** upgrade | vendor `per_thread_int8_triton` with int64 offsets | moderate |
+| V, unsigned u32, reverts on **ComfyUI** update | move the existing guard into `forward.py` | trivial |
+
+Vendoring a V kernel becomes a Commit 3 *performance* question — whether owning
+the fp8 V transpose beats `per_channel_fp8`'s unconditional padded copy — and is
+no longer entangled with surviving updates. That is a much better place for it.
 
 ## 3. Facts
 
@@ -206,8 +263,10 @@ of goal 1.
 | Custom forward is bit-identical to core on both the rotary and no-rope paths | `tests/test_h3_attention_forward.py` | **verified** |
 | Dropping the QKV views returns 100% of the fused buffer: 1.518 GB at C=73, 1.842 GB at C=90 | `benchmarks/measure_qkv_release.py`, §2.1 | **measured** |
 | `memory_reserved` is identically 0 under `cudaMallocAsync`; the pool also withholds freed blocks from `mem_get_info` | §2.1 metric traps | **measured** |
-| Whether Sage's NHD path avoids a copy the HND path makes | — | **unknown — §2.2** |
-| Whether an FP8 V path can avoid `_fused.pyd` on SM89 | — | **unknown — §2.3, blocking for goal 1** |
+| H3 reaches sage as HND (`skip_reshape=True`); `tensor_layout` is an indexing flag, not a copy switch | [`model.py:181`], `core.py`, §2.2 | **verified** |
+| SM89 uses `qk_quant_gran="per_thread"` by default, so the Triton kernels are the live Q/K path | `core.py:618`, `747`, §2.3 | **verified** |
+| `per_channel_fp8` calls `_fused.transpose_pad_permute_cuda` unconditionally; no sage API gives fp8 V without it | `quant.py:282`, §2.3 | **verified** |
+| `sageattn_qk_int8_pv_fp16_cuda` (sm80/86) avoids `per_channel_fp8` entirely — an `_fused`-free option at +1 byte/element on V | `core.py:436-599`, §2.3 | **verified** |
 | Peak-memory and latency delta of `sage_mem_eff` vs `sage` | — | **unknown — §4** |
 
 ## 4. Validation — 4 runs
@@ -297,9 +356,10 @@ copy in the custom path, no access violation, and `_fused` never entered (§2.3)
 | ---: | --- | --- | --- |
 | 1 | Shared attention observer seam | `h3_attention/observer.py`, refactor `h3_probe/capture.py`, extend `tests/test_probe.py` | existing probe tests still pass; no backend behavior change |
 | 2 | Custom forward skeleton **+ the measurement** | `h3_attention/{patch,forward}.py`, `tests/test_h3_attention_forward.py`; attention delegates to PyTorch | §2.1 ≥ 0.90 GB **and** §2.2 answered — **stop here if not** |
-| 3 | SM89 int64 quantizers + dense Sage | `h3_attention/{triton_i64,sage_mem_eff,stats}.py`, `tests/test_sage_mem_eff.py` | §2.3 holds; §5 subprocess test passes |
+| 2a | Guard lives in this repo | `forward.py` applies the `contiguous()` check itself | **goal 1, V half closed for the custom path** |
+| 3 | SM89 int64 Q/K quantizer + dense Sage | `h3_attention/{triton_i64,sage_mem_eff,stats}.py`, `tests/test_sage_mem_eff.py` | §5 C=209 rung passes; **goal 1, Q/K half closed** |
 | 4 | Node wiring | `h3_attention/config.py`, `nodes_minimax_h3.py`, extend `tests/test_attention_backend.py` | §4 matrix; `sage` stays default |
-| 5 | Retire the ComfyUI-tree guard | delete the `contiguous()` edit from `comfy/ldm/modules/attention.py`; document in README | **goal 1 closed** |
+| 5 | Re-evaluate the shipping profile | `chunked_ref2v/PLAN.md` §4.6 revision if C=90 holds end to end | §4 results |
 
 Commit 1 before Commit 2 is not optional — a custom block forward bypasses the
 module-global `optimized_attention` binding the probe currently hooks, so the
@@ -342,12 +402,23 @@ before it is ever published.
 
 ## 9. Open questions
 
-1. §2.1 — does reserved memory actually drop? **Blocks Commits 3-5.**
-2. §2.2 — does Sage's NHD entry avoid a copy? Shapes the forward.
-3. §2.3 — can FP8 V avoid `_fused.pyd` on SM89? **Blocks goal 1.**
-4. If §2.1 succeeds, does C=90 become the shipping profile? That is a
-   `chunked_ref2v/PLAN.md` §4.6 revision, not an attention change — but it is the
-   reason this work is worth doing.
+§2.1, §2.2 and §2.3 are all answered above; what is left is downstream of them.
+
+1. **Does the block-level release move the end-to-end transient?** §2.1 proves the
+   allocator returns 1.518 GB at C=73 in isolation. A real run also has the
+   streaming DiT, ComfyUI's cache and the attention workspace competing for the
+   same pool. **This is the remaining risk**, and §4's four runs are what settle it.
+2. **Does C=90 become the shipping profile?** If the release survives end to end,
+   the 1.842 GB at C=90 is 2× what `chunked_ref2v` §4.6 buys with +2.7% compute,
+   and the 73-vs-90 trade dissolves. That is a `chunked_ref2v/PLAN.md` revision,
+   not an attention change — but it is the reason this work is worth doing.
+3. **Is owning the fp8 V transpose worth it?** `per_channel_fp8` allocates a full
+   padded `v_transposed_permutted` copy unconditionally (§2.3). A vendored kernel
+   could fuse that, or fp16 V could sidestep it at +1 byte/element. Purely a
+   Commit 3 performance question now that goal 1 no longer depends on it.
+4. **Does the int64 Q/K quantizer match the stock one bit-for-bit below the
+   overflow?** It must, or every existing measurement is invalidated. Cheap to
+   check at S=4096, as the original patch was.
 
 [`model.py:156-181`]: ../../../comfy/ldm/minimax/model.py
 [`model.py:177-179`]: ../../../comfy/ldm/minimax/model.py

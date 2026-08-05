@@ -68,6 +68,30 @@ def to_hnd(q, k, v):
             v.transpose(0, 1).unsqueeze(0))
 
 
+# SageAttention's fp8 V path reaches _fused.transpose_pad_permute_cuda, a closed
+# CUDA kernel whose SASS does every index x stride as a plain 32-bit IMAD with no
+# IMAD.WIDE (confirmed by cuobjdump, not inferred). It is *unsigned*, so it wraps
+# at 2^32 rather than faulting - a wrapped u32 stays positive and silently reads
+# the wrong memory. With H3's fused-QKV sequence stride of 21,504 that is row
+# 199,728. No source ships in the wheel, so it cannot be patched.
+#
+# A contiguous copy of v drops the sequence stride from 21,504 to 7,168 and moves
+# the ceiling to S=599,187. This check used to live in ComfyUI's own
+# comfy/ldm/modules/attention.py, where every update threatened to revert it;
+# here it survives updates by construction. See PLAN.md §2.3.
+#
+# On a 12 GB card it never fires - OOM arrives around S=120-150k, well below
+# 199,728 - so it costs a max() over four numbers per block and nothing else.
+V_OFFSET_LIMIT = (1 << 32) - 1
+
+
+def guard_v_stride(v):
+    """Copy v only if its maximum linear element offset would wrap a u32."""
+    if sum((size - 1) * stride for size, stride in zip(v.shape, v.stride())) > V_OFFSET_LIMIT:
+        return v.contiguous()
+    return v
+
+
 def make_forward(module, layer_index, attention=None):
     """Build the replacement forward for one block's attention module.
 
@@ -82,6 +106,7 @@ def make_forward(module, layer_index, attention=None):
     def forward(x, rope_freqs=None, transformer_options={}):
         q, k, v = project_qkv(module, x, rope_freqs)
         q, k, v = to_hnd(q, k, v)
+        v = guard_v_stride(v)
 
         # observers see post-norm, post-rope Q/K in the same HND layout the
         # module-global path delivers, but with a real block index attached

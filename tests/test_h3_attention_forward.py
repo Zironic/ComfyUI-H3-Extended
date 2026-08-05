@@ -112,6 +112,34 @@ def test_views_not_copies():
           "the int32 overflow turns on" % stride)
 
 
+def test_v_stride_guard():
+    """The u32 guard relocated out of ComfyUI's tree. PLAN.md §2.3."""
+    print("v stride guard")
+    attn = build_attention(seed=13)
+    x, rope = build_inputs(seed=14)
+    q, k, v = h3_forward.project_qkv(attn, x, rope)
+    _, _, vh = h3_forward.to_hnd(q, k, v)
+
+    guarded = h3_forward.guard_v_stride(vh)
+    check(guarded is vh, "short sequences are passed through untouched (no copy)")
+
+    # the real H3 geometry: stride 21504, unsigned wrap at 2^32
+    real_stride = 56 * 128 * 3
+    limit_row = h3_forward.V_OFFSET_LIMIT // real_stride
+    check(limit_row == 199728,
+          "u32 ceiling at H3's fused stride is row 199,728 (got %d)" % limit_row)
+
+    # a tensor whose max offset actually exceeds the limit must be copied, but
+    # allocating one is impossible here - drive the predicate directly instead
+    def max_offset(shape, stride):
+        return sum((n - 1) * s for n, s in zip(shape, stride))
+
+    under = max_offset((1, 56, 199_000, 128), (0, 128, real_stride, 1))
+    over = max_offset((1, 56, 200_000, 128), (0, 128, real_stride, 1))
+    check(under <= h3_forward.V_OFFSET_LIMIT < over,
+          "the guard's threshold brackets the measured 199,728-row ceiling")
+
+
 def test_observer():
     print("observation")
     seen = []
@@ -258,6 +286,7 @@ def main():
         test_parity_with_rope()
         test_parity_without_rope()
         test_views_not_copies()
+        test_v_stride_guard()
         test_observer()
         test_attention_injection()
         test_patch_install()
