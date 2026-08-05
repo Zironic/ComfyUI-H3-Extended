@@ -1,4 +1,4 @@
-"""Calibration, measured-residency tables, and budget projections for the A/B probe."""
+"""Calibration, measured-residency tables, and budget projections for A/B/C."""
 
 import _minimax_vram_probe_base as base
 from _minimax_vram_probe_ab_cli import layout_for, parse_profiles
@@ -10,6 +10,8 @@ from _minimax_vram_probe_ab_runtime import (
     safe_measure,
     update_resident_fit,
 )
+
+VARIANTS = ("A", "B", "C")
 
 
 def _variant_state(measurement, spill, threshold_bytes):
@@ -27,9 +29,40 @@ def _profile_text(value):
     return "none" if value is None else str(value)
 
 
-def run(args, parser, arch, dtype, device, reserve_gb, streamed,
-        baseline_forward, candidate_forward):
+def _pct(new, old):
+    if new is None or old is None:
+        return None
+    return (new / old - 1.0) * 100.0
+
+
+def _fmt_pct(value):
+    return "    n/a" if value is None else f"{value:>+6.1f}%"
+
+
+def _budget_state(total, budget):
+    if total is None:
+        return "OOM"
+    return "fit" if total <= budget else "over"
+
+
+def run(
+    args,
+    parser,
+    arch,
+    dtype,
+    device,
+    reserve_gb,
+    streamed,
+    plain_forward,
+    efficient_forward,
+    activation_forward,
+):
     threshold_bytes = int(args.physical_warning_mb) * MIB
+    forwards = {
+        "A": plain_forward,
+        "B": efficient_forward,
+        "C": activation_forward,
+    }
 
     def shared_cost(frames):
         layout = layout_for(args, frames)
@@ -53,10 +86,10 @@ def run(args, parser, arch, dtype, device, reserve_gb, streamed,
     if args.calibrate_to is not None:
         frames = base.align_frame_count(max(5, args.calibrate_to))
         layout, latent, condition = shared_cost(frames)
-        measured, _ = measure_variant(baseline_forward, frames, layout)
+        measured, _ = measure_variant(efficient_forward, frames, layout)
         if measured is None:
             print(
-                f"cannot calibrate: efficient-Sage baseline OOMs at {frames} "
+                f"cannot calibrate: variant B efficient Sage OOMs at {frames} "
                 "frames. Free the card and retry."
             )
             return
@@ -65,8 +98,8 @@ def run(args, parser, arch, dtype, device, reserve_gb, streamed,
             - (measured.peak_bytes + latent + condition) / base.GB
         )
         print(
-            f"calibration {frames} frames is known to fit {args.budget:.1f} GB on the "
-            f"efficient-Sage baseline, so the shared reserve is {solved:.2f} GB"
+            f"calibration {frames} frames is known to fit {args.budget:.1f} GB on "
+            f"variant B (efficient Sage), so the shared reserve is {solved:.2f} GB"
         )
         if solved < 0:
             print(
@@ -74,9 +107,7 @@ def run(args, parser, arch, dtype, device, reserve_gb, streamed,
                 "length is inconsistent"
             )
             return
-        print(
-            f"            reserve {reserve_gb:.2f} GB -> {solved:.2f} GB\n"
-        )
+        print(f"            reserve {reserve_gb:.2f} GB -> {solved:.2f} GB\n")
         reserve_gb, streamed = solved, False
 
     try:
@@ -89,152 +120,158 @@ def run(args, parser, arch, dtype, device, reserve_gb, streamed,
         print()
 
     print(
-        "measured isolated block residency "
+        "measured isolated block memory/residency "
         f"(physical free from cudaMemGetInfo; LOW < {args.physical_warning_mb} MiB)"
     )
     print(
-        f"{'frames':>7} {'tokens':>9} {'base tr':>8} {'act tr':>8} "
-        f"{'saved':>8} {'B free':>7} {'A free':>7} "
-        f"{'base ms':>8} {'act ms':>8} {'time':>7}  residency"
+        f"{'frames':>7} {'tokens':>9} {'A tr':>8} {'B tr':>8} {'C tr':>8} "
+        f"{'A-B':>8} {'B-C':>8} {'A free':>7} {'B free':>7} {'C free':>7}  residency"
     )
 
-    best_base_projected = best_candidate_projected = None
-    last_base_physical_safe = last_candidate_physical_safe = None
-    first_base_low = first_candidate_low = None
-    first_base_spill = first_candidate_spill = None
-    base_resident, candidate_resident, rows = [], [], []
+    best_projected = {key: None for key in VARIANTS}
+    last_physical_safe = {key: None for key in VARIANTS}
+    first_low = {key: None for key in VARIANTS}
+    first_spill = {key: None for key in VARIANTS}
+    resident_points = {key: [] for key in VARIANTS}
+    rows = []
 
     for frames in profiles:
         layout, latent, condition = shared_cost(frames)
-        baseline, _ = measure_variant(baseline_forward, frames, layout)
-        candidate, _ = measure_variant(candidate_forward, frames, layout)
+        measurements = {}
+        for key in VARIANTS:
+            measurements[key], _ = measure_variant(
+                forwards[key], frames, layout
+            )
 
-        base_trans = baseline.peak_bytes if baseline is not None else None
-        base_ms = baseline.median_ms if baseline is not None else None
-        act_trans = candidate.peak_bytes if candidate is not None else None
-        act_ms = candidate.median_ms if candidate is not None else None
+        transient = {
+            key: (
+                measurements[key].peak_bytes
+                if measurements[key] is not None
+                else None
+            )
+            for key in VARIANTS
+        }
+        median_ms = {
+            key: (
+                measurements[key].median_ms
+                if measurements[key] is not None
+                else None
+            )
+            for key in VARIANTS
+        }
+        totals = {
+            key: (
+                reserve_gb + (transient[key] + latent + condition) / base.GB
+                if transient[key] is not None
+                else None
+            )
+            for key in VARIANTS
+        }
+        for key in VARIANTS:
+            if totals[key] is not None and totals[key] <= args.budget:
+                best_projected[key] = frames
 
-        base_total = (
-            reserve_gb + (base_trans + latent + condition) / base.GB
-            if base_trans is not None
+        saved_ab = (
+            transient["A"] - transient["B"]
+            if transient["A"] is not None and transient["B"] is not None
             else None
         )
-        act_total = (
-            reserve_gb + (act_trans + latent + condition) / base.GB
-            if act_trans is not None
+        saved_bc = (
+            transient["B"] - transient["C"]
+            if transient["B"] is not None and transient["C"] is not None
             else None
         )
-        if base_total is not None and base_total <= args.budget:
-            best_base_projected = frames
-        if act_total is not None and act_total <= args.budget:
-            best_candidate_projected = frames
-
-        saved = (
-            base_trans - act_trans
-            if base_trans is not None and act_trans is not None
-            else None
-        )
-        slowdown = (
-            (act_ms / base_ms - 1.0) * 100.0
-            if base_ms is not None and act_ms is not None
+        saved_ac = (
+            transient["A"] - transient["C"]
+            if transient["A"] is not None and transient["C"] is not None
             else None
         )
 
-        base_phys_safe = bool(
-            baseline is not None
-            and baseline.physical_free_min >= threshold_bytes
-        )
-        act_phys_safe = bool(
-            candidate is not None
-            and candidate.physical_free_min >= threshold_bytes
-        )
-        if base_phys_safe:
-            last_base_physical_safe = frames
-        elif baseline is not None and first_base_low is None:
-            first_base_low = frames
-        if act_phys_safe:
-            last_candidate_physical_safe = frames
-        elif candidate is not None and first_candidate_low is None:
-            first_candidate_low = frames
-
+        phys_safe = {}
+        spills = {}
+        states = {}
         sequence = layout["seq_len"]
-        base_spill = act_spill = False
-        if base_ms is not None:
-            base_spill, _ = update_resident_fit(
-                base_resident,
-                sequence,
-                base_ms,
-                args.spill_ratio,
-                include_in_fit=base_phys_safe,
+        for key in VARIANTS:
+            measurement = measurements[key]
+            phys_safe[key] = bool(
+                measurement is not None
+                and measurement.physical_free_min >= threshold_bytes
             )
-            if base_spill and first_base_spill is None:
-                first_base_spill = frames
-        if act_ms is not None:
-            act_spill, _ = update_resident_fit(
-                candidate_resident,
-                sequence,
-                act_ms,
-                args.spill_ratio,
-                include_in_fit=act_phys_safe,
-            )
-            if act_spill and first_candidate_spill is None:
-                first_candidate_spill = frames
+            if phys_safe[key]:
+                last_physical_safe[key] = frames
+            elif measurement is not None and first_low[key] is None:
+                first_low[key] = frames
 
-        base_state = _variant_state(baseline, base_spill, threshold_bytes)
-        act_state = _variant_state(candidate, act_spill, threshold_bytes)
-        saved_text = "    n/a" if saved is None else f"{saved / base.GB:>7.3f}G"
-        time_text = "    n/a" if slowdown is None else f"{slowdown:>+6.1f}%"
+            spills[key] = False
+            if median_ms[key] is not None:
+                spills[key], _ = update_resident_fit(
+                    resident_points[key],
+                    sequence,
+                    median_ms[key],
+                    args.spill_ratio,
+                    include_in_fit=phys_safe[key],
+                )
+                if spills[key] and first_spill[key] is None:
+                    first_spill[key] = frames
+            states[key] = _variant_state(
+                measurement, spills[key], threshold_bytes
+            )
+
+        saved_ab_text = (
+            "    n/a" if saved_ab is None else f"{saved_ab / base.GB:>7.3f}G"
+        )
+        saved_bc_text = (
+            "    n/a" if saved_bc is None else f"{saved_bc / base.GB:>7.3f}G"
+        )
         print(
-            f"{frames:>7} {sequence:>9} {fmt_gib(base_trans)} {fmt_gib(act_trans)} "
-            f"{saved_text} "
-            f"{fmt_mib(baseline.physical_free_min if baseline else None)} "
-            f"{fmt_mib(candidate.physical_free_min if candidate else None)} "
-            f"{fmt_ms(base_ms)} {fmt_ms(act_ms)} {time_text}  "
-            f"B:{base_state} A:{act_state}"
+            f"{frames:>7} {sequence:>9} "
+            f"{fmt_gib(transient['A'])} {fmt_gib(transient['B'])} {fmt_gib(transient['C'])} "
+            f"{saved_ab_text} {saved_bc_text} "
+            f"{fmt_mib(measurements['A'].physical_free_min if measurements['A'] else None)} "
+            f"{fmt_mib(measurements['B'].physical_free_min if measurements['B'] else None)} "
+            f"{fmt_mib(measurements['C'].physical_free_min if measurements['C'] else None)}  "
+            f"A:{states['A']} B:{states['B']} C:{states['C']}"
         )
 
         rows.append({
             "frames": frames,
             "sequence": sequence,
-            "base_transient": base_trans,
-            "activation_transient": act_trans,
-            "saved": saved,
-            "base_ms": base_ms,
-            "activation_ms": act_ms,
-            "slowdown_percent": slowdown,
-            "base_total": base_total,
-            "activation_total": act_total,
-            "base_physical_free_min": (
-                baseline.physical_free_min if baseline else None
-            ),
-            "activation_physical_free_min": (
-                candidate.physical_free_min if candidate else None
-            ),
-            "base_physical_free_start": (
-                baseline.physical_free_start if baseline else None
-            ),
-            "activation_physical_free_start": (
-                candidate.physical_free_start if candidate else None
-            ),
-            "base_physical_samples": (
-                baseline.physical_samples if baseline else 0
-            ),
-            "activation_physical_samples": (
-                candidate.physical_samples if candidate else 0
-            ),
-            "base_spill": base_spill,
-            "activation_spill": act_spill,
+            "measurements": measurements,
+            "transient": transient,
+            "median_ms": median_ms,
+            "totals": totals,
+            "saved_ab": saved_ab,
+            "saved_bc": saved_bc,
+            "saved_ac": saved_ac,
+            "spills": spills,
+            "states": states,
         })
 
-        if base_spill and act_spill and not args.past_spill:
+        if all(spills.values()) and not args.past_spill:
             print(
-                "\nstopping: both variants left their resident timing curves; "
-                "pass --past-spill to continue"
+                "\nstopping: all three variants left their resident timing "
+                "curves; pass --past-spill to continue"
             )
             break
-        if baseline is None and candidate is None:
-            print("\nstopping: both variants hard-OOM at this profile")
+        if all(measurements[key] is None for key in VARIANTS):
+            print("\nstopping: all three variants hard-OOM at this profile")
             break
+
+    print()
+    print("measured isolated block timing (same profiles; median of timed forwards)")
+    print(
+        f"{'frames':>7} {'A ms':>8} {'B ms':>8} {'C ms':>8} "
+        f"{'B/A':>7} {'C/B':>7} {'C/A':>7}"
+    )
+    for row in rows:
+        times = row["median_ms"]
+        print(
+            f"{row['frames']:>7} "
+            f"{fmt_ms(times['A'])} {fmt_ms(times['B'])} {fmt_ms(times['C'])} "
+            f"{_fmt_pct(_pct(times['B'], times['A']))} "
+            f"{_fmt_pct(_pct(times['C'], times['B']))} "
+            f"{_fmt_pct(_pct(times['C'], times['A']))}"
+        )
 
     print()
     print(
@@ -242,98 +279,91 @@ def run(args, parser, arch, dtype, device, reserve_gb, streamed,
         "(arithmetic only: calibrated reserve is not allocated in this probe)"
     )
     print(
-        f"{'frames':>7} {'base projected':>15} {'act projected':>15}  budget state"
+        f"{'frames':>7} {'A projected':>15} {'B projected':>15} "
+        f"{'C projected':>15}  budget state"
     )
     for row in rows:
-        base_total = row["base_total"]
-        act_total = row["activation_total"]
-        base_fits = base_total is not None and base_total <= args.budget
-        act_fits = act_total is not None and act_total <= args.budget
-        if base_fits and act_fits:
-            state = "both fit"
-        elif act_fits and not base_fits:
-            state = "activation only"
-        elif base_fits and not act_fits:
-            state = "baseline only"
-        else:
-            state = "both over"
-        base_text = "OOM" if base_total is None else f"{base_total:.3f} GiB"
-        act_text = "OOM" if act_total is None else f"{act_total:.3f} GiB"
-        print(f"{row['frames']:>7} {base_text:>15} {act_text:>15}  {state}")
+        totals = row["totals"]
+        texts = {
+            key: ("OOM" if totals[key] is None else f"{totals[key]:.3f} GiB")
+            for key in VARIANTS
+        }
+        state = " ".join(
+            f"{key}:{_budget_state(totals[key], args.budget)}"
+            for key in VARIANTS
+        )
+        print(
+            f"{row['frames']:>7} {texts['A']:>15} {texts['B']:>15} "
+            f"{texts['C']:>15}  {state}"
+        )
 
     print()
-    paired = [row for row in rows if row["saved"] is not None]
-    if paired:
-        target = max(paired, key=lambda row: row["frames"])
+    complete = [
+        row for row in rows
+        if all(row["measurements"][key] is not None for key in VARIANTS)
+    ]
+    if complete:
+        target = max(complete, key=lambda row: row["frames"])
+        a = target["transient"]["A"]
+        b = target["transient"]["B"]
+        c = target["transient"]["C"]
         print(
-            "largest paired profile: C=%d S=%d saves %.3f GiB "
-            "(%.1f%% of baseline), time delta %+.1f%%"
+            "largest complete profile: C=%d S=%d; "
+            "A→B saves %.3f GiB, B→C saves %.3f GiB, "
+            "A→C saves %.3f GiB"
             % (
                 target["frames"],
                 target["sequence"],
-                target["saved"] / base.GB,
-                100.0 * target["saved"] / target["base_transient"],
-                target["slowdown_percent"],
+                (a - b) / base.GB,
+                (b - c) / base.GB,
+                (a - c) / base.GB,
+            )
+        )
+        print(
+            "timing at that profile: B/A %+.1f%%, C/B %+.1f%%, C/A %+.1f%%"
+            % (
+                _pct(target["median_ms"]["B"], target["median_ms"]["A"]),
+                _pct(target["median_ms"]["C"], target["median_ms"]["B"]),
+                _pct(target["median_ms"]["C"], target["median_ms"]["A"]),
             )
         )
 
-    last_tested = rows[-1]["frames"] if rows else None
     print(f"physical warning threshold: {args.physical_warning_mb} MiB")
     print(
-        "last measured at/above threshold: baseline=%s, activation=%s"
-        % (
-            _profile_text(last_base_physical_safe),
-            _profile_text(last_candidate_physical_safe),
+        "last measured at/above threshold: "
+        + ", ".join(
+            f"{key}={_profile_text(last_physical_safe[key])}"
+            for key in VARIANTS
         )
     )
     print(
-        "first measured below threshold: baseline=%s, activation=%s"
-        % (
-            _profile_text(first_base_low),
-            _profile_text(first_candidate_low),
+        "first measured below threshold: "
+        + ", ".join(
+            f"{key}={_profile_text(first_low[key])}"
+            for key in VARIANTS
         )
     )
     print(
-        "first timing-curve spill: baseline=%s, activation=%s"
-        % (
-            _profile_text(first_base_spill),
-            _profile_text(first_candidate_spill),
+        "first timing-curve spill: "
+        + ", ".join(
+            f"{key}={_profile_text(first_spill[key])}"
+            for key in VARIANTS
         )
     )
     print(
-        "largest projected under %.1f GB: baseline=%s, activation=%s"
-        % (
-            args.budget,
-            _profile_text(best_base_projected),
-            _profile_text(best_candidate_projected),
+        f"largest projected under {args.budget:.1f} GB: "
+        + ", ".join(
+            f"{key}={_profile_text(best_projected[key])}"
+            for key in VARIANTS
         )
     )
-    if rows:
-        base_all_safe = first_base_low is None and all(
-            row["base_physical_free_min"] is not None for row in rows
-        )
-        act_all_safe = first_candidate_low is None and all(
-            row["activation_physical_free_min"] is not None for row in rows
-        )
-        if base_all_safe:
-            print(
-                "baseline physical-free floor stayed above threshold through "
-                f"C={last_tested}"
-            )
-        if act_all_safe:
-            print(
-                "activation physical-free floor stayed above threshold through "
-                f"C={last_tested}"
-            )
 
     sample_counts = [
-        count
+        row["measurements"][key].physical_samples
         for row in rows
-        for count in (
-            row["base_physical_samples"],
-            row["activation_physical_samples"],
-        )
-        if count
+        for key in VARIANTS
+        if row["measurements"][key] is not None
+        and row["measurements"][key].physical_samples
     ]
     if sample_counts:
         print(
@@ -353,6 +383,6 @@ def run(args, parser, arch, dtype, device, reserve_gb, streamed,
     if streamed and args.calibrate_to is None:
         print(
             "Reserve is a streamed-weight floor, so projected budget lines are "
-            "upper bounds. Use --calibrate-to with a known-good efficient-Sage "
-            "baseline length."
+            "upper bounds. Use --calibrate-to with a known-good variant-B "
+            "efficient-Sage length."
         )
