@@ -28,6 +28,17 @@ import node_helpers
 from comfy.ldm.modules.attention import REGISTERED_ATTENTION_FUNCTIONS, get_attention_function
 from comfy_api.latest import ComfyExtension, io
 
+try:
+    from . import run_context
+    # bound as names, not as the module: the widget is also called cond_cache
+    # and would shadow it inside execute()
+    from .cond_cache import MODES as COND_CACHE_MODES, encode as encode_conditioning
+    from .vram_guard import install_unet_guard
+except ImportError:  # the self-tests import this file as a top-level module
+    import run_context
+    from cond_cache import MODES as COND_CACHE_MODES, encode as encode_conditioning
+    from vram_guard import install_unet_guard
+
 CANVAS_MULTIPLE = 32
 BASE_SHORT_EDGE = 768
 MAX_PIXELS = 768 * 1344
@@ -134,11 +145,22 @@ class EmptyMiniMaxH3LatentAV(io.ComfyNode):
                 io.Int.Input("length", default=124, min=5, max=3600, step=17, tooltip="Frame count at 24 fps, snapped up to the model's 17k+5 grid (124 = ~5s; trained range is ~124-362, longer is untested)"),
             ],
             outputs=[io.Latent.Output()],
+            hidden=[io.Hidden.unique_id],
         )
 
     @classmethod
     def execute(cls, width, height, length) -> io.NodeOutput:
-        latent, _ = _empty_av_latent(width, height, length)
+        latent, frame_count = _empty_av_latent(width, height, length)
+        video, audio = latent["samples"].tensors
+        run_context.record(
+            "Empty MiniMax H3 AV Latent (Zi)", run_context.node_id(cls),
+            [("canvas", "%dx%d" % (width, height)),
+             ("length", "%d requested -> %d frames (%.2fs at %d fps)"
+              % (length, frame_count, frame_count / FPS, FPS)),
+             ("video latent", list(video.shape)),
+             ("audio latent", list(audio.shape))],
+            video_latent_shape=video.shape,
+        )
         return io.NodeOutput(latent)
 
 
@@ -172,21 +194,53 @@ class MiniMaxH3ImageToVideo(io.ComfyNode):
                         "7 outputs 22."
                     ),
                 ),
+                io.Combo.Input(
+                    "cond_cache",
+                    options=COND_CACHE_MODES,
+                    default="auto",
+                    tooltip=(
+                        "Reuse the Qwen3-VL pass across runs, keyed on a hash of the token "
+                        "stream (prompt text plus reference pixels) and the text encoder "
+                        "identity. 'auto' reads and writes the cache; 'off' bypasses it; "
+                        "'refresh' re-encodes and overwrites the entry. A hit skips loading "
+                        "the 14.6 GB encoder entirely, so changing only length or sampler "
+                        "settings costs nothing here."
+                    ),
+                ),
                 io.Image.Input("first_frame", optional=True),
                 io.Image.Input("last_frame", optional=True),
             ],
             outputs=[io.Conditioning.Output(display_name="positive"), io.Latent.Output()],
+            hidden=[io.Hidden.unique_id],
         )
 
     @classmethod
     def execute(cls, clip, vae, prompt, width, height, length,
-                raw_latent_t=0, first_frame=None, last_frame=None) -> io.NodeOutput:
+                raw_latent_t=0, cond_cache="auto",
+                first_frame=None, last_frame=None) -> io.NodeOutput:
         if raw_latent_t > 0:
             latent, frame_count = _empty_av_latent_raw_t(
                 width, height, raw_latent_t
             )
         else:
             latent, frame_count = _empty_av_latent(width, height, length)
+
+        video, audio = latent["samples"].tensors
+        run_context.record(
+            "MiniMax H3 Image to Video (Zi)", run_context.node_id(cls),
+            [("canvas", "%dx%d" % (width, height)),
+             ("length", ("raw_latent_t %d -> %d frames" % (raw_latent_t, frame_count))
+              if raw_latent_t > 0 else
+              ("%d requested -> %d frames (%.2fs at %d fps)"
+               % (length, frame_count, frame_count / FPS, FPS))),
+             ("first_frame", run_context.image_res(first_frame)),
+             ("last_frame", run_context.image_res(last_frame)),
+             ("cond_cache", cond_cache),
+             ("prompt", "%d chars" % len(prompt)),
+             ("video latent", list(video.shape)),
+             ("audio latent", list(audio.shape))],
+            video_latent_shape=video.shape,
+        )
 
         images = []
         keyframes = []
@@ -202,7 +256,7 @@ class MiniMaxH3ImageToVideo(io.ComfyNode):
             keyframes.append({"resolved_frame_index": frame_count - 1, "image": img})
 
         tokens = clip.tokenize(prompt, images=images)
-        cond = clip.encode_from_tokens_scheduled(tokens)
+        cond = encode_conditioning(clip, tokens, mode=cond_cache, label=prompt)
 
         if keyframes:
             for kf in keyframes:
@@ -240,6 +294,19 @@ class MiniMaxH3ReferenceToVideo(io.ComfyNode):
                 io.Int.Input("length", default=124, min=5, max=3600, step=17, tooltip="Frame count at 24 fps, (124 = ~5s, trained range is ~124-362)"),
                 io.Combo.Input("ref_image_size", options=["match", "max"], default="match",
                     tooltip="Reference image sizing. 'match' scales each ref (down only, keeping aspect) to the generation's pixel area; 'max' uses the reference pipeline's 2048px short edge for best identity fidelity. Reference tokens ride through every sampling step, so 'max' can be several times slower."),
+                io.Combo.Input(
+                    "cond_cache",
+                    options=COND_CACHE_MODES,
+                    default="auto",
+                    tooltip=(
+                        "Reuse the Qwen3-VL pass across runs, keyed on a hash of the token "
+                        "stream (prompt text plus reference pixels) and the text encoder "
+                        "identity. 'auto' reads and writes the cache; 'off' bypasses it; "
+                        "'refresh' re-encodes and overwrites the entry. A hit skips loading "
+                        "the 14.6 GB encoder entirely, so changing only length or sampler "
+                        "settings costs nothing here."
+                    ),
+                ),
                 io.Autogrow.Input("ref_images", optional=True,
                     template=io.Autogrow.TemplatePrefix(
                         input=io.Image.Input("ref_image", tooltip="Reference image (downscaled to 2048 short edge if larger, never upscaled)"),
@@ -258,6 +325,7 @@ class MiniMaxH3ReferenceToVideo(io.ComfyNode):
                         prefix="ref_audio_", min=0, max=3)),
             ],
             outputs=[io.Conditioning.Output(display_name="positive"), io.Latent.Output()],
+            hidden=[io.Hidden.unique_id],
         )
 
     @staticmethod
@@ -272,13 +340,15 @@ class MiniMaxH3ReferenceToVideo(io.ComfyNode):
 
     @classmethod
     def execute(cls, clip, vae, audio_vae, prompt, width, height, length, ref_image_size="match",
+                cond_cache="auto",
                 ref_images=None, ref_videos=None, ref_video_audios=None, ref_audios=None) -> io.NodeOutput:
         latent, frame_count = _empty_av_latent(width, height, length)
 
         ref_items = []   # for the tokenizer presentation, in request order
         ref_blocks = []  # for the DiT payload, same order
+        recorded = []    # source -> encoded size of every reference, for the VRAM guard
 
-        for img in (ref_images or {}).values():
+        for name, img in (ref_images or {}).items():
             if img is None:
                 continue
             h, w = img.shape[1], img.shape[2]
@@ -293,6 +363,8 @@ class MiniMaxH3ReferenceToVideo(io.ComfyNode):
             z = vae.encode(resized)
             ref_items.append({"type": "image", "data": resized})
             ref_blocks.append({"kind": "image", "latent_h": th // 16, "latent_w": tw // 16, "latent": z})
+            recorded.append((name, "%dx%d source -> %dx%d encoded (latent %dx%d)"
+                             % (w, h, tw, th, tw // 16, th // 16)))
 
         ref_video_audios = ref_video_audios or {}
         for name, video_frames in (ref_videos or {}).items():
@@ -328,16 +400,41 @@ class MiniMaxH3ReferenceToVideo(io.ComfyNode):
             ref_blocks.append({"kind": "video_audio" if ref_audio_t else "video",
                                "latent_t": z.shape[2], "latent_h": ch // 16, "latent_w": cw // 16,
                                "ref_audio_t": ref_audio_t, "latent": z, "audio_latent": audio_latent})
+            recorded.append((name, "%dx%d x%d frames source -> %dx%d canvas x%d frames used "
+                                   "(latent t=%d, %dx%d)"
+                             % (vw, vh, video_frames.shape[0], cw, ch, n,
+                                z.shape[2], cw // 16, ch // 16)))
+            if soundtrack is not None:
+                recorded.append((name + " soundtrack",
+                                 "%s -> latent t=%d" % (run_context.audio_desc(soundtrack),
+                                                        ref_audio_t)))
 
-        for audio in (ref_audios or {}).values():
+        for name, audio in (ref_audios or {}).items():
             if audio is None:
                 continue
             audio_latent, ref_audio_t = cls._encode_ref_audio(audio_vae, audio)
             ref_items.append({"type": "audio"})
             ref_blocks.append({"kind": "audio", "ref_audio_t": ref_audio_t, "audio_latent": audio_latent})
+            recorded.append((name, "%s -> latent t=%d"
+                             % (run_context.audio_desc(audio), ref_audio_t)))
+
+        video, audio_latent_target = latent["samples"].tensors
+        run_context.record(
+            "MiniMax H3 Reference to Video (Zi)", run_context.node_id(cls),
+            [("canvas", "%dx%d" % (width, height)),
+             ("length", "%d requested -> %d frames (%.2fs at %d fps)"
+              % (length, frame_count, frame_count / FPS, FPS)),
+             ("ref_image_size", ref_image_size),
+             ("cond_cache", cond_cache),
+             ("prompt", "%d chars" % len(prompt))]
+            + recorded
+            + [("video latent", list(video.shape)),
+               ("audio latent", list(audio_latent_target.shape))],
+            video_latent_shape=video.shape,
+        )
 
         tokens = clip.tokenize(prompt, minimax_ref_items=ref_items)
-        cond = clip.encode_from_tokens_scheduled(tokens)
+        cond = encode_conditioning(clip, tokens, mode=cond_cache, label=prompt)
         if ref_blocks:
             cond = node_helpers.conditioning_set_values(cond, {"minimax_refs": ref_blocks})
         return io.NodeOutput(cond, latent)
@@ -407,12 +504,27 @@ class MiniMaxH3SigmaShift(io.ComfyNode):
                         "Errors rather than falling back silently, so benchmarks stay honest."
                     ),
                 ),
+                io.Int.Input(
+                    "vram_guard_mb",
+                    default=800,
+                    min=0,
+                    max=24576,
+                    step=64,
+                    tooltip=(
+                        "Cancel the run if free physical VRAM drops below this many MB "
+                        "before a DiT forward. Logs the memory picture, releases cached "
+                        "blocks, and only cancels if the memory does not come back - so "
+                        "the prompt ends the way the Cancel button ends it instead of "
+                        "raising a CUDA OOM that can kill the prompt worker. 0 disables."
+                    ),
+                ),
             ],
             outputs=[io.Model.Output()],
         )
 
     @classmethod
-    def execute(cls, model, shift_video, shift_audio, attention_backend="sage") -> io.NodeOutput:
+    def execute(cls, model, shift_video, shift_audio, attention_backend="sage",
+                vram_guard_mb=800) -> io.NodeOutput:
         m = model.clone()
 
         class ModelSamplingAdvanced(comfy.model_sampling.ModelSamplingDiscreteFlow, comfy.model_sampling.CONST):
@@ -429,6 +541,7 @@ class MiniMaxH3SigmaShift(io.ComfyNode):
         to["minimax_h3_sigma_shift_video"] = shift_video
         to["minimax_h3_sigma_shift_audio"] = shift_audio
         _set_h3_attention_backend(to, attention_backend)
+        install_unet_guard(m, vram_guard_mb)
         return io.NodeOutput(m)
 
 

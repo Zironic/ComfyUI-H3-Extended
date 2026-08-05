@@ -25,6 +25,124 @@ this copy.
 
 ---
 
+# Conditioning cache
+
+Both conditioning nodes carry a `cond_cache` widget (`auto` / `off` / `refresh`,
+default `auto`) that reuses the Qwen3-VL-32B pass across runs.
+
+The encoder's output depends on the token stream and the TE weights, and on
+nothing else — not width, height, length, sampler settings or seed. But
+ComfyUI's execution cache is keyed on the *whole node*, so nudging `length` by
+one frame re-runs a 14.6 GB text encoder over pixels that did not change, and a
+server restart discards the result entirely.
+
+So the key is a blake2b digest of what the encoder actually consumes, taken
+after tokenization: every text token id and weight, plus the shape, dtype and
+full contents of every vision block, plus a fingerprint of the text encoder
+itself. Entries are safetensors files in `<user-directory>/h3_cond_cache/`.
+
+A hit means the encoder is never staged onto the GPU at all — which on a 12 GB
+card is most of the point, not just a time saving.
+
+| mode | behaviour |
+| --- | --- |
+| `auto` | read and write |
+| `off` | bypass entirely, neither read nor write |
+| `refresh` | ignore any stored entry, re-encode, overwrite |
+
+## Identifying the text encoder without hashing 14.6 GB
+
+Core's loaders record how to rebuild a patcher in `cached_patcher_init`, which
+for a CLIP is `(load_clip_model_patcher, (ckpt_paths, embedding_directory,
+clip_type, model_options))` and survives `clone()`. The fingerprint is the
+checkpoint files' basename/size/mtime plus `clip_type` and `model_options`, so
+swapping the TE file or its dtype/quantization misses, and `patches_uuid` —
+which is regenerated per process and would miss on every restart — is not used.
+
+## Keeping it bounded
+
+`sweep()` runs once on first use and again after every store attempt — after
+failures too, since a failed store is exactly when debris is left behind. It
+applies three limits in order:
+
+| limit | default | env |
+| --- | --- | --- |
+| orphaned temp files | older than 1 hour | — |
+| unused entries | 30 days since last **use** | `H3_COND_CACHE_MAX_AGE_DAYS` (0 disables) |
+| total size | 20 GB, oldest-used first | `H3_COND_CACHE_GB` |
+
+A store writes `<digest>.safetensors.<pid>.tmp` and then `os.replace`s it into
+position. A process killed in between leaves an orphan nothing would ever read
+again — and on this box that is not hypothetical, since an OOM cascade takes the
+prompt worker with it. Those are collected by age; a failed store also deletes
+its own temp file immediately rather than waiting.
+
+Age is measured from last use, not creation, because a hit refreshes the entry's
+mtime — which is also what makes the size eviction a real LRU. An entry you use
+weekly never expires.
+
+`cond_cache.purge()` clears everything by hand and returns
+`(files_removed, bytes_freed)`.
+
+## Owning the folder, not vetting the files
+
+The sweep deletes things, so the question "is this mine?" has to be answered
+before it runs — and the answer is a property of the *folder*, decided once,
+rather than something re-derived per file at delete time.
+
+On first use the cache claims its directory by writing a `.h3_cond_cache`
+marker. It will claim a folder it created, one that is empty, or one already
+carrying the marker; a folder holding only cache-shaped files is adopted too,
+which covers upgrades. **Anything else is refused outright** — the cache logs an
+error and disables itself for the session rather than operating in a directory
+it cannot account for. Refusing to use a folder is a far better failure than
+sweeping one.
+
+That matters because `H3_COND_CACHE_DIR` can point anywhere, and the obvious
+mistake points it at a models folder. The test aims it at a directory holding a
+fake `qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors`, sets the cap to zero and the
+age limit to a day, then calls both `sweep()` and `purge()` and asserts the file
+is still there and no marker was dropped.
+
+Inside an owned folder, a file matching `32 hex digits + .safetensors` is one of
+ours and gets deleted on the normal age/size rules — corrupt ones included.
+Checking each file's metadata instead would strand exactly the corrupt entries
+that most need collecting, since those are the ones that no longer parse.
+
+`purge()` leaves the marker in place so the folder stays claimed.
+
+## What it refuses to do
+
+A wrong hit is much worse than a miss, so anything the key cannot see falls
+through to a plain encode: a LoRA-patched text encoder or an active hook
+schedule (both change the output without changing the tokens), unknown
+checkpoint provenance, an unrecognised token or conditioning payload, and any
+read error. Store failures are caught and logged — the conditioning is returned
+either way.
+
+Log lines are prefixed `[H3 Extended] cond cache` and name the digest, so a hit
+and the store that produced it can be matched up in
+`D:\AI\ComfyUI\User\comfyui.log`.
+
+## Two traps worth recording
+
+**Slice views.** The tokenizer emits video as `frames[i:i+2]` pairs, which are
+already contiguous, so `.contiguous()` is a no-op and the underlying storage
+still spans the whole video. Hashing at storage level would read identical bytes
+for every pair in a clip and collide them; the hash goes through numpy's view,
+which carries the correct shape and strides.
+
+**safetensors mmap on Windows.** Loading returns mmap-backed tensors, and a
+mapped file cannot be deleted or replaced while those views are alive. Holding
+them for the length of a sampling run would block both LRU eviction and a
+`refresh` of that same entry, so a hit copies out and drops the mapping.
+
+Env overrides, for when the widget is not reachable: `H3_COND_CACHE_DISABLE=1`,
+`H3_COND_CACHE_DIR=<path>`, `H3_COND_CACHE_GB=<float>`,
+`H3_COND_CACHE_MAX_AGE_DAYS=<float>`.
+
+---
+
 # Attention backend
 
 `MiniMaxH3SigmaShiftZi` also selects the attention backend for the H3 DiT, via
@@ -98,6 +216,115 @@ Error running sage attention ... using pytorch attention instead
 The attention probe composes with this: it records Q/K and then delegates to the
 original attention function with the same `transformer_options`, so the
 delegated call goes through the selected backend. Both are covered by tests.
+
+---
+
+# VRAM guard
+
+Armed from either of two places, whichever is in the graph:
+
+- `MiniMaxH3SigmaShiftZi`, via its `vram_guard_mb` widget — patches the model, so
+  it covers any sampler;
+- `SamplerCustomAdvancedMiniMaxPreview` in `comfyui-minimax-preview`, via the same
+  widget — covers the whole sampling run including the preview decode.
+
+Default `800` MB in both, `0` disables. **The model-patch route only arms if the
+`(Zi)` shift node is actually in the workflow** — a graph on the stock
+`MiniMaxH3SigmaShift` gets no guard, and the giveaway is that none of this
+extension's `[H3 Extended]` log lines appear at all. The sampler route exists
+because that node is in every H3 workflow here regardless.
+
+Both can be armed at once: the second install is skipped rather than stacking a
+duplicate check.
+
+12 GB is tight for H3 — the stages hold ~20 GB of weights with dynamic VRAM
+loading — and an OOM raised from inside the DiT forward tends to cascade through
+`model_management`'s recovery path and take the `prompt_worker` thread with it,
+which needs a full server restart rather than a re-queue.
+
+So rather than waiting for the driver to refuse an allocation, the guard checks
+free **physical** VRAM at each point where the next allocation is about to be a
+big one — before every DiT forward, and, when armed from the preview sampler,
+either side of the preview decode (that decoder is a resident 2.26 GiB fp8 model,
+invisible to the pre-forward check) plus once before sampling starts:
+
+- above the threshold: nothing happens (one cheap `torch.cuda.mem_get_info` call);
+- below it: logs the memory picture at `WARNING`, releases cached blocks
+  (`soft_empty_cache(force=True)`) and re-measures;
+- still below after that: logs the full picture at `ERROR` and raises
+  `InterruptProcessingException` — the same exception the Cancel button raises, so
+  the executor unwinds cleanly, the prompt is marked cancelled, and the worker
+  survives.
+
+The check runs *before* the forward, so the allocation that would have OOM'd
+never happens.
+
+## What the cancel log says
+
+By the time the guard fires, the numbers worth knowing — requested frame length,
+the source resolution of every reference image and video, the canvas each was
+resized to — have already been consumed and discarded by the conditioning nodes.
+So those nodes deposit their inputs in `run_context.py` as they run, and the
+cancel log prints them next to the memory picture:
+
+```text
+[H3 Extended] VRAM guard cancelling run at DiT forward (sigma 0.7413)
+  memory: free physical 612 MB / 12282 MB total; torch reserved 9942 MB, allocated 8801 MB (threshold 800 MB, still under it after releasing cached blocks)
+  sampling: video latent [2, 24, 12, 48, 84], audio latent [2, 32, 2, 207], cond_or_uncond [1, 0]
+  packed tokens: seq_len=13834 text=300 ref_img=1024 audio=414(t=207) video=12096(t=12,24x42)
+  node inputs for this run:
+    MiniMax H3 Reference to Video (Zi) [node 14]:
+      canvas: 1344x768
+      length: 124 requested -> 124 frames (5.17s at 24 fps)
+      ref_image_size: max
+      ref_image_1: 3024x4032 source -> 1536x2048 encoded (latent 96x128)
+      ref_video_1: 1920x1080 x240 frames source -> 1344x768 canvas x226 frames used (latent t=67, 84x48)
+      video latent: [1, 24, 12, 48, 84]
+      audio latent: [1, 32, 2, 207]
+  Cancelling now rather than letting the next allocation raise a CUDA OOM, ...
+```
+
+Two different provenances, deliberately: the `sampling` and `packed tokens` lines
+are measured from the live forward pass (the latter resolved through the probe's
+`resolve_layout` against core's real `PackedLayout`, since `seq_len` is what
+actually drives attention memory), while the node inputs are remembered. Records
+are keyed by graph node id and overwritten on re-execution, so a workflow that
+runs H3 twice reports the second run's numbers. Each record also stores the
+latent it produced; a record whose latent does not match the tensor being
+denoised — ignoring batch, which the sampler doubles for cond+uncond — is printed
+flagged `[stale: ...]` rather than passed off as current.
+
+Building the description is lazy (it only runs on the cancel path) and every part
+of it is best-effort: an unresolvable layout is skipped, an unreadable input
+prints as `unreadable`, and a description that throws is logged and stepped over.
+The cancellation itself always happens.
+
+This deliberately does not use `comfy.model_management.get_free_memory`, which
+adds torch's reserved-but-unused bytes back into the total. The question the guard
+asks is what the driver can still hand out — and under `cudaMallocAsync` a full
+pool is exactly the condition worth trimming, which is what the release-and-recheck
+second chance is for. Log lines report both readings (`free physical` plus torch
+`reserved`/`allocated`) so the two can be compared after the fact.
+
+Log lines are prefixed `[H3 Extended] VRAM guard` and land in
+`D:\AI\ComfyUI\User\comfyui.log`.
+
+The guard covers sampling and the preview decode. The final VAE decode and the
+text encoder run in other nodes and are not wrapped.
+
+The preview sampler finds this module by matching `__file__` across `sys.modules`,
+rather than importing it by path — a path import would build a *second*
+`run_context`, and the conditioning nodes' recorded inputs would never reach the
+cancel log. It resolves lazily at sample time, so custom-node load order does not
+matter, and warns once and samples unguarded if this extension is missing.
+
+It matches on the file rather than the module name because directory custom nodes
+are **not** registered under their folder name. `nodes.load_custom_node` uses the
+*full path* as the module name (`sys_module_name = module_path.replace(".",
+"_x_")`), so the real key here is
+`c:/...\custom_nodes\ComfyUI-H3-Extended.vram_guard`. The directory itself comes
+from `nodes.LOADED_MODULE_DIRS`, so an install under a different custom-node root
+still resolves.
 
 ---
 
@@ -280,11 +507,45 @@ statistics with synthetic Q/K whose attention target is known in advance:
 cd /path/to/ComfyUI
 python custom_nodes/ComfyUI-H3-Extended/tests/test_probe.py
 python custom_nodes/ComfyUI-H3-Extended/tests/test_attention_backend.py
+python custom_nodes/ComfyUI-H3-Extended/tests/test_vram_guard.py
+python custom_nodes/ComfyUI-H3-Extended/tests/test_cond_cache.py
 ```
+
+Only `test_cond_cache.py` is safe to run while a generation is in flight — it is
+the one that runs with the GPU masked out entirely.
+
+`test_attention_backend.py` **runs real kernels on the card** when CUDA and
+SageAttention are present. `test_probe.py` and `test_vram_guard.py` stub the
+driver queries but still construct CUDA tensors, so they need a device to exist
+and will fail with `No CUDA GPUs are available` if one is masked — they are
+cheap, but they are not free.
+
+Note that `CUDA_VISIBLE_DEVICES=""` does *not* mask the device on Windows; it is
+silently ignored and torch still sees the GPU. Only `CUDA_VISIBLE_DEVICES=-1`
+actually masks it.
 
 The backend test verifies routing with a registered stand-in (so it runs
 anywhere) and, when SageAttention and CUDA are present, additionally checks the
 real kernel's accuracy and that it did not silently fall back.
+
+The VRAM-guard test stubs the driver query and the cache release — neither can be
+exercised honestly without pushing a real GPU to the edge — and covers the
+decision logic around them: the threshold comparison, the release-and-recheck
+second chance, that a breach raises `InterruptProcessingException` before the
+forward runs, and that an already-installed unet wrapper is chained rather than
+replaced. It also asserts on the contents of the cancel log, and resolves a real
+`PackedLayout` to check the `packed tokens` line.
+
+The cond-cache test stubs the text encoder — loading Qwen3-VL-32B to test a
+cache that exists to avoid loading it would defeat the point — and covers what
+surrounds it: that a hit is bit-identical, that every input which genuinely
+changes the embeddings also changes the key (including a different video frame
+pair of the same shape, which is the slice-view trap), that each bypass fires,
+and that a hit leaves the entry deletable rather than mmap-locked. The janitor
+gets the same treatment: that eviction drops the least recently *used* rather
+than the oldest stored, that orphaned and failed temp files are collected, that
+age expiry keys off last use, and that a folder holding anything the cache did
+not write is refused rather than swept.
 
 ## Notes on the fork
 
@@ -293,3 +554,9 @@ The nodes only produce conditioning + latents — all model-side behaviour
 and is *not* forked here. If a core update changes those conditioning keys
 (`minimax_keyframes`, `minimax_refs`, `minimax_h3_sigma_shift_*`), the packed
 layout, or the attention call site, this fork needs the matching update.
+
+The conditioning cache additionally leans on two core shapes: `cached_patcher_init`
+on the CLIP's patcher (for TE provenance) and `encode_from_tokens_scheduled`
+returning `[[cond, dict]]`. Both are checked at runtime and fall back to a plain
+encode if they change, so a core update degrades performance rather than
+correctness.
