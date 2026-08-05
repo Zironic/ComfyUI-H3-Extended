@@ -186,15 +186,30 @@ def test_strategy_isolation():
           "one arm cannot mutate another")
 
 
+def test_composite_qwen_replacement():
+    print("composite Qwen replacement")
+    context = harness.HarnessContext(geo.DEFAULT_GEOMETRY, harness.SeedSet(1),
+                                     (128, 128))
+    audio = {"type": "audio"}
+    video = {"type": "video", "name": "original"}
+    replacement = {"type": "video", "name": "composite"}
+    context.qwen_ref_items_b = [audio, video]
+    out = harness._replace_source_item(context, [replacement])
+    check([item["type"] for item in out] == ["audio", "video"],
+          "composite swap keeps exactly one audio item")
+    check(out[-1] is replacement, "composite video replaces the original video")
+
+
 def test_comparison_cap():
     print("comparison cap")
-    frames = torch.zeros(2, 1080, 1920, 3)
+    # Long-edge fixtures without allocating source-video-sized gigabytes.
+    frames = torch.zeros(2, 32, 1024, 3)
     out, _ = comparison.columns([("a", frames), ("b", frames)])
     check(out.shape[1] <= 512 and out.shape[2] <= 1024,
           "two-column preview is bounded to 512 pixels per tile")
     boundary = comparison.boundary_playback(
-        chunk_a_pixels=torch.zeros(73, 1080, 1920, 3),
-        chunk_b_pixels=torch.zeros(73, 1080, 1920, 3),
+        chunk_a_pixels=torch.zeros(73, 32, 1024, 3),
+        chunk_b_pixels=torch.zeros(73, 32, 1024, 3),
         geometry=geo.DEFAULT_GEOMETRY)
     check(max(boundary.shape[1:3]) <= 512,
           "boundary preview is also bounded")
@@ -205,11 +220,11 @@ def test_artifact_reuse_policy():
     root = tempfile.mkdtemp(prefix="h3_harness_test_")
     old = os.environ.pop(artifacts.AUTO_REUSE_ENV, None)
     try:
-        g = geo.DEFAULT_GEOMETRY
         kwargs = dict(
             source_frames=torch.rand(73, 8, 8, 3), prompt="p", ref_pixels=[],
-            canvas=(128, 128), geometry=g, seed=7, sampler_name="euler",
-            sigmas=torch.linspace(1, 0, 11), checkpoint="ckpt")
+            canvas=(128, 128), geometry=geo.DEFAULT_GEOMETRY, seed=7,
+            sampler_name="euler", sigmas=torch.linspace(1, 0, 11),
+            checkpoint="ckpt")
         identity = artifacts.chunk_a_identity(**kwargs)
         run_id = artifacts.new_run_id(identity)
         store = artifacts.RunStore(root, run_id)
@@ -291,6 +306,8 @@ def test_sample_saved_before_decode():
               "decode failure is distinguished from sampling failure")
         check(results[0].get("recovery_latent"),
               "decode failure reports the recovery latent")
+        check("latent" not in results[0],
+              "recovery path replaces the in-memory latent after decode failure")
     finally:
         harness.sample_experiment = original_sample
         harness.decode_video = original_decode
@@ -324,6 +341,7 @@ def main():
         test_row_consumption,
         test_dependencies_and_prompt_lookup,
         test_strategy_isolation,
+        test_composite_qwen_replacement,
         test_comparison_cap,
         test_artifact_reuse_policy,
         test_interruption_propagates,
