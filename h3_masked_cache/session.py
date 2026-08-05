@@ -35,6 +35,7 @@ class MaskedCacheRun:
         self.active_mask = None
         self.union_mask = None
         self.frozen_mask = None
+        self.frozen_range = None
         self.prev_observed = None
         self.last_sigma = None
         self.sigma_count = 0
@@ -65,13 +66,20 @@ class MaskedCacheRun:
     def stage_mask(self, m):
         self.pending_mask = m if self.pending_mask is None else (self.pending_mask | m)
         self.union_mask = m.clone() if self.union_mask is None else (self.union_mask | m)
-        if self.frozen_mask is None and len(self.steps) >= self.config.warmup_steps:
-            warm = [x for _, x in self.masks[:self.config.warmup_steps]]
-            if warm:
-                frozen = warm[0].clone()
-                for x in warm[1:]:
+
+        # Early H3 predictions can have a much broader reconstruction-error
+        # distribution than the stable steps that follow. Discard the configured
+        # burn-in observations, then freeze exactly the following warmup window.
+        start = self.config.freeze_start
+        stop = self.config.freeze_stop
+        if self.frozen_mask is None and len(self.masks) >= stop:
+            selected = [x for _, x in self.masks[start:stop]]
+            if selected:
+                frozen = selected[0].clone()
+                for x in selected[1:]:
                     frozen |= x
                 self.frozen_mask = frozen
+                self.frozen_range = (start, stop)
 
     def release(self):
         self.pending_mask = None
@@ -137,7 +145,8 @@ class MaskedCacheSession:
             "escaped_union": mask_ops.escaped_fraction(expanded, run.union_mask),
             "escaped_frozen": mask_ops.escaped_fraction(expanded, frozen_before),
             "coverage_frozen": mask_ops.coverage_fraction(expanded, frozen_before),
-            "missed_score_mass_frozen": mask_ops.missed_score_mass(token_scores, frozen_before),
+            "missed_score_mass_frozen": mask_ops.missed_score_mass(
+                token_scores, frozen_before, cfg.score_threshold),
         }
         run.steps.append(row)
         label = "s%03d_%s" % (len(run.steps) - 1, source_kind)
@@ -160,7 +169,8 @@ class MaskedCacheSession:
             "active_expanded": mask_ops.active_fraction(expanded),
             "coverage_by_frozen": mask_ops.coverage_fraction(expanded, run.frozen_mask),
             "escaped_frozen": mask_ops.escaped_fraction(expanded, run.frozen_mask),
-            "missed_score_mass_frozen": mask_ops.missed_score_mass(token_scores, run.frozen_mask),
+            "missed_score_mass_frozen": mask_ops.missed_score_mass(
+                token_scores, run.frozen_mask, cfg.score_threshold),
             "score_quantiles": mask_ops.quantiles(token_scores, SCORE_QUANTILES),
         }
         run.score_maps.append(("final", token_scores.detach().cpu().float()))
