@@ -31,5 +31,26 @@ when attention falls back. It bounds the full-sequence MLP expansion with
 token slabs. `mlp_chunked_native` additionally requests Comfy's native fused
 SwiGLU path when available.
 
+## CUDA async soft GC
+
+`cuda_async_soft_gc` is an optional process-global policy for PyTorch's
+`cudaMallocAsync` allocator. PyTorch initializes the device's default CUDA pool
+with an unlimited (`UINT64_MAX`) release threshold. When this toggle is enabled,
+the node first forces PyTorch's async allocator to initialize and then replaces
+that threshold with `cuda_async_release_threshold_gib`.
+
+This is a soft retention target, not an allocation limit:
+
+- CUDA can reserve more than the threshold when live demand requires it.
+- Excess unused pool backing becomes eligible for release on a later CUDA
+  stream, event, or device synchronization.
+- The node does not call `torch.cuda.empty_cache()`, `cudaMemPoolTrimTo()`, or
+  `torch.cuda.set_per_process_memory_fraction()`.
+- On the native allocator, CPU-only systems, or unsupported drivers, the policy
+  logs a clear no-op result and the model patch continues normally.
+
+The policy is disabled by default pending repeated-forward measurement. `11.0`
+GiB is the initial test value for a 12 GiB RTX 4070.
+
 The original standalone attention and activation-memory nodes remain available
 for isolated testing.
