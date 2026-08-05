@@ -1,18 +1,11 @@
-"""A/B one real MiniMax-H3 DiT block at production packed-sequence shapes.
+"""A/B/C one real MiniMax-H3 DiT block at production packed-sequence shapes.
 
 Dispatched by ``minimax_vram_probe.py --ab-activation-memory``. One block and one
 random BF16 weight set remain resident while the probe compares:
 
-    baseline:  efficient Sage + stock H3 DiTBlock forward
-    candidate: efficient Sage + token-chunked MLP block forward
-
-Typical target run:
-
-    python custom_nodes/ComfyUI-H3-Extended/minimax_vram_probe.py \
-        --ab-activation-memory --ab-frames 73,90 --budget 11 \
-        --mode ref2v --width 1216 --height 672 --text-len 1500 \
-        --anchor --ref-audio --calibrate-to 90 \
-        --activation-chunk-rows 4096 --ckpt <dit>
+    A: ordinary unmodified Sage through core H3 Attention.forward
+    B: the two-stage efficient-Sage attention forward
+    C: efficient Sage plus the token-chunked MLP block forward
 
 Use ``--ab-frames grid`` for the complete 17k+5 ladder. Checkpoint headers supply
 architecture and disk size only; the probe intentionally keeps random BF16 block
@@ -72,72 +65,51 @@ def main():
     device = torch.device("cuda")
     dtype = torch.bfloat16
 
-    # Must run before importing the efficient-Sage implementation.
+    # Must run before importing the H3 model or efficient-Sage implementation.
     selected = base.select_attention(True)
 
-    print(
-        f"canvas      {args.width}x{args.height}  ->  "
-        f"latent {args.height // 16}x{args.width // 16}"
-    )
+    print(f"canvas      {args.width}x{args.height}  ->  latent {args.height // 16}x{args.width // 16}")
     print(f"arch        {arch_source}")
-    print(
-        "            "
-        + "  ".join(f"{key}={value}" for key, value in arch.items())
-    )
+    print("            " + "  ".join(f"{key}={value}" for key, value in arch.items()))
     free, total = torch.cuda.mem_get_info(device)
-    print(
-        f"gpu         {torch.cuda.get_device_name(device)}  "
-        f"{total / base.GB:.1f} GB total, {free / base.GB:.1f} GB free"
-    )
+    print(f"gpu         {torch.cuda.get_device_name(device)}  {total / base.GB:.1f} GB total, {free / base.GB:.1f} GB free")
     if ckpt_gb is not None:
         print(
             f"checkpoint  {ckpt_gb:.2f} GB on disk"
-            + (
-                f"  -- exceeds the {args.budget:.1f} GB budget; production streams it"
-                if streamed
-                else "  (fits, held resident)"
-            )
+            + (f"  -- exceeds the {args.budget:.1f} GB budget; production streams it"
+               if streamed else "  (fits, held resident)")
         )
+    print(f"budget      {args.budget:.1f} GB  (reserve {reserve_gb:.2f} GB outside transient)")
     print(
-        f"budget      {args.budget:.1f} GB  "
-        f"(reserve {reserve_gb:.2f} GB outside transient)"
+        "method      measured A/B/C on GPU; "
+        f"variant A uses Comfy-selected {selected}"
     )
-    print(f"method      measured A/B on GPU; Comfy selected {selected}")
+    print("weights     one shared random BF16 block; activation geometry, not checkpoint INT8 streaming")
     print(
-        "physical    cudaMemGetInfo sampled every %.2f ms during an untimed "
-        "residency pass; LOW below %d MiB"
-        % (args.physical_poll_ms, args.physical_warning_mb)
-    )
-    print(
-        "weights     random BF16 block weights; activation geometry, "
-        "not checkpoint INT8 streaming"
+        f"physical    LOW below {args.physical_warning_mb} MiB; "
+        f"cudaMemGetInfo sampled every {args.physical_poll_ms:g} ms during untimed probes"
     )
 
     if args.mode == "ref2v":
         bits = [f"ref video {args.ref_frames}"]
         if args.ref_width or args.ref_height:
-            bits.append(
-                f"ref canvas {args.ref_width or args.width}x"
-                f"{args.ref_height or args.height}"
-            )
+            bits.append(f"ref canvas {args.ref_width or args.width}x{args.ref_height or args.height}")
         if args.ref_audio:
             bits.append("ref audio")
         if args.anchor:
             bits.append("anchor keyframe")
         if args.static_refs:
             pixels = args.static_ref_pixels or args.width * args.height
-            bits.append(
-                f"{args.static_refs} static ref(s) @ {pixels / 1e6:.2f} MP"
-            )
+            bits.append(f"{args.static_refs} static ref(s) @ {pixels / 1e6:.2f} MP")
         print(f"task        ref2v -- {', '.join(bits)}")
     else:
         print("task        t2va -- target stream only")
 
     block = base.build_block(arch, dtype, device)
-    baseline, candidate, backend, config = build_forwards(block, args)
+    plain, efficient, activation, backend, config = build_forwards(block, args)
+    print("variants    A=plain Sage; B=efficient Sage; C=efficient Sage + activation memory")
     print(
-        "A/B         baseline=sage_mem_eff; candidate=+%s rows=%d "
-        "alignment=%d held=%s"
+        "C config    %s rows=%d alignment=%d held=%s"
         % (
             config.mode,
             config.chunk_rows,
@@ -146,18 +118,11 @@ def main():
         )
     )
     print(
-        "Sage        version=%s kernel=%s accumulation=%s"
-        % (
-            backend.api.version,
-            backend.api.kernel_name,
-            backend.api.accumulation,
-        )
+        "Sage B/C    version=%s kernel=%s accumulation=%s"
+        % (backend.api.version, backend.api.kernel_name, backend.api.accumulation)
     )
     if config.native_swiglu:
-        print(
-            "note        BF16 probe weights cannot exercise native "
-            "TensorWise-INT8 FC2"
-        )
+        print("note        BF16 probe weights cannot exercise native TensorWise-INT8 FC2")
     print()
 
     run_sweep(
@@ -168,8 +133,9 @@ def main():
         device,
         reserve_gb,
         streamed,
-        baseline,
-        candidate,
+        plain,
+        efficient,
+        activation,
     )
 
 
