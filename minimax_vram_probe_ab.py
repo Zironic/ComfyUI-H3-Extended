@@ -62,7 +62,7 @@ def main():
             reserve_gb = per_block / base.GB
             streamed = ckpt_gb is not None
 
-    device = torch.device("cuda")
+    device = torch.device("cuda", torch.cuda.current_device())
     dtype = torch.bfloat16
 
     # Must run before importing the H3 model or efficient-Sage implementation.
