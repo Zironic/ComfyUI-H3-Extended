@@ -71,6 +71,43 @@ def _score_maps(video_x0, source, cfg):
     return mask_ops.token_score(relative), error, scale
 
 
+def _attention_backend_name(transformer_options):
+    """Identify the selected registered attention implementation when possible.
+
+    The H3 sigma-shift node's override closes over the backend's undecorated
+    implementation. Matching that closure against Comfy's attention registry
+    recovers ``sage``/``pytorch`` without requiring a duplicate node input.
+    Unknown third-party overrides remain explicitly labelled ``override``.
+    """
+    override = transformer_options.get("optimized_attention_override")
+    if override is None:
+        return "comfy default"
+    marked = getattr(override, "_h3_backend", None)
+    if marked:
+        return str(marked)
+
+    closure_objects = []
+    for cell in getattr(override, "__closure__", None) or ():
+        try:
+            closure_objects.append(cell.cell_contents)
+        except ValueError:
+            pass
+    try:
+        from comfy.ldm.modules.attention import (
+            REGISTERED_ATTENTION_FUNCTIONS,
+            get_attention_function,
+        )
+        for name in sorted(REGISTERED_ATTENTION_FUNCTIONS):
+            fn = get_attention_function(name, default=None)
+            impl = getattr(fn, "__wrapped__", fn) if fn is not None else None
+            if any(obj is fn or obj is impl for obj in closure_objects):
+                return str(name)
+    except Exception:
+        logging.debug("%s could not resolve attention override identity",
+                      LOG_PREFIX, exc_info=True)
+    return "override"
+
+
 def make_outer_wrapper(session):
     def wrapper(executor, *args, **kwargs):
         run = session.begin(latent_shapes=kwargs.get("latent_shapes"))
@@ -218,9 +255,7 @@ def _prepare(session, run, args, transformer_options, payload, video_x):
         run.notes["total_steps"] = max(1, sched.numel() - 1) if sched is not None else 0
         run.notes["sample_sigmas"] = sched.detach().cpu().float().tolist() if sched is not None else None
         run.sample_sigmas_tensor = sched.detach().cpu().float() if sched is not None else None
-        override = transformer_options.get("optimized_attention_override")
-        run.notes["attention_backend"] = getattr(override, "_h3_backend", None) or (
-            "override" if override is not None else "comfy default")
+        run.notes["attention_backend"] = _attention_backend_name(transformer_options)
         _log_run_header(run, video_x, source_res, cfg)
 
 
@@ -234,7 +269,8 @@ def _log_run_header(run, video_x, source_res, cfg):
         "  dense sequence:    %d rows (%d target video)\n"
         "  token grid:        t=%d %dx%d\n"
         "  tile / halo:       %dx%d tiles, spatial %d, temporal %d\n"
-        "  warmup / refresh:  %d / %d\n"
+        "  burn-in / warmup:  %d / %d\n"
+        "  refresh interval:  %d\n"
         "  threshold:         %.3g (floor %.3g)\n"
         "  attention:         %s\n  output:            %s",
         LOG_PREFIX, cfg.mode, cfg.strict,
@@ -242,6 +278,6 @@ def _log_run_header(run, video_x, source_res, cfg):
         list(source_res.latent.shape), list(video_x.shape), layout.seq_len, video_rows,
         layout.video_shape[0], layout.video_shape[1], layout.video_shape[2],
         cfg.tile_h, cfg.tile_w, cfg.spatial_halo, cfg.temporal_halo,
-        cfg.warmup_steps, cfg.refresh_interval,
+        cfg.burn_in_steps, cfg.warmup_steps, cfg.refresh_interval,
         cfg.score_threshold, cfg.score_absolute_floor,
         run.notes.get("attention_backend"), run.out_dir)
