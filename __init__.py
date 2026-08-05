@@ -4,13 +4,20 @@ from dataclasses import is_dataclass, replace
 
 from comfy_api.latest import ComfyExtension
 
+from . import nodes_minimax_h3
 from .chunked_ref2v.nodes import MiniMaxH3HarnessExtension
+from .cond_cache_diagnostics import encode as encode_conditioning_diagnostic
 from .h3_activation_memory.nodes import MiniMaxH3ActivationMemoryExtension
 from .h3_attention.nodes import MiniMaxH3AttentionExtension
 from .h3_masked_cache.nodes import MiniMaxH3MaskedCacheExtension
 from .h3_memory_optimizer.nodes import MiniMaxH3MemoryOptimizerExtension
 from .h3_probe.nodes import MiniMaxH3ProbeExtension
-from .nodes_minimax_h3 import MiniMaxH3Extension
+
+# The conditioning node module binds cond_cache.encode at import time. Replace
+# that module-level seam with a transparent diagnostic wrapper; the wrapper
+# delegates to the original cache without changing key or storage behaviour.
+nodes_minimax_h3.encode_conditioning = encode_conditioning_diagnostic
+MiniMaxH3Extension = nodes_minimax_h3.MiniMaxH3Extension
 
 
 NODE_CATEGORIES = {
