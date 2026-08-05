@@ -1,18 +1,11 @@
-"""A/B one real MiniMax-H3 DiT block at production packed-sequence shapes.
+"""A/B/C one real MiniMax-H3 DiT block at production packed-sequence shapes.
 
 Dispatched by ``minimax_vram_probe.py --ab-activation-memory``. One block and one
 random BF16 weight set remain resident while the probe compares:
 
-    baseline:  efficient Sage + stock H3 DiTBlock forward
-    candidate: efficient Sage + token-chunked MLP block forward
-
-Typical target run:
-
-    python custom_nodes/ComfyUI-H3-Extended/minimax_vram_probe.py \
-        --ab-activation-memory --ab-frames 73,90 --budget 11 \
-        --mode ref2v --width 1216 --height 672 --text-len 1500 \
-        --anchor --ref-audio --calibrate-to 90 \
-        --activation-chunk-rows 4096 --ckpt <dit>
+    A: ordinary unmodified Sage through core H3 Attention.forward
+    B: the two-stage efficient-Sage attention forward
+    C: efficient Sage plus the token-chunked MLP block forward
 
 Use ``--ab-frames grid`` for the complete 17k+5 ladder. Checkpoint headers supply
 architecture and disk size only; the probe intentionally keeps random BF16 block
@@ -38,6 +31,10 @@ def main():
         parser.error("--ab-activation-memory requires CUDA")
     if args.ab_warmup < 0 or args.ab_iterations < 1:
         parser.error("--ab-warmup must be >= 0 and --ab-iterations must be >= 1")
+    if args.physical_warning_mb < 0:
+        parser.error("--physical-warning-mb must be >= 0")
+    if args.physical_poll_ms <= 0:
+        parser.error("--physical-poll-ms must be > 0")
 
     arch = dict(base.DEFAULT_ARCH)
     ckpt_gb = None
@@ -68,7 +65,7 @@ def main():
     device = torch.device("cuda")
     dtype = torch.bfloat16
 
-    # Must run before importing the efficient-Sage implementation.
+    # Must run before importing the H3 model or efficient-Sage implementation.
     selected = base.select_attention(True)
 
     print(f"canvas      {args.width}x{args.height}  ->  latent {args.height // 16}x{args.width // 16}")
@@ -83,8 +80,15 @@ def main():
                if streamed else "  (fits, held resident)")
         )
     print(f"budget      {args.budget:.1f} GB  (reserve {reserve_gb:.2f} GB outside transient)")
-    print(f"method      measured A/B on GPU; Comfy selected {selected}")
-    print("weights     random BF16 block weights; activation geometry, not checkpoint INT8 streaming")
+    print(
+        "method      measured A/B/C on GPU; "
+        f"variant A uses Comfy-selected {selected}"
+    )
+    print("weights     one shared random BF16 block; activation geometry, not checkpoint INT8 streaming")
+    print(
+        f"physical    LOW below {args.physical_warning_mb} MiB; "
+        f"cudaMemGetInfo sampled every {args.physical_poll_ms:g} ms during untimed probes"
+    )
 
     if args.mode == "ref2v":
         bits = [f"ref video {args.ref_frames}"]
@@ -102,13 +106,19 @@ def main():
         print("task        t2va -- target stream only")
 
     block = base.build_block(arch, dtype, device)
-    baseline, candidate, backend, config = build_forwards(block, args)
+    plain, efficient, activation, backend, config = build_forwards(block, args)
+    print("variants    A=plain Sage; B=efficient Sage; C=efficient Sage + activation memory")
     print(
-        "A/B         baseline=sage_mem_eff; candidate=+%s rows=%d alignment=%d held=%s"
-        % (config.mode, config.chunk_rows, config.alignment, config.prefer_held_weights)
+        "C config    %s rows=%d alignment=%d held=%s"
+        % (
+            config.mode,
+            config.chunk_rows,
+            config.alignment,
+            config.prefer_held_weights,
+        )
     )
     print(
-        "Sage        version=%s kernel=%s accumulation=%s"
+        "Sage B/C    version=%s kernel=%s accumulation=%s"
         % (backend.api.version, backend.api.kernel_name, backend.api.accumulation)
     )
     if config.native_swiglu:
@@ -116,8 +126,16 @@ def main():
     print()
 
     run_sweep(
-        args, parser, arch, dtype, device, reserve_gb, streamed,
-        baseline, candidate,
+        args,
+        parser,
+        arch,
+        dtype,
+        device,
+        reserve_gb,
+        streamed,
+        plain,
+        efficient,
+        activation,
     )
 
 
