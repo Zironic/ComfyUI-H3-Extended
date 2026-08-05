@@ -1,13 +1,4 @@
-"""Install the H3 block-attention forward as reversible object patches.
-
-Only the main DiT blocks are patched. The token refiner shares core's `Attention`
-class but runs on the text span alone, where the packed-sequence machinery buys
-nothing - it keeps whatever backend the rest of the model is using.
-
-`add_object_patch` is the reversible mechanism: it `set_attr`s on the patched
-clone and restores on unpatch, the same way `MiniMaxH3SigmaShift` swaps
-`model_sampling`. Nothing is mutated on the shared underlying model.
-"""
+"""Install H3-owned block-attention forwards as reversible object patches."""
 
 import logging
 
@@ -16,13 +7,18 @@ import comfy.quant_ops
 from .forward import make_forward
 
 BLOCKS_ATTR = "diffusion_model.blocks"
-
-# every attribute the forward reads off the attention module
 REQUIRED_ATTRS = ("qkv_proj", "q_norm", "k_norm", "out_proj", "heads", "head_dim")
 
 
 class H3PatchError(RuntimeError):
-    """Configuration failed before sampling. Never a silent fallback."""
+    """Configuration failed before sampling."""
+
+
+def _diffusion_model(model_patcher):
+    try:
+        return model_patcher.get_model_object("diffusion_model")
+    except Exception:
+        return None
 
 
 def _blocks(model_patcher):
@@ -30,23 +26,30 @@ def _blocks(model_patcher):
         blocks = model_patcher.get_model_object(BLOCKS_ATTR)
     except Exception as exc:
         raise H3PatchError(
-            "This model has no '%s'; the H3 attention backend only applies to "
-            "MiniMax H3. Select 'sage', 'comfy' or 'pytorch'." % BLOCKS_ATTR) from exc
+            "This model has no '%s'; efficient Sage only applies to MiniMax H3."
+            % BLOCKS_ATTR) from exc
     if not len(blocks):
         raise H3PatchError("'%s' is empty; nothing to patch." % BLOCKS_ATTR)
     return blocks
 
 
 def validate(model_patcher):
-    """Check every assumption the forward makes. Returns the attention modules.
-
-    Raises rather than degrading: a violated assumption means core drifted, and
-    silently falling back would hide that until a benchmark looked wrong.
-    """
+    """Validate model identity and every attribute read by the copied forward."""
     if not hasattr(comfy.quant_ops.ck, "rms_rope_split_half_"):
         raise H3PatchError(
             "comfy_kitchen does not expose rms_rope_split_half_; this ComfyUI "
-            "build cannot run the H3 attention backend.")
+            "build cannot run the H3-owned attention forward.")
+
+    diffusion_model = _diffusion_model(model_patcher)
+    if diffusion_model is not None:
+        try:
+            from comfy.ldm.minimax.model import MiniMaxH3Model
+        except ImportError:
+            MiniMaxH3Model = None
+        if MiniMaxH3Model is not None and not isinstance(diffusion_model, MiniMaxH3Model):
+            raise H3PatchError(
+                "efficient Sage can only patch MiniMaxH3Model; got %s"
+                % type(diffusion_model).__name__)
 
     blocks = _blocks(model_patcher)
     modules = []
@@ -54,19 +57,17 @@ def validate(model_patcher):
         attn = getattr(block, "attn", None)
         if attn is None:
             raise H3PatchError("block %d has no 'attn' module." % index)
-        missing = [a for a in REQUIRED_ATTRS if not hasattr(attn, a)]
+        missing = [name for name in REQUIRED_ATTRS if not hasattr(attn, name)]
         if missing:
             raise H3PatchError(
-                "block %d attention is missing %s - core's MiniMax Attention "
-                "has changed shape and the H3 forward must be re-checked "
-                "against it." % (index, ", ".join(missing)))
+                "block %d attention is missing %s; core MiniMax Attention drifted"
+                % (index, ", ".join(missing)))
         expected = attn.heads * attn.head_dim * 3
         actual = getattr(attn.qkv_proj, "out_features", None)
         if actual is not None and actual != expected:
             raise H3PatchError(
-                "block %d qkv_proj projects to %d, expected 3 * heads * head_dim "
-                "= %d; the fused-QKV split this forward relies on no longer "
-                "holds." % (index, actual, expected))
+                "block %d qkv_proj projects to %d, expected %d"
+                % (index, actual, expected))
         modules.append(attn)
     return modules
 
@@ -75,35 +76,51 @@ def key_for(index):
     return "%s.%d.attn.forward" % (BLOCKS_ATTR, index)
 
 
-def install(model_patcher, attention=None):
-    """Patch every main block's attention forward. Idempotent.
-
-    Raises on a conflicting patch rather than overwriting it - another node
-    owning the same forward is a real incompatibility, and silently winning the
-    race would make the result depend on node order.
-    """
+def install(model_patcher, backend=None, attention=None):
+    """Patch every main block. Idempotent; foreign ownership is an error."""
     modules = validate(model_patcher)
-
     existing = getattr(model_patcher, "object_patches", {})
-    ours = [i for i in range(len(modules))
-            if getattr(existing.get(key_for(i)), "_h3_attention", False)]
-    if len(ours) == len(modules):
-        logging.info("[H3 attention] block forwards already patched (%d)", len(modules))
-        return 0
 
-    conflicts = [key_for(i) for i in range(len(modules))
-                 if key_for(i) in existing
-                 and not getattr(existing[key_for(i)], "_h3_attention", False)]
+    desired_backend = getattr(backend, "name", None)
+    ours = [
+        index for index in range(len(modules))
+        if getattr(existing.get(key_for(index)), "_h3_attention", False)
+    ]
+    if len(ours) == len(modules):
+        installed_backends = {
+            getattr(existing[key_for(index)], "_h3_backend", None)
+            for index in ours
+        }
+        if installed_backends == {desired_backend}:
+            logging.info("[H3 attention] block forwards already patched (%d)", len(modules))
+            return 0
+        raise H3PatchError(
+            "H3 attention is already patched for %s; requested backend is %s"
+            % (sorted(str(x) for x in installed_backends), desired_backend))
+    if ours:
+        raise H3PatchError(
+            "only %d of %d H3 attention blocks carry this patch; refusing a mixed state"
+            % (len(ours), len(modules)))
+
+    conflicts = [
+        key_for(index) for index in range(len(modules))
+        if key_for(index) in existing
+        and not getattr(existing[key_for(index)], "_h3_attention", False)
+    ]
     if conflicts:
         raise H3PatchError(
-            "another patch already owns %s (and %d more); two nodes cannot both "
-            "replace the H3 attention forward. Remove one, or select a backend "
-            "that uses the attention override instead."
+            "another patch already owns %s (and %d more); remove one attention-forward patch"
             % (conflicts[0], len(conflicts) - 1))
 
     for index, attn in enumerate(modules):
-        model_patcher.add_object_patch(key_for(index), make_forward(attn, index, attention))
+        model_patcher.add_object_patch(
+            key_for(index),
+            make_forward(attn, index, backend=backend, attention=attention),
+        )
 
-    logging.info("[H3 attention] patched %d block forwards (token refiner untouched)",
-                 len(modules))
+    logging.info(
+        "[H3 attention] patched %d main-block forwards with %s (token refiner untouched)",
+        len(modules),
+        getattr(backend, "name", "legacy attention"),
+    )
     return len(modules)

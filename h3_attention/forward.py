@@ -1,17 +1,12 @@
-"""H3-owned replacement for the DiT block attention forward.
+"""H3-owned replacement for the 50 main DiT attention forwards.
 
-This is a deliberate, small fork of `comfy.ldm.minimax.model.Attention.forward`.
-It exists because an `optimized_attention_override` cannot control activation
-lifetime: core's forward holds `q`, `k` and `v` as locals across the attention
-call, and those are views into one fused QKV projection, so the whole bf16 buffer
-stays resident through the attention peak. At C=73 that buffer is 1.518 GB - 36%
-of the measured sampling transient. Owning the forward is the only place the
-references can be dropped early. See PLAN.md §1.6.
+This is a small, deliberate fork of core MiniMax H3 ``Attention.forward``. It
+exists because an ``optimized_attention_override`` cannot release the fused QKV
+projection: the caller still holds Q/K/V views while the override runs.
 
-The cost of that is a copy of a core method that can drift silently. The parity
-tests in tests/test_h3_attention_forward.py turn drift into a loud failure rather
-than a subtle numerical one; they do not prevent it. Re-run them after a ComfyUI
-update that touches the MiniMax model.
+The custom backend contract is two-stage. ``prepare`` consumes the values into
+independent quantized tensors, then this module visibly deletes all three source
+views before ``execute`` launches the expensive attention kernel.
 """
 
 import torch
@@ -20,38 +15,34 @@ import comfy.ldm.minimax.model as h3_model
 import comfy.model_management
 import comfy.quant_ops
 
-from .observer import notify_attention
+from .observer import notify_attention, marked_observed
 
 
 def project_qkv(module, x, rope_freqs):
-    """Fused QKV projection plus fused RMSNorm/RoPE, mirroring core.
-
-    Returns `(q, k, v)` as `[seq, heads, head_dim]` views into a single fused
-    allocation. The caller owns their lifetime - that is the whole point.
-    """
+    """Mirror core's fused projection plus fused RMSNorm/RoPE."""
     seq = x.shape[0]
     inner = module.heads * module.head_dim
 
-    # the fused projection output is deliberately never bound to a local: q, k
-    # and v are the only references keeping it alive, so dropping them frees it
+    # Do not bind the fused output separately. These three views are the only
+    # Python references keeping the full allocation alive.
     q, k, v = module.qkv_proj(x).split(inner, dim=-1)
     v = v.view(seq, module.heads, module.head_dim)
 
     if rope_freqs is not None:
         if comfy.model_management.in_training:
             raise RuntimeError(
-                "h3_attention.forward is inference-only; core's training branch "
-                "uses the out-of-place rms_rope_split_half, which defeats the "
-                "activation-lifetime control this forward exists for.")
+                "h3_attention.forward is inference-only; core training uses an "
+                "out-of-place RMSNorm/RoPE path that defeats lifetime control.")
         q = q.view(1, seq, module.heads, module.head_dim)
         k = k.view(1, seq, module.heads, module.head_dim)
         qw = comfy.model_management.cast_to(module.q_norm.weight, device=x.device)
         kw = comfy.model_management.cast_to(module.k_norm.weight, device=x.device)
-        # partial rotary: the table carries rot_dim/2 pair-rotations, the norm
-        # always spans the full head_dim
         rot = rope_freqs.shape[-3] * 2
         comfy.quant_ops.ck.rms_rope_split_half_(
-            q, k, rope_freqs, qw, kw, epsilon=module.q_norm.eps, rot_dim=rot)
+            q, k, rope_freqs, qw, kw,
+            epsilon=module.q_norm.eps,
+            rot_dim=rot,
+        )
         q = q[0]
         k = k[0]
     else:
@@ -62,63 +53,78 @@ def project_qkv(module, x, rope_freqs):
 
 
 def to_hnd(q, k, v):
-    """`[seq, heads, dim]` -> `[1, heads, seq, dim]`. Views; copies nothing."""
-    return (q.transpose(0, 1).unsqueeze(0),
-            k.transpose(0, 1).unsqueeze(0),
-            v.transpose(0, 1).unsqueeze(0))
+    """``[seq, heads, dim]`` -> HND views; copies nothing."""
+    return (
+        q.transpose(0, 1).unsqueeze(0),
+        k.transpose(0, 1).unsqueeze(0),
+        v.transpose(0, 1).unsqueeze(0),
+    )
 
 
-# SageAttention's fp8 V path reaches _fused.transpose_pad_permute_cuda, a closed
-# CUDA kernel whose SASS does every index x stride as a plain 32-bit IMAD with no
-# IMAD.WIDE (confirmed by cuobjdump, not inferred). It is *unsigned*, so it wraps
-# at 2^32 rather than faulting - a wrapped u32 stays positive and silently reads
-# the wrong memory. With H3's fused-QKV sequence stride of 21,504 that is row
-# 199,728. No source ships in the wheel, so it cannot be patched.
-#
-# A contiguous copy of v drops the sequence stride from 21,504 to 7,168 and moves
-# the ceiling to S=599,187. This check used to live in ComfyUI's own
-# comfy/ldm/modules/attention.py, where every update threatened to revert it;
-# here it survives updates by construction. See PLAN.md §2.3.
-#
-# On a 12 GB card it never fires - OOM arrives around S=120-150k, well below
-# 199,728 - so it costs a max() over four numbers per block and nothing else.
-V_OFFSET_LIMIT = (1 << 32) - 1
+def _legacy_attention(module, q, k, v, transformer_options, attention=None):
+    attention_fn = attention if attention is not None else h3_model.optimized_attention
+    # The custom forward already emitted the observation with an explicit layer.
+    with marked_observed(transformer_options):
+        return attention_fn(
+            q, k, v, module.heads,
+            mask=None,
+            skip_reshape=True,
+            transformer_options=transformer_options,
+        )
 
 
-def guard_v_stride(v):
-    """Copy v only if its maximum linear element offset would wrap a u32."""
-    if sum((size - 1) * stride for size, stride in zip(v.shape, v.stride())) > V_OFFSET_LIMIT:
-        return v.contiguous()
-    return v
+def make_forward(module, layer_index, backend=None, attention=None):
+    """Build one reversible block-forward replacement.
 
-
-def make_forward(module, layer_index, attention=None):
-    """Build the replacement forward for one block's attention module.
-
-    `add_object_patch` sets this on the instance, so it is called unbound: the
-    module is closed over rather than arriving as `self`.
-
-    `attention` defaults to whatever `comfy.ldm.minimax.model.optimized_attention`
-    is at call time, so probe install/uninstall is still honored. Commit 2 uses
-    that default and changes no numerics; a memory-efficient backend replaces it.
+    ``backend`` is the production two-stage backend. ``attention`` is retained
+    only for parity tests and characterization of the legacy path.
     """
+    if backend is not None and attention is not None:
+        raise ValueError("pass either backend or attention, not both")
 
-    def forward(x, rope_freqs=None, transformer_options={}):
+    def forward(x, rope_freqs=None, transformer_options=None):
+        transformer_options = transformer_options if transformer_options is not None else {}
         q, k, v = project_qkv(module, x, rope_freqs)
         q, k, v = to_hnd(q, k, v)
-        v = guard_v_stride(v)
 
-        # observers see post-norm, post-rope Q/K in the same HND layout the
-        # module-global path delivers, but with a real block index attached
         with torch.no_grad():
-            notify_attention(q, k, layer_index=layer_index,
-                             transformer_options=transformer_options)
+            notify_attention(
+                q, k,
+                layer_index=layer_index,
+                transformer_options=transformer_options,
+            )
 
-        attention_fn = attention if attention is not None else h3_model.optimized_attention
-        out = attention_fn(q, k, v, module.heads, mask=None, skip_reshape=True,
-                           transformer_options=transformer_options)
+        if backend is None:
+            out = _legacy_attention(
+                module, q, k, v, transformer_options, attention=attention)
+        else:
+            prepared = backend.prepare(
+                q, k, v,
+                layer_index=layer_index,
+                transformer_options=transformer_options,
+            )
+
+            # Load-bearing ownership boundary: after prepare returns, the
+            # prepared object must not retain any view into the fused storage.
+            del q, k, v
+
+            out_hnd = backend.execute(prepared)
+            del prepared
+            if out_hnd.ndim != 4:
+                raise RuntimeError(
+                    "%s returned rank-%d output; expected HND rank 4"
+                    % (getattr(backend, "name", type(backend).__name__), out_hnd.ndim))
+            out = out_hnd.transpose(1, 2).reshape(
+                out_hnd.shape[0], out_hnd.shape[2], module.heads * module.head_dim)
+
         return module.out_proj(out.squeeze(0))
 
     forward._h3_attention = True
     forward._h3_layer_index = layer_index
+    forward._h3_backend = getattr(backend, "name", None)
     return forward
+
+# Backward-compatible imports for the existing characterization test. The guard
+# now belongs to the Sage-specific V preparation path and is not called by the
+# generic forward.
+from .sage_mem_eff import V_OFFSET_LIMIT, guard_v_stride  # noqa: E402,F401
