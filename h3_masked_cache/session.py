@@ -17,6 +17,7 @@ class MaskedCacheRun:
         self.out_dir = out_dir
         self.started = time.time()
         self.latent_shapes = latent_shapes
+        self.sample_sigmas_tensor = None
 
         self.layout = None
         self.source = None
@@ -64,7 +65,6 @@ class MaskedCacheRun:
     def stage_mask(self, m):
         self.pending_mask = m if self.pending_mask is None else (self.pending_mask | m)
         self.union_mask = m.clone() if self.union_mask is None else (self.union_mask | m)
-        # Freeze exactly the union of the configured dense warm-up observations.
         if self.frozen_mask is None and len(self.steps) >= self.config.warmup_steps:
             warm = [x for _, x in self.masks[:self.config.warmup_steps]]
             if warm:
@@ -79,6 +79,7 @@ class MaskedCacheRun:
         self.union_mask = None
         self.frozen_mask = None
         self.prev_observed = None
+        self.sample_sigmas_tensor = None
         self.score_maps = []
         self.error_maps = []
         self.source_maps = []
@@ -118,14 +119,10 @@ class MaskedCacheSession:
         core, expanded, _ = mask_ops.build_mask(
             token_scores, cfg.score_threshold, cfg.tile_h, cfg.tile_w,
             cfg.spatial_halo, cfg.temporal_halo)
-
         frozen_before = run.frozen_mask
         row = {
-            "step": int(step),
-            "sigma": float(sigma),
-            "source_kind": source_kind,
-            "cond_or_uncond": int(cond_or_uncond),
-            "sigma_index": run.sigma_count - 1,
+            "step": int(step), "sigma": float(sigma), "source_kind": source_kind,
+            "cond_or_uncond": int(cond_or_uncond), "sigma_index": run.sigma_count - 1,
             "dense_wall_s": dense_wall_s,
             "score_quantiles": mask_ops.quantiles(token_scores, SCORE_QUANTILES),
             "saliency_quantiles": mask_ops.quantiles(mask_ops.spatial_saliency(token_scores), SCORE_QUANTILES),
@@ -143,14 +140,12 @@ class MaskedCacheSession:
             "missed_score_mass_frozen": mask_ops.missed_score_mass(token_scores, frozen_before),
         }
         run.steps.append(row)
-
         label = "s%03d_%s" % (len(run.steps) - 1, source_kind)
         run.score_maps.append((label, token_scores.detach().cpu().float()))
         run.error_maps.append((label, error_rms.detach().cpu().float()))
         run.source_maps.append((label, source_rms.detach().cpu().float()))
         run.saliency_maps.append((label, mask_ops.spatial_saliency(token_scores).detach().cpu().float()))
         run.masks.append((label, expanded.detach().cpu()))
-
         run.stage_mask(expanded)
         run.prev_observed = expanded
         return row
