@@ -6,6 +6,7 @@ from .chunked_ref2v.nodes import MiniMaxH3HarnessExtension
 from .h3_activation_memory.nodes import MiniMaxH3ActivationMemoryExtension
 from .h3_attention.nodes import MiniMaxH3AttentionExtension
 from .h3_masked_cache.nodes import MiniMaxH3MaskedCacheExtension
+from .h3_memory_optimizer.nodes import MiniMaxH3MemoryOptimizerExtension
 from .h3_probe.nodes import MiniMaxH3ProbeExtension
 from .nodes_minimax_h3 import MiniMaxH3Extension
 
@@ -20,6 +21,7 @@ class H3ExtendedExtension(ComfyExtension):
             MiniMaxH3MaskedCacheExtension(),
             MiniMaxH3AttentionExtension(),
             MiniMaxH3ActivationMemoryExtension(),
+            MiniMaxH3MemoryOptimizerExtension(),
         ):
             nodes.extend(await ext.get_node_list())
         return nodes
