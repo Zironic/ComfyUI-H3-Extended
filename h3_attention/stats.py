@@ -1,4 +1,4 @@
-"""Process-local diagnostics for the efficient H3 Sage backend."""
+"""Process-local diagnostics for the efficient H3 Sage backends."""
 
 import threading
 
@@ -10,6 +10,7 @@ _DEFAULTS = {
     "tokens": 0,
     "max_sequence": 0,
     "v_guard_copies": 0,
+    "qk_guard_copies": 0,
     "kernel_errors": 0,
     "compatibility_errors": 0,
 }
@@ -31,7 +32,10 @@ def observe_sequence(sequence):
     with _LOCK:
         _STATS["prepared"] += 1
         _STATS["tokens"] += int(sequence)
-        _STATS["max_sequence"] = max(_STATS["max_sequence"], int(sequence))
+        _STATS["max_sequence"] = max(
+            _STATS["max_sequence"],
+            int(sequence),
+        )
 
 
 def get_stats():

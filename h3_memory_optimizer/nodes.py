@@ -20,10 +20,11 @@ class MiniMaxH3MemoryOptimizer(io.ComfyNode):
             display_name="MiniMax H3 Memory Optimizer (Zi)",
             category="model/patch/minimax",
             description=(
-                "Unified H3 memory patch. On a supported SM89 setup, auto uses "
-                "the prepared-QKV efficient Sage path; otherwise it preserves "
-                "the model's existing attention backend. BF16 MLP chunking is "
-                "device-independent and remains available on fallback systems."
+                "Unified H3 memory patch. Auto selects a preflighted prepared-QKV "
+                "Sage path on SageAttention-supported NVIDIA SM80, SM86, SM89, "
+                "SM90, SM120, or SM121 devices. Unsupported architectures or "
+                "incomplete Sage builds preserve the incoming attention backend. "
+                "BF16 MLP chunking remains available on fallback systems."
             ),
             inputs=[
                 io.Model.Input("model"),
@@ -37,10 +38,10 @@ class MiniMaxH3MemoryOptimizer(io.ComfyNode):
                     options=list(ATTENTION_MODES),
                     default="auto",
                     tooltip=(
-                        "auto selects a fully preflighted optimized adapter. "
-                        "efficient_sage_sm89 requests the current RTX 40-series "
-                        "adapter. existing preserves whatever attention backend "
-                        "the incoming MODEL already uses."
+                        "auto selects the adapter matching the active GPU. "
+                        "Architecture-specific entries force that family and "
+                        "then follow attention_fallback. existing preserves "
+                        "whatever attention backend the incoming MODEL uses."
                     ),
                 ),
                 io.Combo.Input(

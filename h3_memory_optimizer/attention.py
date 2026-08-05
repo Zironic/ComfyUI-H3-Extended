@@ -1,8 +1,14 @@
 """Capability-driven attention selection for the unified H3 memory patch.
 
-The first optimized adapter is deliberately SM89-only. The registry and decision
-objects are architecture-neutral so SM80/86/90/120 adapters can be added without
-changing the node or activation-memory implementation.
+The registry mirrors SageAttention 2.2's public architecture dispatch:
+
+- SM80: CUDA FP16-V path
+- SM86: Triton per-block FP16-V path
+- SM89: CUDA FP8-V path
+- SM90: Hopper FP8-V path
+- SM120/121: SM89-family FP8 kernel with per-warp Q/K
+
+Unknown architectures or incomplete wheels fall back before model mutation.
 """
 
 from dataclasses import dataclass
@@ -11,9 +17,21 @@ import logging
 import torch
 
 ATTENTION_AUTO = "auto"
+ATTENTION_SM80 = "efficient_sage_sm80"
+ATTENTION_SM86 = "efficient_sage_sm86"
 ATTENTION_SM89 = "efficient_sage_sm89"
+ATTENTION_SM90 = "efficient_sage_sm90"
+ATTENTION_SM12X = "efficient_sage_sm12x"
 ATTENTION_EXISTING = "existing"
-ATTENTION_MODES = (ATTENTION_AUTO, ATTENTION_SM89, ATTENTION_EXISTING)
+ATTENTION_MODES = (
+    ATTENTION_AUTO,
+    ATTENTION_SM80,
+    ATTENTION_SM86,
+    ATTENTION_SM89,
+    ATTENTION_SM90,
+    ATTENTION_SM12X,
+    ATTENTION_EXISTING,
+)
 
 FALLBACK_ALLOW = "allow"
 FALLBACK_ERROR = "error"
@@ -40,17 +58,35 @@ class RuntimeEnvironment:
         try:
             try:
                 import comfy.model_management as model_management
+
                 device = torch.device(model_management.get_torch_device())
             except Exception:
                 device = torch.device("cuda", torch.cuda.current_device())
             if device.type != "cuda":
-                return cls(False, None, None, "ComfyUI model device is %s" % device)
-            index = int(device.index if device.index is not None else torch.cuda.current_device())
-            capability = tuple(int(v) for v in torch.cuda.get_device_capability(index))
+                return cls(
+                    False,
+                    None,
+                    None,
+                    "ComfyUI model device is %s" % device,
+                )
+            index = int(
+                device.index
+                if device.index is not None
+                else torch.cuda.current_device()
+            )
+            capability = tuple(
+                int(v) for v in torch.cuda.get_device_capability(index)
+            )
             name = str(torch.cuda.get_device_name(index))
             return cls(True, index, capability, name)
         except Exception as exc:
-            return cls(False, None, None, "CUDA probe failed: %s: %s" % (type(exc).__name__, exc))
+            return cls(
+                False,
+                None,
+                None,
+                "CUDA probe failed: %s: %s"
+                % (type(exc).__name__, exc),
+            )
 
     @property
     def architecture(self):
@@ -73,50 +109,126 @@ class AttentionDecision:
         return self.backend is not None
 
 
-class SM89Adapter:
-    """Current tested RTX 40-series prepared-QKV Sage adapter."""
+def _require_registered_sage():
+    from comfy.ldm.modules.attention import get_attention_function
 
-    name = ATTENTION_SM89
+    if get_attention_function("sage", default=None) is None:
+        raise RuntimeError(
+            "ComfyUI has no registered 'sage' attention backend"
+        )
+
+
+def _require_local_triton():
+    try:
+        from ..h3_attention.triton_i64 import TRITON_AVAILABLE
+    except ImportError:
+        from h3_attention.triton_i64 import TRITON_AVAILABLE
+
+    if not TRITON_AVAILABLE:
+        raise RuntimeError("Triton is unavailable")
+
+
+class _ExactCapabilityAdapter:
+    name = None
+    capabilities = frozenset()
+    backend_name = None
+    requires_local_triton = False
 
     @classmethod
     def probe(cls, environment):
         if not environment.cuda_available:
             return False, environment.device_name
-        if environment.capability != (8, 9):
-            return False, "requires SM89, detected %s (%s)" % (
-                environment.architecture,
-                environment.device_name,
+        if environment.capability not in cls.capabilities:
+            supported = ", ".join(
+                "SM%d%d" % capability
+                for capability in sorted(cls.capabilities)
             )
-        return True, "SM89 detected"
+            return (
+                False,
+                "requires %s, detected %s (%s)"
+                % (
+                    supported,
+                    environment.architecture,
+                    environment.device_name,
+                ),
+            )
+        return True, "%s detected" % environment.architecture.upper()
+
+    @classmethod
+    def _backend_class(cls):
+        try:
+            from .. import h3_attention
+        except ImportError:
+            import h3_attention
+        return getattr(h3_attention, cls.backend_name)
 
     @classmethod
     def build(cls):
-        try:
-            from ..h3_attention import SM89SageMemoryEfficientBackend
-            from ..h3_attention.triton_i64 import TRITON_AVAILABLE
-        except ImportError:
-            from h3_attention import SM89SageMemoryEfficientBackend
-            from h3_attention.triton_i64 import TRITON_AVAILABLE
-
-        if not TRITON_AVAILABLE:
-            raise RuntimeError("Triton is unavailable")
-
-        from comfy.ldm.modules.attention import get_attention_function
-
-        if get_attention_function("sage", default=None) is None:
-            raise RuntimeError("ComfyUI has no registered 'sage' attention backend")
-        return SM89SageMemoryEfficientBackend()
+        _require_registered_sage()
+        if cls.requires_local_triton:
+            _require_local_triton()
+        return cls._backend_class()()
 
 
-ADAPTERS = (SM89Adapter,)
-ADAPTER_BY_NAME = {adapter.name: adapter for adapter in ADAPTERS}
+class SM80Adapter(_ExactCapabilityAdapter):
+    name = ATTENTION_SM80
+    capabilities = frozenset({(8, 0)})
+    backend_name = "SageSM80MemoryEfficientBackend"
+    requires_local_triton = True
+
+
+class SM86Adapter(_ExactCapabilityAdapter):
+    name = ATTENTION_SM86
+    capabilities = frozenset({(8, 6)})
+    backend_name = "SageSM86MemoryEfficientBackend"
+    requires_local_triton = True
+
+
+class SM89Adapter(_ExactCapabilityAdapter):
+    name = ATTENTION_SM89
+    capabilities = frozenset({(8, 9)})
+    backend_name = "SM89SageMemoryEfficientBackend"
+    requires_local_triton = True
+
+
+class SM90Adapter(_ExactCapabilityAdapter):
+    name = ATTENTION_SM90
+    capabilities = frozenset({(9, 0)})
+    backend_name = "SageSM90MemoryEfficientBackend"
+    requires_local_triton = True
+
+
+class SM12xAdapter(_ExactCapabilityAdapter):
+    name = ATTENTION_SM12X
+    capabilities = frozenset({(12, 0), (12, 1)})
+    backend_name = "SageSM12xMemoryEfficientBackend"
+    # Upstream intentionally uses CUDA per-warp quantization on Blackwell.
+    requires_local_triton = False
+
+
+ADAPTERS = (
+    SM80Adapter,
+    SM86Adapter,
+    SM89Adapter,
+    SM90Adapter,
+    SM12xAdapter,
+)
+ADAPTER_BY_NAME = {
+    adapter.name: adapter
+    for adapter in ADAPTERS
+}
 
 
 def _fallback(requested, environment, fallback, reasons):
-    reason = "; ".join(reasons) if reasons else "existing attention requested"
+    reason = (
+        "; ".join(reasons)
+        if reasons
+        else "existing attention requested"
+    )
     if fallback == FALLBACK_ERROR and requested != ATTENTION_EXISTING:
         raise AttentionResolutionError(
-            "cannot select %s on %s: %s" % (requested, environment.device_name, reason)
+            "cannot select %s on %s: %s"
+            % (requested, environment.device_name, reason)
         )
     return AttentionDecision(
         requested=requested,
@@ -128,8 +240,12 @@ def _fallback(requested, environment, fallback, reasons):
     )
 
 
-def resolve_attention(requested=ATTENTION_AUTO, fallback=FALLBACK_ALLOW,
-                      environment=None, adapters=None):
+def resolve_attention(
+    requested=ATTENTION_AUTO,
+    fallback=FALLBACK_ALLOW,
+    environment=None,
+    adapters=None,
+):
     """Resolve an attention strategy without mutating the model.
 
     Expected compatibility failures are converted to an ``existing`` decision
@@ -144,16 +260,26 @@ def resolve_attention(requested=ATTENTION_AUTO, fallback=FALLBACK_ALLOW,
 
     environment = environment or RuntimeEnvironment.detect()
     if requested == ATTENTION_EXISTING:
-        return _fallback(requested, environment, FALLBACK_ALLOW, [])
+        return _fallback(
+            requested,
+            environment,
+            FALLBACK_ALLOW,
+            [],
+        )
 
     registry = tuple(adapters or ADAPTERS)
     if requested == ATTENTION_AUTO:
         candidates = registry
     else:
-        adapter = next((item for item in registry if item.name == requested), None)
+        adapter = next(
+            (item for item in registry if item.name == requested),
+            None,
+        )
         if adapter is None:
             return _fallback(
-                requested, environment, fallback,
+                requested,
+                environment,
+                fallback,
                 ["no adapter named %s is registered" % requested],
             )
         candidates = (adapter,)
@@ -169,7 +295,11 @@ def resolve_attention(requested=ATTENTION_AUTO, fallback=FALLBACK_ALLOW,
         except Exception as exc:
             reasons.append(
                 "%s preflight failed: %s: %s"
-                % (adapter.name, type(exc).__name__, exc)
+                % (
+                    adapter.name,
+                    type(exc).__name__,
+                    exc,
+                )
             )
             continue
         return AttentionDecision(
@@ -181,9 +311,15 @@ def resolve_attention(requested=ATTENTION_AUTO, fallback=FALLBACK_ALLOW,
             environment=environment,
         )
 
-    decision = _fallback(requested, environment, fallback, reasons)
+    decision = _fallback(
+        requested,
+        environment,
+        fallback,
+        reasons,
+    )
     logging.warning(
-        "%s attention fallback: requested=%s selected=%s device=%s arch=%s reason=%s",
+        "%s attention fallback: requested=%s selected=%s "
+        "device=%s arch=%s reason=%s",
         LOG_PREFIX,
         requested,
         decision.selected,

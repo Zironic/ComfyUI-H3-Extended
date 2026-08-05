@@ -5,7 +5,10 @@ import sys
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(_HERE))
-sys.path.insert(0, os.path.abspath(os.path.join(_HERE, "..", "..", "..")))
+sys.path.insert(
+    0,
+    os.path.abspath(os.path.join(_HERE, "..", "..", "..")),
+)
 
 from h3_memory_optimizer.attention import (  # noqa: E402
     ATTENTION_AUTO,
@@ -14,6 +17,11 @@ from h3_memory_optimizer.attention import (  # noqa: E402
     FALLBACK_ERROR,
     AttentionResolutionError,
     RuntimeEnvironment,
+    SM80Adapter,
+    SM86Adapter,
+    SM89Adapter,
+    SM90Adapter,
+    SM12xAdapter,
     resolve_attention,
 )
 from h3_memory_optimizer.config import (  # noqa: E402
@@ -49,7 +57,9 @@ class FakeAdapter:
 
 class FakePatcher:
     def __init__(self):
-        self.model_options = {"transformer_options": {"existing": True}}
+        self.model_options = {
+            "transformer_options": {"existing": True}
+        }
         self.calls = []
 
 
@@ -58,8 +68,39 @@ def env(capability=(8, 9)):
         cuda_available=capability is not None,
         device_index=0 if capability is not None else None,
         capability=capability,
-        device_name="fake GPU" if capability is not None else "no CUDA device",
+        device_name=(
+            "fake GPU"
+            if capability is not None
+            else "no CUDA device"
+        ),
     )
+
+
+def test_architecture_probes():
+    print("architecture probes")
+    cases = (
+        (SM80Adapter, (8, 0)),
+        (SM86Adapter, (8, 6)),
+        (SM89Adapter, (8, 9)),
+        (SM90Adapter, (9, 0)),
+        (SM12xAdapter, (12, 0)),
+        (SM12xAdapter, (12, 1)),
+    )
+    for adapter, capability in cases:
+        supported, _ = adapter.probe(env(capability))
+        check(
+            supported,
+            "%s accepts SM%d%d"
+            % (adapter.name, capability[0], capability[1]),
+        )
+
+    supported, reason = SM89Adapter.probe(env((9, 0)))
+    check(
+        not supported and "requires SM89" in reason,
+        "architecture adapters do not assume forward compatibility",
+    )
+    supported, _ = SM12xAdapter.probe(env((12, 1)))
+    check(supported, "SM121 selects the Blackwell adapter")
 
 
 def test_resolution():
@@ -73,29 +114,41 @@ def test_resolution():
         environment=env(),
         adapters=(FakeAdapter,),
     )
-    check(decision.selected == FakeAdapter.name and decision.optimized,
-          "auto selects a supported adapter")
-    check(FakeAdapter.builds == 1, "selected adapter is preflight-built exactly once")
+    check(
+        decision.selected == FakeAdapter.name
+        and decision.optimized,
+        "auto selects a supported adapter",
+    )
+    check(
+        FakeAdapter.builds == 1,
+        "selected adapter is preflight-built exactly once",
+    )
 
     FakeAdapter.supported = False
     decision = resolve_attention(
         ATTENTION_AUTO,
         FALLBACK_ALLOW,
-        environment=env((8, 6)),
+        environment=env((8, 7)),
         adapters=(FakeAdapter,),
     )
-    check(decision.selected == ATTENTION_EXISTING and not decision.optimized,
-          "unsupported architecture preserves existing attention")
+    check(
+        decision.selected == ATTENTION_EXISTING
+        and not decision.optimized,
+        "unsupported architecture preserves existing attention",
+    )
 
     try:
         resolve_attention(
             ATTENTION_AUTO,
             FALLBACK_ERROR,
-            environment=env((8, 6)),
+            environment=env((8, 7)),
             adapters=(FakeAdapter,),
         )
     except AttentionResolutionError as exc:
-        check("cannot select" in str(exc), "strict fallback raises during preflight")
+        check(
+            "cannot select" in str(exc),
+            "strict fallback raises during preflight",
+        )
     else:
         raise AssertionError("strict fallback must raise")
 
@@ -107,24 +160,34 @@ def test_resolution():
         environment=env(),
         adapters=(FakeAdapter,),
     )
-    check(decision.selected == ATTENTION_EXISTING,
-          "missing low-level kernel falls back before model mutation")
-    check("synthetic missing kernel" in decision.reason,
-          "fallback reason retains the failed capability detail")
+    check(
+        decision.selected == ATTENTION_EXISTING,
+        "missing low-level kernel falls back before model mutation",
+    )
+    check(
+        "synthetic missing kernel" in decision.reason,
+        "fallback reason retains the failed capability detail",
+    )
 
 
 def test_config():
     print("config")
     config = MemoryOptimizerConfig(activation=ACTIVATION_OFF)
-    check(config.activation_config() is None, "activation off produces no patch config")
+    check(
+        config.activation_config() is None,
+        "activation off produces no patch config",
+    )
     config = MemoryOptimizerConfig(
         activation="mlp_chunked_bf16",
         chunk_rows=4096,
         activation_strict=False,
     )
     activation = config.activation_config()
-    check(activation.chunk_rows == 4096 and activation.strict is False,
-          "portable BF16 activation config is preserved")
+    check(
+        activation.chunk_rows == 4096
+        and activation.strict is False,
+        "portable BF16 activation config is preserved",
+    )
 
 
 def test_apply_order_and_fallback():
@@ -157,15 +220,26 @@ def test_apply_order_and_fallback():
         attention_configurer=configure_attention,
         activation_installer=install_activation,
     )
-    check(calls == ["attention", "activation"],
-          "attention forward is installed before the enclosing block forward")
-    check(result.attention_blocks == 50 and result.activation_blocks == 50,
-          "unified result reports both patch counts")
-    status = patcher.model_options["transformer_options"]["minimax_h3_memory_optimizer"]
-    check(status["attention_selected"] == "fake_sm89",
-          "transformer options record the selected adapter")
-    check(patcher.model_options["transformer_options"]["existing"] is True,
-          "status recording preserves existing transformer options")
+    check(
+        calls == ["attention", "activation"],
+        "attention forward is installed before the enclosing block forward",
+    )
+    check(
+        result.attention_blocks == 50
+        and result.activation_blocks == 50,
+        "unified result reports both patch counts",
+    )
+    status = patcher.model_options["transformer_options"][
+        "minimax_h3_memory_optimizer"
+    ]
+    check(
+        status["attention_selected"] == "fake_sm89",
+        "transformer options record the selected adapter",
+    )
+    check(
+        patcher.model_options["transformer_options"]["existing"] is True,
+        "status recording preserves existing transformer options",
+    )
 
     patcher = FakePatcher()
     calls = []
@@ -184,13 +258,19 @@ def test_apply_order_and_fallback():
         attention_configurer=configure_attention,
         activation_installer=install_activation,
     )
-    check(calls == ["activation"],
-          "attention fallback leaves the incoming attention path untouched")
-    check(result.attention_blocks == 0 and result.activation_blocks == 50,
-          "activation optimization remains active after attention fallback")
+    check(
+        calls == ["activation"],
+        "attention fallback leaves the incoming attention path untouched",
+    )
+    check(
+        result.attention_blocks == 0
+        and result.activation_blocks == 50,
+        "activation optimization remains active after attention fallback",
+    )
 
 
 def main():
+    test_architecture_probes()
     test_resolution()
     test_config()
     test_apply_order_and_fallback()
