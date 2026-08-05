@@ -20,11 +20,11 @@ A monolithic 10+ second Ref2VA run does not fit in 12 GB. Piece by piece does.
 The overlap needed to prevent stitching artifacts costs extra compute, and in
 exchange peak VRAM stops being a function of duration.
 
-That trade is only worth stating because runtime is **linear** in sequence length
-(§1.3). Had attention been the dominant cost, chunking a long video would have
-been a compute *win* and the overlap would have paid for itself. It is not, so
-the overlap is a real flat tax of `C/S` — 1.32× at the target profile. Bounded
-VRAM is what that buys.
+That trade is worth stating because runtime is **linear-dominated** in sequence
+length (§1.3): attention is only 39% of the block at C=90, so chunking does not
+pay for itself the way it would under pure quadratic scaling. The overlap is a
+real tax of `C/S` — 1.43× at the target profile. Bounded VRAM is what it buys,
+and past C≈90 the quadratic term means longer chunks stop helping at all (§4.4).
 
 ## 1. Correction log
 
@@ -57,7 +57,21 @@ escapes the clone. Use `add_object_patch`, which `set_attr`s on patch and
 restores on unpatch ([`model_patcher.py:1107-1110`, `1157-1161`]) — the same
 mechanism `MiniMaxH3SigmaShift` already uses for `model_sampling`.
 
-### 1.3 Cost is linear in sequence length — `C/S` stands
+### 1.3 Cost is linear-dominated but not linear — and that is what makes C=90 optimal
+
+**Superseded by measurement — see §4.4.** With sage attention enabled, the fitted
+block cost is `ms = 14.83e-3·S + 205.2e-9·S²`: at C=90 that is 682 ms linear and
+434 ms attention, so attention is **39% of the block** and time grows as roughly
+`S^1.3` across the operating range. The linear term dominates, which is why it
+reads as linear in practice, but the quadratic term is real.
+
+The consequence is not that longer chunks are bad — it is that cost per output
+frame has a **minimum** rather than falling forever, and the minimum sits exactly
+at the target profile. The argument below is kept because its reasoning about
+why `C/S` approximates the truth still holds; only the "no superlinear component"
+claim is wrong.
+
+### 1.3a Original argument (partially superseded)
 
 An intermediate revision of this document argued that cost is half-quadratic in
 packed sequence length, and that `C/S` therefore understated the price of longer
@@ -70,7 +84,11 @@ superlinear component until the working set stops fitting in VRAM.
 
 The FLOP argument was not wrong about FLOPs — attention is ~45-55% of arithmetic
 at these lengths — but the run is not FLOP-bound. Weight streaming and
-bandwidth-bound attention kernels dominate, and both scale linearly in S. And
+bandwidth-bound attention kernels dominate, and both scale linearly in S. The
+§4.3 probe confirms this **for memory**: the transient is flat to 0.3% per rung
+across a 14× span, with no quadratic term at all. Time is a different story —
+§4.4 measures a real quadratic component in the block forward, which is where
+this argument breaks down. And
 because `C/T` is nearly constant on the H3 grid (39/12 = 3.25, 56/17 = 3.29),
 S is near-proportional to C, so `C/S` is a good approximation of cost per output
 frame.
@@ -93,11 +111,16 @@ a curve. See §4.
 | `encode_temporal` encodes **independent** 17-frame clips, concatenates, drops last 3 tokens | [`vae.py:522-539`] | verified |
 | `payload["seed"]` also seeds conditioning noise aug (`VISUAL_COND_TIMESTEP = 0.999`) | [`model.py:31`, `473-481`] | verified |
 | `_frame_grid(48, 84)` → 1008 rows per latent frame at the 768×1344 canvas | [`model.py:87-91`] | verified |
-| Runtime scales ~linearly with input+output tokens, no superlinear term until the working set exceeds VRAM | this hardware, extensive prior use | **measured** |
+| DiT transient **memory** is exactly linear in S — 0.894 GB per rung, flat to 0.3% over a 14× span | `minimax_vram_probe.py`, §4.3 | **measured** |
+| DiT **time** is linear-dominated but superlinear: `ms = 14.83e-3·S + 205.2e-9·S²` with sage, ~`S^1.3` over the operating range | probe fit, §4.4 | **measured** |
+| Sage cuts the attention constant 2.83× vs pytorch attention (205.2e-9 vs 581.5e-9) | probe fit, §4.4 | **measured** |
+| Spill is a performance cliff, not an exception — the driver backs oversubscription with system RAM | this hardware; probe run 1 at 209 frames | **measured** |
+| ref2v packs 1.97× the t2va sequence at the same frame count | probe row breakdown, §4.3 | **measured** |
 | Ref2VA trained range is ~124-362 frames | [`nodes_minimax_h3.py:177`] | verified |
 | T=6/18 frames is the coherence floor, T=7/22 preferable | prior experimentation | **measured** |
 | This machine runs ~4 s input + ~4 s output at 0.8 MP → C ceiling between 90 and 107 | this hardware, prior use | **measured** |
-| Whether C=90 still fits once anchor + static refs + pinned canvas are added | — | **unknown — Stage 0 §4.3** |
+| Cost per output frame bottoms out at C=90; C=73 costs +2.7% and buys 0.90 GB margin | probe fit, §4.4 / §4.6 | **measured** |
+| Whether C=73 holds up with real prompts, references and desktop load | — | **unknown — Stage 0 §4.6** |
 | Whether quality improves with C independently of overlap (training-distribution effect) | — | **unknown — Stage 3** |
 | Ref2VA checkpoint obeys a keyframe latent Qwen never saw | — | **unknown — Stage 0** |
 
@@ -122,7 +145,7 @@ and are **not** slices of any longer encode. Only fully-real clips slice:
 
 ```
 C=39: tokens 0-9  of 12 sliceable, 10-11 re-encoded per chunk   (83%)
-C=90: tokens 0-24 of 27 sliceable, 25-26 re-encoded per chunk   (93%)
+C=73: tokens 0-19 of 22 sliceable, 20-21 re-encoded per chunk   (91%)
 ```
 
 So even with `S % 17 == 0` the win is "encode 1 clip instead of 3" on the 4.9 GB
@@ -252,22 +275,27 @@ At 0.8 MP (~800 rows per latent frame), with the ceiling marked:
 | 107 | 32 | 4.46 s | ~53k | 0.86× | at or over the line |
 | 124 | 37 | 5.17 s | ~61k | 1.00× | no |
 
-**Target profile: C=90, O=22, S=68.** `C/S` = 1.32× — a materially smaller
-overlap tax than the 1.65× the plan previously assumed — 18 chunks for a
-50-second source, `S % 17 == 0`, and 0.73× the trained minimum instead of 0.31×.
+**Target profile: C=73, O=22, S=51.** `C/S` = 1.43×, 24 chunks for a 50-second
+source, `S % 17 == 0`, 0.59× the trained minimum.
 
-Overlap alternatives at C=90, to be settled after Stage 0:
+C=90 is the compute optimum (§4.4) and C=73 costs **+2.7%** against it — but C=90
+sits exactly at the measured ceiling with *zero* margin, and the run is
+unattended for hours. C=73 buys **0.90 GB** of headroom for that 2.7%. See §4.6
+for why that is the right trade.
+
+Overlap alternatives at C=73, to be settled after Stage 0:
 
 | O | S | `C/S` | seam window | chunks / 1200 frames |
 | ---: | ---: | ---: | ---: | ---: |
-| 22 | 68 | 1.32× | 0.9 s | 18 |
-| 39 | 51 | 1.76× | 1.6 s | 22 |
+| 22 | 51 | 1.43× | 0.9 s | 24 |
+| 39 | 34 | 2.15× | 1.6 s | 34 |
 
 Start at O=22 and raise it only if seams are visible. Both are clip-aligned
-(68 = 4×17, 51 = 3×17).
+(51 = 3×17, 34 = 2×17).
 
-C=107 is worth one probe but should not be the default — it sits at the measured
-ceiling with no headroom for the anchor keyframe or static references (§4.3).
+C=90 remains the profile to use on a quiet card with `match`-sized references and
+a short prompt; C=107 should not be used at all, since it is past the ceiling
+*and* past the compute optimum.
 
 ### 4.3 The ceiling is a token budget — spend it deliberately
 
@@ -314,45 +342,97 @@ the actual class so the fused in-place rms+rope and swiglu kernels are counted.
 Blocks run sequentially and free their activations, so the sampling transient is
 one block's peak plus the persistent packed hidden state.
 
-**Two adjustments are needed before its output applies to this project.**
-
-*It models t2va.* `token_counts` returns `text_len + video_tokens + audio_tokens`
-— target rows only. Ref2V roughly doubles the video rows and the chunked design
-adds the anchor on top. Fold everything non-target into `--text-len`. At
-1216×672 (798 rows per latent frame, ~0.82 MP), C=90:
+It now packs reference rows natively via `--mode ref2v`, in PackedLayout order,
+so nothing has to be hand-folded into `--text-len`:
 
 ```
-ref video   27 × 798 = 21,546
-anchor keyframe            798
-ref audio                  300
-text + 2 fps presentation ~1,500
-                      ─────────
---text-len              ~24,144        seq_len ≈ 45,990
-```
-
-```
-python user/minimax_vram_probe.py --budget 11 \
-    --width 1216 --height 672 --text-len 24144 \
+python user/minimax_vram_probe.py --budget 11 --mode ref2v \
+    --width 1216 --height 672 --text-len 1500 \
+    --anchor --ref-audio --calibrate-to 90 \
     --ckpt models/diffusion_models/hf_minimax_h3/minimax_h3_ref2va_pruned_int8_convrot.safetensors
 ```
 
-*Its default reserve is a floor, so it over-predicts.* With the DiT streamed,
-`--reserve-gb` defaults to a single block's weights (~0.36 GB) and excludes
-ComfyUI's streaming cache, the conditioning tensor, attention workspace and
-`cudaMallocAsync` slack. Run analytically it puts C=90 at ~6.2 GB and C=124 at
-~8.3 GB — i.e. it predicts the trained minimum fits in 11 GB, which contradicts
-the measured 4 s + 4 s ceiling.
-
-**So calibrate first.** Find the `--reserve-gb` at which the probe reproduces the
-known ceiling for a plain Ref2VA run, then re-run with that value to predict the
-chunked case. The probe's *relative* ordering across the grid is trustworthy; its
-absolute ceiling is not, until the reserve is pinned to reality.
+`--ref-frames` defaults to `matched` — the reference video takes the target's
+length and canvas, which is the v2v case and what makes ref2v roughly double the
+sequence. Verified row breakdown at C=90, 1216×672 (798 rows per latent frame,
+~0.82 MP):
 
 ```
-C=90 fits with margin        →  ship 90/22/68
+text        1,500      cond (anchor)     798      ref_audio     300
+ref_img    21,546      audio             300      video      21,546
+                                                  seq_len    45,990
+```
+
+That is **1.97× the t2va sequence at the same frame count** — the concrete form
+of "ref2v uses a lot more." The full sweep reproduces §4.2's estimates exactly
+(C=107 → 54,082; C=124 → 62,178).
+
+**Calibrate the reserve before trusting any absolute number.** With the DiT
+streamed, `--reserve-gb` defaults to a single block's weights (~0.36 GB) and
+excludes ComfyUI's streaming cache, the conditioning tensor, attention workspace
+and `cudaMallocAsync` slack. Run analytically it puts C=90 at ~6.2 GB and C=124
+at ~8.3 GB — i.e. it predicts the trained minimum fits in 11 GB, which
+contradicts the measured 4 s + 4 s ceiling.
+
+`--calibrate-to <frames>` solves for the reserve that makes a length you have
+actually run come out as the last fitting one, then re-sweeps with it. The
+probe's *relative* ordering across the grid is trustworthy either way; its
+absolute ceiling is not, until the reserve is pinned to reality.
+
+Static references are priced too, and confirm §4.3's earlier estimate: at
+`ref_image_size=match` one reference costs +1.7% of the sequence, at `max`
+(2048×3641) +15.8%.
+
+```
+C=90 fits with margin        →  ship 73/22/51 anyway, per the §4.6 headroom budget
 C=90 tips                    →  73/22/51  (C/S = 1.43×, 24 chunks / 1200 frames)
 C=90 fits with room to spare →  probe 107/22/85
 ```
+
+#### Measured result
+
+Run at 1216×672, `--mode ref2v --anchor --ref-audio --calibrate-to 90`,
+budget 11 GB, against the real ref2va checkpoint header:
+
+| C | tokens | transient | +latent | +cond | total |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 39 | 21,710 | 2.401 G | 0.005 | 0.015 | 8.283 G |
+| 56 | 29,802 | 3.295 G | 0.007 | 0.020 | 9.186 G |
+| 73 | 37,898 | 4.189 G | 0.009 | 0.026 | 10.087 G |
+| **90** | **45,990** | **5.085 G** | 0.012 | 0.032 | **10.991 G** |
+| 107 | 54,082 | 5.978 G | 0.014 | 0.037 | 11.892 G — over |
+
+Calibrated reserve: **5.86 GB** outside the transient, against a 0.36 GB floor
+default. The floor under-predicts by 16×, which is the whole reason the raw probe
+said C=124 would fit.
+
+**The transient is exactly linear in sequence length.** Successive 17-frame rungs
+cost 0.896, 0.894, 0.894, 0.896, 0.893, 0.895, 0.893, 0.896 GB — flat to within
+0.3% across a 14× span of sequence length. There is no quadratic term in memory
+at all: sage attention is O(S), and this is direct confirmation of §1.3 from the
+memory side to match the timing side.
+
+Two usable constants fall out, both at 0.82 MP:
+
+```
+~116 KB per token
+~0.894 GB per 17-frame rung of C
+```
+
+And an exchange rate, since rows = pixels/1024 and S ≈ 2,100 + 55·rows at T=27:
+
+```
+one C rung (17 frames)  ≈  0.15 MP of canvas
+```
+
+So C=107 fits at ~0.69 MP for what C=90 costs at 0.82 MP. Probably not worth the
+16% pixel loss for one rung, but it is the lever if C=107 is wanted.
+
+**Caveat on the ceiling itself.** `--calibrate-to 90` *defines* 90 as the last
+fitting length, so "max = 90 frames" is by construction, not an independent
+result. What the sweep establishes independently is the per-rung cost and the
+linearity — and those say reaching C=107 needs 0.9 GB more headroom than C=90,
+whatever the true absolute ceiling turns out to be.
 
 #### What the probe does not cover
 
@@ -371,7 +451,65 @@ the Tot Alloc/Freed columns.
 Note that ~46k tokens is well into the range the local sage int64 offset patch
 exists to fix. Confirm that patch is applied before probing.
 
-### 4.4 Validation rules
+### 4.4 Measured: C=90 is the compute optimum, not just the VRAM ceiling
+
+Fitted from the sage-enabled probe (`ms = 14.83e-3·S + 205.2e-9·S²`), cost per
+output frame at O=22:
+
+| C | S | block ms | stride | ms / output frame |
+| ---: | ---: | ---: | ---: | ---: |
+| 39 | 22,050 | 427 | 22 | 19.40 |
+| 56 | 30,030 | 630 | 34 | 18.54 |
+| 73 | 38,010 | 860 | 51 | 16.86 |
+| **90** | **45,990** | **1,116** | **68** | **16.41** ← minimum |
+| 107 | 53,970 | 1,398 | 85 | 16.45 |
+| 124 | 61,950 | 1,706 | 102 | 16.73 |
+| 141 | 69,930 | 2,040 | 119 | 17.14 |
+
+The curve has a real minimum. Below C=90 the overlap tax dominates; above it the
+quadratic attention term starts to bite. **The VRAM ceiling and the compute
+optimum land on the same rung**, which is a convenient accident and worth not
+disturbing — pushing to C=107 for lower `C/S` would cost 0.9 GB of headroom to
+buy nothing.
+
+Attention backend matters to this result. The same sweep on pytorch attention
+fits `581.5e-9·S²` — 2.83× the sage constant, attention 69% of the block — and
+shifts the optimum downward. Any re-measurement must pass `--sage`; the probe
+defaults to pytorch because `comfy.cli_args` only reads argv under
+`comfy.options.args_parsing`, which only `main.py` sets.
+
+Multiply the block column by 50 layers for a DiT step: ~56 s per step at C=90.
+
+### 4.6 Headroom budget — why C=73 and not the optimum
+
+The §4.4 minimum assumes the probe's exact conditions: a 1,500-token prompt, no
+static references, and whatever the desktop happened to be holding. Every one of
+those varies in production, and at ~116 KB per token they convert straight into
+VRAM:
+
+| variable | cost |
+| --- | ---: |
+| **C=90 → C=73 headroom gained** | **0.90 G** |
+| desktop VRAM swing observed in one session (0.73 → 2.99 G) | 2.26 G |
+| 1 static ref at `ref_image_size=max` | 0.81 G |
+| +2,500 prompt tokens | 0.28 G |
+| 3 static refs at `match` | 0.26 G |
+| 1 static ref at `match` | 0.09 G |
+
+A single `max`-sized reference nearly consumes the entire C=90 → C=73 gap on its
+own, and the desktop baseline alone moved 2.26 GB during one working session.
+C=90 has no room for any of it.
+
+The asymmetry decides it: **+2.7% certain compute versus a spill risk on an
+unattended 5-6 hour run**, where one spilled chunk out of 24 costs more than the
+2.7% saved across all of them. Take the margin.
+
+This also argues for an `auto` chunk size (§12): the node knows the exact row
+count before it samples, so it can read free VRAM, predict the transient at
+116 KB/token, and pick the largest grid rung that fits with a configured safety
+margin. That converts the whole question from a constant into a pre-flight check.
+
+### 4.5 Validation rules
 
 ```
 C % 17 == 5                 generation legality (hard)
@@ -418,7 +556,7 @@ if `overlap_frames` is raised.
 
 For chunk `i > 0`, the anchor is the previous chunk's output at **local frame
 `S`** — the first frame of its pending tail, corresponding to the new chunk's
-global start. Not its final frame — local frame 68 at the 90/22/68 target profile.
+global start. Not its final frame — local frame 51 at the 73/22/51 target profile.
 
 ## 6. Architecture — three passes
 
@@ -523,12 +661,12 @@ Stage-0 question.
 
 ## 10. Stage 0 — feasibility gate
 
-Two hard-coded chunks at the **target profile** — C=90, O=22, S=68, 0.8 MP,
-canvas pinned. Chunk A source `0-89`, chunk B source `68-157`, chunk B anchored
-from chunk A output frame 68. No generated audio, fixed seeds, manual hard seam,
+Two hard-coded chunks at the **target profile** — C=73, O=22, S=51, 0.8 MP,
+canvas pinned. Chunk A source `0-72`, chunk B source `51-123`, chunk B anchored
+from chunk A output frame 51. No generated audio, fixed seeds, manual hard seam,
 frame dumps for manual comparison.
 
-Run at 90 rather than at a cheaper 39 for two reasons: it is the geometry that
+Run at 73 rather than at a cheaper 39 for two reasons: it is the geometry that
 will ship, and 39 frames is 0.31× the trained minimum, so a poor result there
 would not distinguish a broken anchor from an out-of-distribution chunk length.
 The §4.3 headroom probe needs a 90-frame run anyway — same geometry, both
@@ -546,7 +684,7 @@ Three arms:
 | C. Anchor disabled | refs only | — |
 
 Record peak reserved VRAM on every arm — that is the §4.3 probe, obtained for
-free. If C=90 tips, drop to 73/22/51 and rerun; the conditioning question is
+free. If C=73 tips, drop to 56/22/34 and rerun; the conditioning question is
 unaffected by the step down.
 
 This diagnoses: whether hybrid keyframe conditioning works at all; whether
@@ -565,7 +703,7 @@ Explicit modes, never silent fallbacks:
 
 ## 11. Stages
 
-**Stage 0** — the three-arm proof at 90/22/68, with peak VRAM recorded per arm.
+**Stage 0** — the three-arm proof at 73/22/51, with peak VRAM recorded per arm.
 Settles both the architectural unknown and whether the target profile fits.
 
 **Stage 1 — core chunk engine.** Chunk planner; final padding and trimming;
@@ -594,9 +732,11 @@ reference  ref_images, extra_ref_videos, extra_ref_video_audios, ref_audios,
            initial_target_frame, source_audio
 sampling   steps, sampler_name, scheduler, denoise=1.0,
            shift_video=12.0, shift_audio=3.0, seed_mode
-chunking   chunk_frames, overlap_frames, strict_h3_grid=true, final_padding=repeat_last
-           defaults 90/22 (S=68); 73/22 if the §4.3 probe shows 90 does not fit
-ref_size   ref_image_size=match — `max` costs ~one C rung per reference (§4.3)
+chunking   chunk_frames=73 | auto, overlap_frames=22, strict_h3_grid=true,
+           final_padding=repeat_last, vram_margin_gb=1.0
+           `auto` reads free VRAM pre-flight and picks the largest grid rung whose
+           predicted transient (116 KB/token over the real row count) fits the margin
+ref_size   ref_image_size=match — `max` costs 0.81 G per reference (§4.6)
 stitching  seam_mode=best_cut, seam_search_margin=2, blend_frames=0,
            motion_weight, edge_weight
 output     audio_output=preserve_source, output_mode=stream_to_file,
@@ -678,7 +818,7 @@ original video; static replacement references must be re-supplied every chunk.
 **Drift accumulates.** The carried frame propagates any previous appearance error,
 once per chunk boundary — so exposure scales with **chunk count**, not duration.
 Maximizing C (§4.3) is therefore a quality lever as much as a compute one: 1200
-frames is 54 hops at C=39 and 18 at C=90. Heavy overlap and repeated static
+frames is 54 hops at C=39 and 24 at C=73. Heavy overlap and repeated static
 references reduce per-hop error without eliminating it.
 
 This is the one axis on which "arbitrarily large input" is not literally true.
@@ -727,10 +867,10 @@ The UI is one node; the implementation is not one class.
 | Attention structure measurement | `h3_probe/` |
 | Chunk-size ceiling prediction (§4.3) | `user/minimax_vram_probe.py` (outside this repo) |
 
-`minimax_vram_probe.py` is worth pulling into this repo and extending with
-first-class `--ref-frames` / `--anchor` / `--static-refs` flags, so the ref2v row
-count is computed rather than hand-folded into `--text-len`, and with a
-calibration mode that solves for `--reserve-gb` from a known-good ceiling.
+`minimax_vram_probe.py` now carries `--mode ref2v` with `--ref-frames` /
+`--ref-audio` / `--anchor` / `--static-refs` and a `--calibrate-to` mode. It
+lives in `user/` (gitignored by both repos) and is worth moving in here once the
+node exists, so the layout arithmetic has one home and the tests can cover it.
 
 [`comfy/ldm/minimax/model.py:319`]: ../../../comfy/ldm/minimax/model.py
 [`model.py:335-377`]: ../../../comfy/ldm/minimax/model.py
