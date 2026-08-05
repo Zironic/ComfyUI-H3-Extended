@@ -20,6 +20,13 @@ class H3ActivationPatchError(RuntimeError):
     pass
 
 
+def _diffusion_model(model_patcher):
+    try:
+        return model_patcher.get_model_object("diffusion_model")
+    except Exception:
+        return None
+
+
 def _blocks(model_patcher):
     try:
         blocks = model_patcher.get_model_object(BLOCKS_ATTR)
@@ -34,6 +41,20 @@ def _blocks(model_patcher):
 
 
 def validate(model_patcher):
+    diffusion_model = _diffusion_model(model_patcher)
+    if diffusion_model is not None:
+        try:
+            from comfy.ldm.minimax.model import MiniMaxH3Model
+        except ImportError:
+            MiniMaxH3Model = None
+        if MiniMaxH3Model is not None and not isinstance(
+            diffusion_model, MiniMaxH3Model
+        ):
+            raise H3ActivationPatchError(
+                "activation-memory execution can only patch MiniMaxH3Model; got %s"
+                % type(diffusion_model).__name__
+            )
+
     blocks = _blocks(model_patcher)
     for index, block in enumerate(blocks):
         missing = [name for name in REQUIRED_BLOCK_ATTRS if not hasattr(block, name)]
@@ -79,18 +100,33 @@ def install(model_patcher, config=None):
             % (foreign[0], len(foreign) - 1)
         )
 
-    ours = [existing.get(key_for(i)) for i in range(len(blocks))]
-    if all(
-        fn is not None
-        and getattr(fn, "_h3_activation_memory", False)
-        and getattr(fn, "_h3_activation_config", None) == config.signature
-        for fn in ours
-    ):
-        logging.info(
-            "[H3 activation memory] block forwards already patched (%d)",
-            len(blocks),
+    ours = [
+        index
+        for index in range(len(blocks))
+        if getattr(existing.get(key_for(index)), "_h3_activation_memory", False)
+    ]
+    if ours:
+        if len(ours) != len(blocks):
+            raise H3ActivationPatchError(
+                "only %d of %d H3 blocks carry the activation-memory patch; "
+                "refusing a mixed state" % (len(ours), len(blocks))
+            )
+        installed = {
+            getattr(existing[key_for(index)], "_h3_activation_config", None)
+            for index in ours
+        }
+        if installed == {config.signature}:
+            logging.info(
+                "[H3 activation memory] block forwards already patched (%d)",
+                len(blocks),
+            )
+            return 0
+        raise H3ActivationPatchError(
+            "H3 activation memory is already patched for %s; requested %s. "
+            "Remove the earlier activation-memory node instead of relying on "
+            "node order."
+            % (sorted(str(item) for item in installed), config.signature)
         )
-        return 0
 
     for index, block in enumerate(blocks):
         model_patcher.add_object_patch(

@@ -95,6 +95,9 @@ class HeldMLP:
         return False
 
     def fc1(self, x):
+        # Ordinary Comfy module forwards call this before every operation. The
+        # held path bypasses the module wrapper, so preserve cancellation.
+        comfy.ops.run_every_op()
         return self.fc1_weight.linear(x)
 
     def fc2_swiglu(self, expanded, native):

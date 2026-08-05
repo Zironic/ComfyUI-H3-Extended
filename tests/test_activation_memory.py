@@ -185,9 +185,25 @@ def test_patch_install():
     other = ActivationMemoryConfig(
         mode="mlp_chunked_native", chunk_rows=256
     )
-    check(patch.install(model, other) == 2, "a new configuration replaces ours")
+    try:
+        patch.install(model, other)
+    except patch.H3ActivationPatchError as exc:
+        check("already patched" in str(exc), "reconfiguration is explicit")
+    else:
+        raise AssertionError("stacked activation-memory configurations must raise")
 
-    model = FakePatcher([build_block(12)])
+    partial = FakePatcher([build_block(12), build_block(13)])
+    partial.object_patches[patch.key_for(0)] = make_forward(
+        partial.blocks[0], 0, config
+    )
+    try:
+        patch.install(partial, config)
+    except patch.H3ActivationPatchError as exc:
+        check("mixed state" in str(exc), "partial patch state is rejected")
+    else:
+        raise AssertionError("partial activation-memory patch must raise")
+
+    model = FakePatcher([build_block(14)])
     model.object_patches[patch.key_for(0)] = lambda *args, **kwargs: None
     try:
         patch.install(model, config)
