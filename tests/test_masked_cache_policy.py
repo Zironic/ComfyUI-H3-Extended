@@ -57,6 +57,7 @@ def test_burn_in_freeze():
     session = MaskedCacheSession(cfg, tempfile.gettempdir())
     run = session.begin()
 
+    # The two broad early predictions must not contaminate the frozen mask.
     record(session, run, torch.full((1, 4, 4), 2.0), 0)
     record(session, run, torch.full((1, 4, 4), 2.0), 1)
     check(run.frozen_mask is None, "burn-in predictions do not freeze a mask")
