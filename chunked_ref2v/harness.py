@@ -68,7 +68,6 @@ class HarnessContext:
         self.seeds = seeds
         self.canvas = canvas
         self.base_prompt = ""
-
         self.source_chunk_a_pixels = None
         self.source_chunk_b_pixels = None
         self.static_ref_items = []
@@ -79,7 +78,6 @@ class HarnessContext:
         self.qwen_ref_items_b = []
         self.dit_ref_blocks_a = []
         self.dit_ref_blocks_b = []
-
         self.conditionings = {}
         self.chunk_a_output_latent = None
         self.chunk_a_output_audio = None
@@ -93,13 +91,6 @@ class HarnessContext:
         return prompts.build_prompt(self.base_prompt, policy)
 
     def conditioning_for(self, policy, fallback=None):
-        """Return the exact Qwen encode required by `policy`.
-
-        Non-original arms must never silently consume the original conditioning;
-        doing so produces a plausible output while invalidating the experiment.
-        `fallback` exists only for legacy callers and is accepted for the
-        original policy.
-        """
         key = prompts.encode_key(policy)
         cond = self.conditionings.get(key)
         if cond is None and policy == "original" and fallback:
@@ -132,7 +123,6 @@ def phase_a_vae(context, *, video_vae, audio_vae, source_frames, ref_images,
     a0, a1 = geometry.chunk_a_range
     b0, b1 = geometry.chunk_b_range
     width, height = context.canvas
-    # Store the exact canvas-space source used by both the VAE and metrics.
     context.source_chunk_a_pixels = ref_builder.resize(
         source_frames[a0:a1], width, height).to("cpu", torch.float32)
     context.source_chunk_b_pixels = ref_builder.resize(
@@ -234,7 +224,6 @@ def phase_c_chunk_a(context, *, model, sampler, sigmas, store, identity,
 
     context.chunk_a_output_latent = video_latent.to("cpu", torch.float32)
     context.chunk_a_output_audio = audio_latent.to("cpu", torch.float32)
-    # Persist the completed sample before attempting the much larger VAE decode.
     store.save_tensors("common", "chunk_a_sample", {
         "video_latent": context.chunk_a_output_latent,
         "audio_latent": context.chunk_a_output_audio,
@@ -315,14 +304,15 @@ def _phase_d_vae(context, deps, video_vae, audio_vae, experiment_ids, store, ide
         frames = ref_builder.composite_frames(
             context.overlap_pixels, context.source_chunk_b_pixels,
             geometry.overlap_frames)
-        # Preserve exactly the same source-audio condition used by the original
-        # Chunk B block; otherwise the composite arm changes two variables.
         audio_b = context.dynamic_assets.get("source_audio_b")
         items, block, note = ref_builder.encode_video_ref(
             video_vae, frames, context.canvas,
             audio=audio_b, audio_vae=audio_vae)
         context.dynamic_assets["composite_ref_block"] = block
-        context.dynamic_assets["composite_ref_items"] = items
+        # The original Chunk B presentation already contains the source audio
+        # item. Replacing the video with [audio, video] would duplicate it and
+        # silently create a second <Audio N>. Keep only the replacement video.
+        context.dynamic_assets["composite_ref_items"] = items[-1:] if audio_b else items
         notes.append("composite source reference (%s)" % note)
 
     payload = {}
@@ -382,7 +372,6 @@ def phase_e_experiments(context, *, experiment_ids, model, sampler, sigmas,
     """Sample all arms first, then perform one grouped VAE decode phase."""
     results = []
 
-    # E1: DiT sampling. Every successful sample is persisted immediately.
     for experiment_id in experiment_ids:
         spec = CATALOG[experiment_id]
         record = {
@@ -405,8 +394,6 @@ def phase_e_experiments(context, *, experiment_ids, model, sampler, sigmas,
             record["recovery_latent"] = recovery_path
             record["status"] = "sampled"
         except InterruptProcessingException:
-            # User cancellation and the VRAM guard intentionally use this same
-            # exception. Never swallow it: the executor must unwind immediately.
             logging.warning("%s %s interrupted", LOG_PREFIX, experiment_id)
             raise
         except torch.cuda.OutOfMemoryError as exc:
@@ -435,7 +422,6 @@ def phase_e_experiments(context, *, experiment_ids, model, sampler, sigmas,
             record["resources"] = _resource_snapshot(started)
         results.append(record)
 
-    # E2: VAE decode and pixel diagnostics. This causes one DiT -> VAE switch.
     for record in results:
         if record.get("status") != "sampled":
             continue
@@ -465,7 +451,8 @@ def phase_e_experiments(context, *, experiment_ids, model, sampler, sigmas,
             if not continue_after_failure:
                 raise
         _persist_decoded(
-            store, record, save_latents=save_latents, save_frames=save_frames)
+            store, record, geometry=context.geometry,
+            save_latents=save_latents, save_frames=save_frames)
 
     baseline = next((r.get("metrics") for r in results
                      if r["experiment_id"] == "baseline_none"), None)
@@ -501,7 +488,6 @@ def sample_experiment(context, spec, *, model, sampler, sigmas):
 
 
 def run_experiment(context, spec, *, model, sampler, sigmas, video_vae):
-    """Compatibility helper for one-off callers: sample, decode, and measure."""
     outcome = sample_experiment(context, spec, model=model, sampler=sampler, sigmas=sigmas)
     pixels = decode_video(video_vae, outcome["latent"]).to("cpu", torch.float32)
     outcome["pixels"] = pixels
@@ -519,7 +505,7 @@ def run_experiment(context, spec, *, model, sampler, sigmas, video_vae):
     return outcome
 
 
-def _persist_decoded(store, record, *, save_latents, save_frames):
+def _persist_decoded(store, record, *, geometry, save_latents, save_frames):
     experiment_id = record["experiment_id"]
     record["artifacts"] = {}
     recovery = record.get("recovery_latent")
@@ -542,6 +528,14 @@ def _persist_decoded(store, record, *, save_latents, save_frames):
             boundary_dir = os.path.join(directory, "boundary")
             artifacts.save_frames(boundary_dir, record["boundary"], "seam")
             record["artifacts"]["boundary"] = boundary_dir
+
+    # Metrics and full-resolution artifacts are complete. Retain only the
+    # overlap-sized bounded preview needed by node outputs, not 73 full frames
+    # per experiment. The sampled latent is already persisted as well.
+    if record.get("pixels") is not None:
+        record["pixels"] = comparison.preview_clip(
+            record["pixels"][:geometry.overlap_frames])
+    record.pop("latent", None)
     record.pop("audio_latent", None)
 
 
