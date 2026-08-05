@@ -1,4 +1,4 @@
-"""CLI and packed-layout helpers for the activation-memory VRAM A/B probe."""
+"""CLI and packed-layout helpers for the activation-memory VRAM A/B/C probe."""
 
 import argparse
 
@@ -13,8 +13,14 @@ def build_parser(description):
         description=description,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--ab-activation-memory", action="store_true",
-                   help="compare efficient Sage alone with efficient Sage + chunked MLP")
+    p.add_argument(
+        "--ab-activation-memory",
+        action="store_true",
+        help=(
+            "run A/B/C: A=plain Sage, B=efficient Sage, "
+            "C=efficient Sage + chunked MLP"
+        ),
+    )
     p.add_argument("--ab-frames", default="73,90",
                    help="comma-separated profiles, or 'grid' for the complete 17k+5 sweep")
     p.add_argument("--ab-warmup", type=int, default=1)
@@ -29,19 +35,13 @@ def build_parser(description):
         "--physical-warning-mb",
         type=int,
         default=800,
-        help=(
-            "mark a variant LOW when its minimum measured free physical VRAM "
-            "falls below this many MiB (default 800)"
-        ),
+        help="mark a measured variant LOW below this much physical free VRAM",
     )
     p.add_argument(
         "--physical-poll-ms",
         type=float,
         default=2.0,
-        help=(
-            "poll cudaMemGetInfo at this interval during an untimed residency "
-            "probe; timing iterations run without the poller (default 2 ms)"
-        ),
+        help="cudaMemGetInfo sampling interval for the untimed residency probe",
     )
 
     p.add_argument("--width", type=int, default=1344)
@@ -54,9 +54,9 @@ def build_parser(description):
     p.add_argument("--ckpt", default=None,
                    help="safetensors checkpoint; only its header is read")
     p.add_argument("--analytic", action="store_true",
-                   help="unsupported for A/B; retained for copied-command diagnostics")
+                   help="unsupported for A/B/C; retained for copied-command diagnostics")
     p.add_argument("--sage", action="store_true",
-                   help="accepted for compatibility; A/B always uses efficient Sage")
+                   help="accepted for compatibility; A/B/C always selects ordinary Sage for A")
 
     g = p.add_argument_group("ref2v")
     g.add_argument("--mode", choices=["t2va", "ref2v"], default="t2va")
@@ -67,8 +67,13 @@ def build_parser(description):
     g.add_argument("--anchor", action="store_true")
     g.add_argument("--static-refs", type=int, default=0)
     g.add_argument("--static-ref-pixels", type=int, default=None)
-    g.add_argument("--calibrate-to", type=int, default=None, metavar="FRAMES",
-                   help="calibrate reserve from the efficient-Sage baseline")
+    g.add_argument(
+        "--calibrate-to",
+        type=int,
+        default=None,
+        metavar="FRAMES",
+        help="calibrate reserve from variant B (efficient Sage)",
+    )
     g.add_argument("--spill-ratio", type=float, default=1.35)
     g.add_argument("--past-spill", action="store_true")
 
