@@ -45,6 +45,12 @@ def _video_input(x):
     return x[0]
 
 
+def _video_output(out):
+    if not isinstance(out, (list, tuple)) or not out or not torch.is_tensor(out[0]):
+        raise MeasurementUnavailable("model output is not H3's [video, audio] pair")
+    return out[0]
+
+
 def _unpack_video(packed, latent_shapes):
     if not torch.is_tensor(packed):
         raise MeasurementUnavailable("expected a packed latent tensor")
@@ -113,7 +119,31 @@ def make_diffusion_wrapper(session):
                     "report the fallback instead." % (LOG_PREFIX, reason)) from exc
             logging.warning("%s disabled for this run: %s", LOG_PREFIX, reason)
             run.disable(reason)
-        return executor(*args, **kwargs)
+            return executor(*args, **kwargs)
+
+        out = executor(*args, **kwargs)
+
+        # CPU self-tests and direct wrapper users do not pass through Comfy's
+        # sampler/post-CFG path. Preserve a conditional raw-output fallback only
+        # for that case; real sampling runs always have latent_shapes and are
+        # measured by make_post_cfg_observer instead.
+        cu = transformer_options.get("cond_or_uncond") or [0]
+        if run.latent_shapes is None and int(cu[0]) == 0 and run.disabled_reason is None:
+            try:
+                sigma_t = transformer_options["sigmas"]
+                step, sigma = _step_index(transformer_options)
+                run.observe_sigma(sigma)
+                video_out = _video_output(out)
+                source = session.sources.get(run.source, video_x.device, torch.float32)
+                x0 = session.model_sampling.calculate_denoised(
+                    sigma_t, video_out.float(), video_x.float())
+                tokens, error, scale = _score_maps(x0, source, cfg)
+                session.record_step(run, tokens.cpu(), error.cpu(), scale.cpu(),
+                                    step, sigma, source_kind="conditional_raw")
+            except Exception:
+                logging.exception("%s direct-wrapper scoring failed", LOG_PREFIX)
+                run.disable("direct-wrapper scoring raised")
+        return out
     return wrapper
 
 
@@ -130,22 +160,18 @@ def make_post_cfg_observer(session):
             sigma = float(sigma_t.flatten()[0])
             if not (sigma > MIN_SIGMA):
                 return denoised
-            if run.sample_sigmas_tensor is None:
-                step = -1
-            else:
-                step = int(torch.argmin((run.sample_sigmas_tensor - sigma).abs()))
+            step = (-1 if run.sample_sigmas_tensor is None else
+                    int(torch.argmin((run.sample_sigmas_tensor - sigma).abs())))
             run.observe_sigma(sigma)
             video_x0 = _unpack_video(denoised, run.latent_shapes)
             source = session.sources.get(run.source, video_x0.device, torch.float32)
             tokens, error, scale = _score_maps(video_x0, source, session.config)
-            row = session.record_step(
-                run, tokens.cpu(), error.cpu(), scale.cpu(), step, sigma,
-                source_kind="guided")
+            row = session.record_step(run, tokens.cpu(), error.cpu(), scale.cpu(),
+                                      step, sigma, source_kind="guided")
             logging.info(
                 "%s step %d sigma %.4f: active %.1f%% core -> %.1f%% expanded%s "
-                "(threshold %.3g)",
-                LOG_PREFIX, step, sigma, 100.0 * row["active_core"],
-                100.0 * row["active_expanded"],
+                "(threshold %.3g)", LOG_PREFIX, step, sigma,
+                100.0 * row["active_core"], 100.0 * row["active_expanded"],
                 "" if row["jaccard_prev"] is None else
                 ", J=%.3f vs previous" % row["jaccard_prev"],
                 session.config.score_threshold)
@@ -172,7 +198,8 @@ def _prepare(session, run, args, transformer_options, payload, video_x):
         raise MeasurementUnavailable("no sigma in transformer_options")
     _, sigma = _step_index(transformer_options)
     if not (sigma > MIN_SIGMA):
-        return
+        raise MeasurementUnavailable(
+            "sigma %.3g at or below the %.3g floor" % (sigma, MIN_SIGMA))
     if "easycache" in transformer_options:
         raise MeasurementUnavailable(
             "EasyCache is active; whole-step reuse contaminates the Stage-0 trajectory")
