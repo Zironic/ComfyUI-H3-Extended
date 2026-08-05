@@ -1,4 +1,4 @@
-"""Configure the H3-specific efficient Sage model patch."""
+"""Configure H3-specific prepared-QKV attention backends."""
 
 import logging
 
@@ -14,7 +14,9 @@ def _pin_token_refiner_to_sage(transformer_options):
     sage = get_attention_function("sage", default=None)
     if sage is None:
         raise RuntimeError(
-            "sage_mem_eff requires the registered 'sage' backend for the H3 token refiner")
+            "prepared H3 attention requires the registered 'sage' backend for "
+            "the H3 token refiner"
+        )
     sage_impl = getattr(sage, "__wrapped__", sage)
 
     def override(_original, *args, **kwargs):
@@ -23,14 +25,25 @@ def _pin_token_refiner_to_sage(transformer_options):
     transformer_options["optimized_attention_override"] = override
 
 
-def configure(model_patcher):
-    """Install the SM89 backend on a cloned ModelPatcher and return diagnostics."""
+def configure_backend(model_patcher, backend):
+    """Install one already-preflighted prepared-QKV backend.
+
+    Keeping construction separate from installation lets a capability resolver
+    fall back before any model options or object patches are mutated.
+    """
+    if backend is None:
+        raise TypeError("backend must not be None")
+    backend_name = getattr(backend, "name", type(backend).__name__)
     transformer_options = model_patcher.model_options["transformer_options"] = (
         model_patcher.model_options.get("transformer_options", {}).copy()
     )
     _pin_token_refiner_to_sage(transformer_options)
-    backend = SM89SageMemoryEfficientBackend()
     count = install(model_patcher, backend=backend)
-    transformer_options["minimax_h3_attention_backend"] = BACKEND_NAME
-    logging.info("[H3 attention] configured %s on %d blocks", BACKEND_NAME, count)
+    transformer_options["minimax_h3_attention_backend"] = backend_name
+    logging.info("[H3 attention] configured %s on %d blocks", backend_name, count)
     return backend, count
+
+
+def configure(model_patcher):
+    """Backward-compatible standalone SM89 node configuration."""
+    return configure_backend(model_patcher, SM89SageMemoryEfficientBackend())
