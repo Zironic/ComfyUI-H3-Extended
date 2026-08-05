@@ -3,6 +3,7 @@
 from comfy_api.latest import ComfyExtension
 
 from .chunked_ref2v.nodes import MiniMaxH3HarnessExtension
+from .h3_activation_memory.nodes import MiniMaxH3ActivationMemoryExtension
 from .h3_attention.nodes import MiniMaxH3AttentionExtension
 from .h3_masked_cache.nodes import MiniMaxH3MaskedCacheExtension
 from .h3_probe.nodes import MiniMaxH3ProbeExtension
@@ -18,6 +19,7 @@ class H3ExtendedExtension(ComfyExtension):
             MiniMaxH3HarnessExtension(),
             MiniMaxH3MaskedCacheExtension(),
             MiniMaxH3AttentionExtension(),
+            MiniMaxH3ActivationMemoryExtension(),
         ):
             nodes.extend(await ext.get_node_list())
         return nodes
