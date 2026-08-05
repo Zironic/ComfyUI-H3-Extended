@@ -20,6 +20,8 @@ same mechanism `MiniMaxH3SigmaShiftZi` already uses for `model_sampling`.
 
 import logging
 
+import comfy.conds
+
 from .layout_ops import condition_latents, describe_layout, insert_target_conditions
 
 LOG_PREFIX = "[H3 Extended] harness"
@@ -71,7 +73,6 @@ def patch_target_conditions(model, conditions, *, position_policy="copy_target")
             base_layout, conditions, position_policy=position_policy)
         payload["h3_harness_conditions"] = described
 
-        import comfy.conds
         out["minimax_payload"] = comfy.conds.CONDConstant(payload)
         logging.info("%s target conditions: %s | %s", LOG_PREFIX,
                      "; ".join(described), describe_layout(payload["layout"]))

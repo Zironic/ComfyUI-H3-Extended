@@ -117,9 +117,13 @@ class DirectLatentFrame(CarryStrategy):
         return StrategyDependencies(needs_chunk_a_latent=True)
 
     def prepare(self, context, spec):
+        # `require` rather than attribute access: on a profile whose overlap does
+        # not land on a latent boundary this asset is deliberately absent, and
+        # refusing is the whole point of computing the mapping.
+        latent = context.require("direct_frame_latent")
         prepared = self._base(context, spec)
         prepared.target_conditions = [TargetAlignedCondition(
-            latent=context.direct_frame_latent,
+            latent=latent,
             target_latent_start=0,
             label="previous frame (direct)",
             position_policy=spec.position_policy,
@@ -167,10 +171,11 @@ class DirectLatentOverlap(CarryStrategy):
         return StrategyDependencies(needs_chunk_a_latent=True)
 
     def prepare(self, context, spec):
+        latent = context.require("overlap_latent")
         start, count = context.geometry.overlap_slice()
         prepared = self._base(context, spec)
         prepared.target_conditions = [TargetAlignedCondition(
-            latent=context.overlap_latent,
+            latent=latent,
             target_latent_start=0,
             label="previous overlap",
             position_policy=spec.position_policy,

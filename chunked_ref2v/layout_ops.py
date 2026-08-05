@@ -215,7 +215,7 @@ def insert_target_conditions(base_layout, conditions, *, position_policy="copy_t
 
 def validate_conditions(base_layout, conditions):
     """Check every condition against the target it claims to align to."""
-    text_len, target_latent_t, latent_h, latent_w = base_layout.signature[:4]
+    _, target_latent_t, latent_h, latent_w = base_layout.signature[:4]
     seen = []
     for condition in conditions:
         t = condition.latent_t

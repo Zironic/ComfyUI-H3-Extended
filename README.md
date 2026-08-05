@@ -19,9 +19,28 @@ can be loaded at the same time:
 | `MiniMaxH3ReferenceToVideoZi` | MiniMax H3 Reference to Video (Zi) |
 | `MiniMaxH3SigmaShiftZi` | MiniMax H3 Sigma Shift (Zi) |
 | `MiniMaxH3AttentionProbeZi` | MiniMax H3 Attention Probe (Zi) |
+| `MiniMaxH3Ref2VExperimentHarnessZi` | MiniMax H3 Ref2V Experiment Harness (Zi) |
+| `MiniMaxH3MaskedRef2VCacheZi` | MiniMax H3 Masked Ref2V Cache (Zi) |
 
 Existing workflows still point at the stock ids; re-add the `(Zi)` nodes to use
 this copy.
+
+---
+
+# Chunked ref2v
+
+[`chunked_ref2v/`](chunked_ref2v/) holds the arbitrary-length Ref2V work: the
+production design in [`PLAN.md`](chunked_ref2v/PLAN.md), and the two-chunk
+experiment harness that decides which carry mechanism that production node should
+use — implemented, CPU-tested, **not yet run on the GPU**. See
+[`chunked_ref2v/README.md`](chunked_ref2v/README.md).
+
+The harness is the first thing in this repo that needs *model-side* behaviour
+changed. Core keeps only one set of condition latents when keyframes and
+references are both present, and places a keyframe at the wrong temporal address
+when references are present; both are corrected through `add_object_patch`,
+so the "not forked here" boundary below still holds and the change reverses on
+unpatch.
 
 ---
 
@@ -498,6 +517,134 @@ The instrumentation stays explicitly H3-focused and disposable. There is no
 reason to build a generic Comfy attention profiler before the first measurements
 say what H3 needs.
 
+---
+
+# Masked Ref2V computation
+
+`h3_masked_cache/` — `H3 Masked Computation Plan.md` is the full design. The idea
+is that in a Ref2V *edit*, most of the target video is supposed to come out the
+same as the source video, and the tokens carrying those unchanged regions could
+be dropped from the 50 DiT blocks entirely — the whole source stream is still
+present as reference rows — and then clamped back to the source with an exact
+forced velocity.
+
+**Only Stage 0, measurement, is implemented.** The node observes and reports; it
+does not change what the model computes. `blocks.py` and `plan.py` from the
+plan's structure do not exist yet, and selecting `fixed` or `dynamic` raises
+rather than quietly measuring under a name that promises otherwise.
+
+## The question Stage 0 answers
+
+> Does an early predicted-clean source-difference map reliably identify the
+> region that ends up edited?
+
+Everything downstream rests on that. If the edited region is not identifiable
+early, is not materially smaller than the whole target, or grows unpredictably
+late in the schedule, then no amount of kernel work makes token pruning worth
+having, and it is much cheaper to find that out from a report than from a
+half-finished sparse attention path.
+
+## What it measures
+
+Per model call, on the conditional branch only:
+
+1. `x0 = model_sampling.calculate_denoised(sigma, model_output, x)` — using the
+   sampling object as configured *at this point in the graph*, so an upstream
+   sigma-shift node is honoured rather than approximated by a re-derived flow
+   formula.
+2. A per-latent-cell relative difference against the source reference:
+   `rms_channels(x0 - source) / (rms_channels(source) + floor)`.
+3. Max-pooled over each `1x2x2` DiT patch, giving exactly one score per
+   target-video sequence row.
+4. Thresholded, quantized to token tiles, dilated by a spatial and a temporal
+   halo.
+
+Every reduction is a `max`, never a mean. The mask decides what may be *dropped*,
+so one changed cell has to keep its whole patch; averaging would let a small
+bright edit disappear into a large unchanged patch.
+
+## Output
+
+`output/h3_masked_cache/<run_tag>_<timestamp>/`:
+
+| file | contents |
+| --- | --- |
+| `report.txt` | the readable version of everything below |
+| `summary.json` | config, layout, resolved source, per-step rows, aggregates |
+| `steps.jsonl` | one line per observed forward |
+| `mask.npz` | token score maps (fp16), per-step masks, the run's union mask |
+
+Rewritten in full after every observed forward, so a cancelled or OOM-killed run
+still leaves what it had. No pickles — the score maps are the evidence a
+threshold gets chosen from and have to outlive this code.
+
+The three numbers the gate turns on:
+
+* **active fraction** after tiles and halo — how much there is to gain;
+* **J(prev)** — Jaccard between consecutive steps' masks, i.e. stability;
+* **escaped(union)** — the share of a step's active tokens that no earlier step
+  covered. This is the direct measure of what freezing an early mask would miss,
+  and it is the one that decides whether a warm-up of two steps is enough.
+
+A threshold sweep is reported at every step and averaged over the run, at both
+ends of the chain: a threshold that looks selective at token resolution can be
+worthless once a 4×4 tile and a halo have been applied to it. **No default
+threshold is committed** — the schema's `0.1` is a placeholder, and picking one
+is Commit 5's job, from these curves.
+
+## Fail-closed
+
+The whole mask rests on `x0` and `source` describing the same pixel, so the
+source reference must match the target latent exactly in channels, latent
+length, height and width. Nothing is resized, interpolated, cropped or warped;
+the Ref2V node re-canvases reference videos independently of the requested
+generation size, so a mismatch is common and is always an error rather than a
+best effort.
+
+With `strict=True` (the default) any of these stops the run *before* the forward:
+no video reference, an out-of-range `source_video_ref`, a geometry mismatch, a
+missing packed layout, a sigma at or below the stability floor. With
+`strict=False` the run samples dense, measurement disables itself for the rest of
+the run, and the report says `MEASUREMENT DISABLED` in the header — a fallback
+cannot be mistaken for a measurement.
+
+A measurement run that quietly measured nothing is worse than one that stopped,
+because its output still looks like evidence.
+
+## Placement and cost
+
+```text
+Load H3 model
+  -> MiniMax H3 Sigma Shift (Zi)      # schedule, attention backend, VRAM guard
+  -> MiniMax H3 Masked Ref2V Cache (Zi)
+  -> sampler
+```
+
+`source_video_ref` is one-based over **video** references only — reference images
+and standalone audio do not count — because that is how the reference widgets
+read in the graph.
+
+Cost is one extra float32 copy of the video latent per conditional step plus a
+few element-wise passes over it; the source latent is moved to the device once
+per run and released at the end. Nothing is added to the 50 blocks. `measure`
+mode returns the model's own output object unmodified, which the self-test
+asserts on directly.
+
+## Test matrix
+
+The probe's matrix plus the cases that specifically stress an edit mask:
+
+| tag | clip |
+| --- | --- |
+| `t22`, `t39`, `long`, `rot`, `transform`, `translate` | as for the probe |
+| `subject_static_camera` | subject replacement, camera locked — the best case |
+| `subject_moving_camera` | the same edit with camera motion |
+| `global_style_change` | expected to activate nearly everything, and to say so |
+
+`global_style_change` is not a failure case. It is the one that has to make the
+report obviously unsuitable for compaction rather than quietly produce a 95%
+active mask.
+
 ## Tests
 
 No model or checkpoint required — it builds a real `PackedLayout` and drives the
@@ -509,10 +656,14 @@ python custom_nodes/ComfyUI-H3-Extended/tests/test_probe.py
 python custom_nodes/ComfyUI-H3-Extended/tests/test_attention_backend.py
 python custom_nodes/ComfyUI-H3-Extended/tests/test_vram_guard.py
 python custom_nodes/ComfyUI-H3-Extended/tests/test_cond_cache.py
+python custom_nodes/ComfyUI-H3-Extended/tests/test_chunked_ref2v.py
+python custom_nodes/ComfyUI-H3-Extended/tests/test_masked_cache.py
 ```
 
-Only `test_cond_cache.py` is safe to run while a generation is in flight — it is
-the one that runs with the GPU masked out entirely.
+`test_cond_cache.py`, `test_chunked_ref2v.py` and `test_masked_cache.py` are safe
+to run while a generation is in flight — the first masks the GPU out entirely,
+the other two force `--cpu` before the first comfy import so `model_management`
+never initializes a CUDA context.
 
 `test_attention_backend.py` **runs real kernels on the card** when CUDA and
 SageAttention are present. `test_probe.py` and `test_vram_guard.py` stub the
@@ -535,6 +686,16 @@ second chance, that a breach raises `InterruptProcessingException` before the
 forward runs, and that an already-installed unet wrapper is chained rather than
 replaced. It also asserts on the contents of the cancel log, and resolves a real
 `PackedLayout` to check the `packed tokens` line.
+
+The masked-cache test plants an edit of known extent in a synthetic source and
+predicted-clean pair and checks that the score chain recovers exactly its tokens
+and no neighbours, that tiles and halos produce hand-written answers on grids
+small enough to verify by eye, that a mask inferred at one sigma does not become
+active until the next, and that every validation failure either stops the run or
+returns the dense output untouched. It drives the real diffusion-model wrapper
+with a fake executor and a `CONST` flow sampling object, so the
+`calculate_denoised` relation is exercised rather than re-derived, and it asserts
+that `measure` mode hands back the model's own output object.
 
 The cond-cache test stubs the text encoder — loading Qwen3-VL-32B to test a
 cache that exists to avoid loading it would defeat the point — and covers what

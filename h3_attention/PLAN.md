@@ -267,6 +267,9 @@ no longer entangled with surviving updates. That is a much better place for it.
 | SM89 uses `qk_quant_gran="per_thread"` by default, so the Triton kernels are the live Q/K path | `core.py:618`, `747`, §2.3 | **verified** |
 | `per_channel_fp8` calls `_fused.transpose_pad_permute_cuda` unconditionally; no sage API gives fp8 V without it | `quant.py:282`, §2.3 | **verified** |
 | `sageattn_qk_int8_pv_fp16_cuda` (sm80/86) avoids `per_channel_fp8` entirely — an `_fused`-free option at +1 byte/element on V | `core.py:436-599`, §2.3 | **verified** |
+| SageAttention is **Apache 2.0**, so the Q/K kernel can be vendored with attribution rather than clean-roomed | `sageattention-2.2.0.dist-info/licenses/LICENSE` | **verified** |
+| The int64 quantizer is bit-identical to stock at S=4096/8192 and on the `km` path | `tests/test_triton_i64.py` | **measured** |
+| The int64 quantizer completes past the wrap at S=99,866 with no access violation | `tests/test_triton_i64.py --overflow` | **measured** |
 | Peak-memory and latency delta of `sage_mem_eff` vs `sage` | — | **unknown — §4** |
 
 ## 4. Validation — 4 runs
@@ -308,9 +311,16 @@ repeatable check that belongs early and can be run often — not a scheduled eve
 ### 5.1 Primary: the first legal grid rung past the limit
 
 ```
-C = 209 frames  ->  S = 102,640     (limit is 99,864)
+first wrapping row index      99,865      (= (2**31-1) // 21504 + 1)
+minimum sequence to reach it  99,866      rows are 0-indexed
+
+C = 209 frames  ->  S = 102,640     crosses it
 C = 192 frames  ->  S =  94,547     nearest legal rung below — the control
 ```
+
+Mind the off-by-one: `(2**31-1) // 21504 = 99,864` is the last *safe* row, and a
+length-99,865 tensor stops exactly one row short of wrapping. The unit test asserts
+both sides of that boundary because the first version of it got this wrong.
 
 C=209 is the first `C % 17 == 5` rung that crosses, at 0.82 MP. Run both: 192 must
 complete block 0, 209 must complete block 0 **only** with int64 quantization.
@@ -337,8 +347,13 @@ Keep a synthetic variant for the case where the model is not loadable, or for CI
 Same stride (21,504), no DiT resident:
 
 ```
-S = 99,865   fused QKV 4.00 + Q,K int8 1.33 + V fp8 0.67 + out bf16 1.33  =  ~7.33 GB
+S = 99,866   fused QKV 4.00 + Q,K int8 1.33 + V fp8 0.67 + out bf16 1.33  =  ~7.33 GB
 ```
+
+**Measured 2026-08-05:** `tests/test_triton_i64.py --overflow` at S=99,866 (max
+element offset 2,147,504,127, past the 2,147,483,647 limit) completes with finite
+positive scales and non-zero output, exit code 0, no access violation. Needed
+5.33 GB against 10.00 GB free.
 
 Run it in a **subprocess** — the one piece of the draft's §11.3 worth preserving. A
 defective kernel produces a Windows access violation that kills the interpreter
