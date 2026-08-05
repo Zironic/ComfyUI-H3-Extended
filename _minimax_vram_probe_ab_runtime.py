@@ -1,4 +1,4 @@
-"""Runtime patching and measurement for the activation-memory VRAM A/B probe."""
+"""Runtime patching and measurement for the activation-memory VRAM A/B/C probe."""
 
 from dataclasses import dataclass
 import statistics
@@ -74,18 +74,61 @@ class PhysicalFreeMonitor:
         self._sample()
 
 
+def _route_attention(block, attention_forward, block_forward, variant):
+    """Call one block-forward implementation with an explicit attention forward.
+
+    All three variants share the same block and parameters. Swapping only the
+    instance-level attention callable avoids allocating duplicate multi-GB BF16
+    weight sets while keeping each path unambiguous.
+    """
+
+    def forward(
+        x,
+        t_emb,
+        mod_segments,
+        rope_freqs,
+        transformer_options=None,
+    ):
+        previous = block.attn.forward
+        block.attn.forward = attention_forward
+        try:
+            return block_forward(
+                x,
+                t_emb,
+                mod_segments,
+                rope_freqs,
+                transformer_options=(
+                    transformer_options if transformer_options is not None else {}
+                ),
+            )
+        finally:
+            block.attn.forward = previous
+
+    forward._h3_probe_variant = variant
+    return forward
+
+
 def build_forwards(block, args):
-    # Imported only after base.select_attention(True) has selected Sage.
+    """Build shared-weight A/B/C forwards.
+
+    A: core DiTBlock + core Attention.forward + globally selected attention_sage.
+    B: core DiTBlock + the two-stage efficient-Sage attention forward.
+    C: activation-memory DiTBlock + the same efficient-Sage attention forward.
+    """
+    # Imported only after base.select_attention(True) has selected plain Sage.
     from h3_attention.forward import make_forward as make_attention_forward
     from h3_attention.sage_mem_eff import SM89SageMemoryEfficientBackend
     from h3_activation_memory.config import ActivationMemoryConfig
     from h3_activation_memory.forward import make_forward as make_activation_forward
 
     stock_block_forward = block.forward
+    plain_sage_attention_forward = block.attn.forward
+
     backend = SM89SageMemoryEfficientBackend()
-    block.attn.forward = make_attention_forward(
+    efficient_attention_forward = make_attention_forward(
         block.attn, layer_index=0, backend=backend
     )
+
     config = ActivationMemoryConfig(
         mode=args.activation_mode,
         chunk_rows=args.activation_chunk_rows,
@@ -93,13 +136,32 @@ def build_forwards(block, args):
         strict=not args.activation_nonstrict,
         prefer_held_weights=not args.no_held_weights,
     )
-    activation_forward = make_activation_forward(
+    activation_block_forward = make_activation_forward(
         block,
         layer_index=0,
         config=config,
         original_forward=stock_block_forward,
     )
-    return stock_block_forward, activation_forward, backend, config
+
+    plain = _route_attention(
+        block,
+        plain_sage_attention_forward,
+        stock_block_forward,
+        "A_plain_sage",
+    )
+    efficient = _route_attention(
+        block,
+        efficient_attention_forward,
+        stock_block_forward,
+        "B_efficient_sage",
+    )
+    activation = _route_attention(
+        block,
+        efficient_attention_forward,
+        activation_block_forward,
+        "C_activation_memory",
+    )
+    return plain, efficient, activation, backend, config
 
 
 def measure_forward(
