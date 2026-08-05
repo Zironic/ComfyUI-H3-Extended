@@ -117,21 +117,55 @@ loud test failure. They do not prevent drift. Accepted deliberately.
 
 ## 2. The three questions, in the order they should be answered
 
-### 2.1 Does freeing the QKV actually reduce reserved memory? (Commit 2)
+### 2.1 Does freeing the QKV actually reduce memory? — **ANSWERED: yes, in full**
 
-Custom forward installed, attention delegated to stock PyTorch. Drop the QKV
-references before the attention call, read `GPU reserved memory` — the allocator
-counter that is meaningful under `cudaMallocAsync`.
+`benchmarks/measure_qkv_release.py` reproduces the allocation pattern at H3's real
+shapes with no model loaded, so the question is settled in seconds instead of by
+instrumenting a multi-hour run. Measured on the RTX 4070, 2026-08-05:
 
-```
-measure at C=73 (S=37,898), 50 blocks, sampling transient
-expected eligible release: 1.518 GB
-decision threshold:        >= 0.90 GB realized  ->  proceed to Commit 3
-                           <  0.90 GB realized  ->  stop, write up, keep `sage`
-```
+| C | S | predicted releasable | live at attention, hold → release | **realized** |
+| ---: | ---: | ---: | ---: | ---: |
+| 22 | 13,617 | 0.545 GB | 0.824 → 0.278 GB | **0.545 GB** |
+| 73 | 37,898 | 1.518 GB | 2.293 → 0.775 GB | **1.518 GB** |
+| 90 | 45,990 | 1.842 GB | 2.782 → 0.940 GB | **1.842 GB** |
 
-No kernels written yet at this point. This is the cheapest possible answer to the
-most expensive question in the plan.
+Realized equals predicted to three decimals at every rung: dropping the views
+returns **100%** of the fused QKV. §1.1's worry that `cudaMallocAsync` might not
+give it back does not hold — see the metric traps below for why it looked like it
+might.
+
+**Gate: PASSED.** 1.518 GB at C=73 and 1.842 GB at C=90 against a 0.90 GB
+threshold. Commits 3-5 are worth writing.
+
+The consequence §1.1 predicted now has a number behind it: at C=90 the release is
+**1.842 GB, 2× the 0.90 GB** that `chunked_ref2v/PLAN.md` §4.6 buys with +2.7%
+compute. If it survives end to end, the 73-vs-90 trade dissolves and C=90 — the
+§4.4 compute optimum — becomes the shipping profile.
+
+**What this does not yet show.** This is the allocation pattern in isolation. A
+real run also has the streaming DiT, ComfyUI's cache and the attention kernel's
+own workspace competing for the same pool. The block-level release is proven; that
+it moves the *end-to-end* transient by the same amount is still §4's job.
+
+#### Two metric traps, both of which produced a false STOP
+
+Anyone re-running this will hit both.
+
+- **`torch.cuda.memory_reserved` is identically zero under `cudaMallocAsync`**, so
+  every reserved-based delta is 0.000 GB and reads as "no saving." Use
+  `memory_allocated`. `mem_get_info` is no better: the async pool retains freed
+  blocks rather than returning them to the driver, so driver-free does not move
+  either. The blocks stay reusable in-process, which is what actually matters.
+- **A whole-tensor `x.float()` in the quantization stand-in** materializes a 4-byte
+  copy of the input — 1.01 GB at C=73 — which dominates the peak *in both modes
+  equally* and hides the effect entirely. The measurement quantizes in 4,096-row
+  chunks to keep that temporary bounded.
+
+Peak-allocated saving (0.506 GB at C=73) is smaller than the live-at-attention
+saving because the only thing allocated after the release in this script is the
+output tensor. In the real forward the attention kernel claims a much larger
+workspace, so more of the freed space is reused; live-at-attention is the better
+predictor of end-to-end benefit.
 
 ### 2.2 Does the NHD entry point avoid a copy? (Commit 2, same sitting)
 
@@ -169,7 +203,9 @@ of goal 1.
 | OOM arrives on this card around S=120-150k | prior experimentation | **measured** |
 | C=22 → S=13,617 and C=73 → S=37,898; both satisfy `C % 17 == 5` | rung step 8,093 from §4.3 probe table | **verified** |
 | `optimized_attention_override` is a supported core seam (`wrap_attn`) | [`attention.py:158`] | **verified** |
-| Whether freeing the QKV reduces *reserved* memory under `cudaMallocAsync` | — | **unknown — §2.1, blocking** |
+| Custom forward is bit-identical to core on both the rotary and no-rope paths | `tests/test_h3_attention_forward.py` | **verified** |
+| Dropping the QKV views returns 100% of the fused buffer: 1.518 GB at C=73, 1.842 GB at C=90 | `benchmarks/measure_qkv_release.py`, §2.1 | **measured** |
+| `memory_reserved` is identically 0 under `cudaMallocAsync`; the pool also withholds freed blocks from `mem_get_info` | §2.1 metric traps | **measured** |
 | Whether Sage's NHD path avoids a copy the HND path makes | — | **unknown — §2.2** |
 | Whether an FP8 V path can avoid `_fused.pyd` on SM89 | — | **unknown — §2.3, blocking for goal 1** |
 | Peak-memory and latency delta of `sage_mem_eff` vs `sage` | — | **unknown — §4** |

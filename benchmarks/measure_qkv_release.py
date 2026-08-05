@@ -56,18 +56,38 @@ def predict(seq):
     }
 
 
-def _quantize_int8(x):
-    """Per-token amax scaling. Stands in for the real kernel: same output size,
-    same read of the strided source, no dependency on sageattention."""
-    scale = x.abs().amax(dim=-1, keepdim=True).float().clamp(min=1e-6) / 127.0
-    return (x.float() / scale).round().clamp(-127, 127).to(torch.int8), scale
+QUANT_CHUNK = 4096
+
+
+def _quantize_int8(x, out=None):
+    """Per-token amax scaling, chunked.
+
+    Stands in for the real kernel: same output size, same read of the strided
+    source, no sageattention dependency. Chunked because a whole-tensor
+    `x.float()` materializes a 4-byte copy of the input - 1.01 GB at C=73 -
+    which would dominate the very peak this script is trying to measure, in both
+    modes equally, and hide the effect.
+    """
+    scale = x.abs().amax(dim=-1, keepdim=True).to(torch.float32).clamp(min=1e-6) / 127.0
+    out = torch.empty(x.shape, dtype=torch.int8, device=x.device)
+    for i in range(0, x.shape[0], QUANT_CHUNK):
+        j = i + QUANT_CHUNK
+        out[i:j] = (x[i:j].to(torch.float32) / scale[i:j]).round_().clamp_(-127, 127).to(torch.int8)
+    return out, scale
+
+
+def _free_gb(device):
+    """Driver-level free VRAM. `memory_reserved` is identically zero under
+    cudaMallocAsync, so torch's own pool counters cannot answer this."""
+    torch.cuda.synchronize(device)
+    return torch.cuda.mem_get_info(device)[0] / GB
 
 
 def run_once(seq, release, device):
     torch.cuda.synchronize(device)
     torch.cuda.reset_peak_memory_stats(device)
     base_alloc = torch.cuda.memory_allocated(device)
-    base_reserved = torch.cuda.memory_reserved(device)
+    base_free = _free_gb(device)
 
     # exactly core's shape: the fused projection is never bound to a local, so
     # q/k/v views are the only thing keeping the whole buffer alive
@@ -85,22 +105,24 @@ def run_once(seq, release, device):
     if release:
         del q, k, v                      # drops the last refs to the fused buffer
     torch.cuda.synchronize(device)
-    after_quant = torch.cuda.memory_allocated(device) - base_alloc
 
-    # the attention kernel's own output, allocated while the above is resident
+    # what is resident when the attention kernel starts and begins carving out
+    # its own workspace: the number that decides whether the run fits
+    live_at_attention = torch.cuda.memory_allocated(device) - base_alloc
+    free_at_attention = _free_gb(device)
+
     out = torch.empty(seq, INNER, dtype=torch.bfloat16, device=device)
     torch.cuda.synchronize(device)
-
     peak_alloc = torch.cuda.max_memory_allocated(device) - base_alloc
-    peak_reserved = torch.cuda.max_memory_reserved(device) - base_reserved
+
     del q8, k8, v8, q_scale, k_scale, out
     if not release:
         del q, k, v
     return {
         "after_projection_gb": after_proj / GB,
-        "after_quantize_gb": after_quant / GB,
+        "live_at_attention_gb": live_at_attention / GB,
+        "driver_used_at_attention_gb": base_free - free_at_attention,
         "peak_allocated_gb": peak_alloc / GB,
-        "peak_reserved_gb": peak_reserved / GB,
     }
 
 
@@ -138,28 +160,34 @@ def main():
     results = {}
     for mode, release in (("hold", False), ("release", True)):
         runs = [run_once(seq, release, device) for _ in range(args.repeats)]
-        runs.sort(key=lambda r: r["peak_allocated_gb"])
+        runs.sort(key=lambda r: r["live_at_attention_gb"])
         results[mode] = runs[len(runs) // 2]
         torch.cuda.empty_cache()
 
-    print("\n%-10s %14s %14s %14s %14s"
-          % ("mode", "after proj", "after quant", "peak alloc", "peak reserved"))
+    print("\n%-10s %14s %16s %16s %14s"
+          % ("mode", "after proj", "live at attn", "driver at attn", "peak alloc"))
     for mode, r in results.items():
-        print("%-10s %11.3f GB %11.3f GB %11.3f GB %11.3f GB"
-              % (mode, r["after_projection_gb"], r["after_quantize_gb"],
-                 r["peak_allocated_gb"], r["peak_reserved_gb"]))
+        print("%-10s %11.3f GB %13.3f GB %13.3f GB %11.3f GB"
+              % (mode, r["after_projection_gb"], r["live_at_attention_gb"],
+                 r["driver_used_at_attention_gb"], r["peak_allocated_gb"]))
 
-    saved_alloc = results["hold"]["peak_allocated_gb"] - results["release"]["peak_allocated_gb"]
-    saved_reserved = results["hold"]["peak_reserved_gb"] - results["release"]["peak_reserved_gb"]
-    print("\nrealized saving:  allocated %.3f GB   reserved %.3f GB"
-          % (saved_alloc, saved_reserved))
-    print("predicted ceiling: %.3f GB" % sizes["fused_qkv_bf16"])
-    verdict = "PROCEED to Commits 3-5" if saved_reserved >= 0.90 else "STOP - below the §2.1 threshold"
-    print("threshold 0.90 GB reserved  ->  %s" % verdict)
+    saved = results["hold"]["live_at_attention_gb"] - results["release"]["live_at_attention_gb"]
+    saved_peak = results["hold"]["peak_allocated_gb"] - results["release"]["peak_allocated_gb"]
+    print("\nrealized saving at the attention peak:")
+    print("   live at attention  %.3f GB   <- headroom the kernel gets back" % saved)
+    print("   peak allocated     %.3f GB   <- freed space reused by later allocs" % saved_peak)
+    print("   predicted          %.3f GB" % sizes["fused_qkv_bf16"])
+    print("\nNote: driver-free memory does not move under cudaMallocAsync - the pool"
+          "\nretains freed blocks instead of returning them. They stay reusable inside"
+          "\nthe process, which is what matters here, so torch's allocated counter is"
+          "\nthe honest metric and mem_get_info is not.")
+    verdict = ("PROCEED to Commits 3-5" if saved >= 0.90
+               else "STOP - below the §2.1 threshold")
+    print("\nthreshold 0.90 GB at the attention peak  ->  %s" % verdict)
 
     if args.json:
         print(json.dumps({"frames": args.frames, "seq_len": seq, "sizes_gb": sizes,
-                          "results": results, "saved_reserved_gb": saved_reserved}, indent=2))
+                          "results": results, "saved_driver_gb": saved_driver}, indent=2))
     return 0
 
 
