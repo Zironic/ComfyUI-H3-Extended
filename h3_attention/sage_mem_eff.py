@@ -1,12 +1,19 @@
 """SM89-only memory-efficient SageAttention for MiniMax H3.
 
 The backend reproduces the released H3 Sage path (HND, per-thread INT8 Q/K,
-FP8 V, no K smoothing, FP32+FP16 accumulation) while separating preparation
-from execution so the caller can release the fused BF16 QKV projection before
-the attention kernel starts.
+FP8 V, no K smoothing) while separating preparation from execution so the
+caller can release the fused BF16 QKV projection before the attention kernel
+starts.
+
+SageAttention 2.2 wheels are not uniform across platforms. In particular, some
+Windows builds expose the SM89 kernels only through the compiled extension or
+``torch.ops`` rather than as attributes on ``sageattention.sm89_compile``. The
+resolver below searches every supported export surface and selects the best
+available official kernel.
 """
 
 from dataclasses import dataclass
+import importlib
 import importlib.metadata
 import logging
 
@@ -17,6 +24,27 @@ from .triton_i64 import per_thread_int8_i64
 
 SUPPORTED_SAGE_PREFIXES = ("2.2.",)
 V_OFFSET_LIMIT = (1 << 32) - 1
+
+# Preferred order matches SageAttention's public SM89 dispatch. Every candidate
+# has the same low-level ABI; only the accumulation strategy and therefore the
+# FP8 V quantization range differ.
+KERNEL_CANDIDATES = (
+    (
+        "qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf",
+        2.25,
+        "fp32+fp16",
+    ),
+    (
+        "qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf",
+        448.0,
+        "fp32+fp32",
+    ),
+    (
+        "qk_int8_sv_f8_accum_f32_fuse_v_scale_attn",
+        448.0,
+        "fp32",
+    ),
+)
 
 
 class EfficientSageError(RuntimeError):
@@ -29,6 +57,9 @@ class SageSM89API:
     per_channel_fp8: object
     kernel: object
     kernel_name: str
+    kernel_source: str = "injected"
+    v_scale_max: float = 2.25
+    accumulation: str = "fp32+fp16"
 
 
 @dataclass
@@ -49,6 +80,77 @@ class PreparedSM89:
     kernel_name: str
 
 
+def _append_unique(modules, module):
+    if module is None:
+        return
+    if not any(module is existing for existing in modules):
+        modules.append(module)
+
+
+def _sm89_export_surfaces(core):
+    """Return every place a SageAttention wheel may expose SM89 kernels.
+
+    Official source binds ``sm89_compile`` in ``sageattention.core``. Windows
+    wheels and locally compiled builds have also been observed exposing only the
+    direct extension or registered ``torch.ops`` namespace. All use the same
+    low-level function signature consumed by this backend.
+    """
+    modules = []
+    _append_unique(modules, getattr(core, "sm89_compile", None))
+
+    public_fn = getattr(core, "sageattn_qk_int8_pv_fp8_cuda", None)
+    fn_globals = getattr(public_fn, "__globals__", {}) if public_fn is not None else {}
+    _append_unique(modules, fn_globals.get("sm89_compile"))
+
+    for module_name in ("sageattention.sm89_compile", "sageattention._qattn_sm89"):
+        try:
+            _append_unique(modules, importlib.import_module(module_name))
+        except Exception:
+            pass
+
+    try:
+        _append_unique(modules, torch.ops.sageattention_sm89)
+    except Exception:
+        pass
+    return modules
+
+
+def _surface_name(surface):
+    return getattr(surface, "__name__", type(surface).__name__)
+
+
+def _resolve_sm89_kernel(core):
+    surfaces = _sm89_export_surfaces(core)
+    for kernel_name, v_scale_max, accumulation in KERNEL_CANDIDATES:
+        for surface in surfaces:
+            try:
+                kernel = getattr(surface, kernel_name)
+            except (AttributeError, RuntimeError):
+                continue
+            if callable(kernel):
+                return (
+                    kernel,
+                    kernel_name,
+                    _surface_name(surface),
+                    v_scale_max,
+                    accumulation,
+                )
+
+    available = set()
+    for surface in surfaces:
+        try:
+            names = dir(surface)
+        except Exception:
+            continue
+        available.update(name for name in names if name.startswith("qk_int8_sv_f8"))
+    expected = ", ".join(name for name, _, _ in KERNEL_CANDIDATES)
+    found = ", ".join(sorted(available)) or "none discoverable"
+    raise EfficientSageError(
+        "SageAttention 2.2.x has no supported SM89 kernel export. "
+        "Expected one of: %s. Found: %s" % (expected, found)
+    )
+
+
 def _load_api():
     try:
         version = importlib.metadata.version("sageattention")
@@ -56,27 +158,41 @@ def _load_api():
     except Exception as exc:
         stats.increment("compatibility_errors")
         raise EfficientSageError(
-            "sage_mem_eff requires SageAttention 2.2.x with the SM89 extension") from exc
+            "sage_mem_eff requires SageAttention 2.2.x with the SM89 extension"
+        ) from exc
 
     if not version.startswith(SUPPORTED_SAGE_PREFIXES):
         stats.increment("compatibility_errors")
         raise EfficientSageError(
             "sage_mem_eff was validated against SageAttention 2.2.x; installed version is %s"
-            % version)
+            % version
+        )
     if not getattr(core, "SM89_ENABLED", False):
         stats.increment("compatibility_errors")
         raise EfficientSageError("SageAttention's SM89 extension is unavailable")
 
     per_channel_fp8 = getattr(core, "per_channel_fp8", None)
-    sm89_compile = getattr(core, "sm89_compile", None)
-    kernel_name = "qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf"
-    kernel = getattr(sm89_compile, kernel_name, None) if sm89_compile is not None else None
-    if per_channel_fp8 is None or kernel is None:
+    if per_channel_fp8 is None:
         stats.increment("compatibility_errors")
         raise EfficientSageError(
-            "SageAttention 2.2.x internal SM89 API changed: missing %s"
-            % kernel_name)
-    return SageSM89API(version, per_channel_fp8, kernel, kernel_name)
+            "SageAttention 2.2.x internal API changed: missing per_channel_fp8"
+        )
+
+    try:
+        kernel, kernel_name, source, v_scale_max, accumulation = _resolve_sm89_kernel(core)
+    except EfficientSageError:
+        stats.increment("compatibility_errors")
+        raise
+
+    return SageSM89API(
+        version=version,
+        per_channel_fp8=per_channel_fp8,
+        kernel=kernel,
+        kernel_name=kernel_name,
+        kernel_source=source,
+        v_scale_max=v_scale_max,
+        accumulation=accumulation,
+    )
 
 
 def max_linear_offset(tensor):
@@ -113,7 +229,8 @@ class SM89SageMemoryEfficientBackend:
         if q.shape != k.shape or q.shape != v.shape:
             raise EfficientSageError(
                 "sage_mem_eff requires equal self-attention Q/K/V shapes; got %s %s %s"
-                % (tuple(q.shape), tuple(k.shape), tuple(v.shape)))
+                % (tuple(q.shape), tuple(k.shape), tuple(v.shape))
+            )
         if q.ndim != 4:
             raise EfficientSageError("sage_mem_eff expects HND rank-4 tensors")
         batch, heads, sequence, head_dim = q.shape
@@ -135,7 +252,8 @@ class SM89SageMemoryEfficientBackend:
             capability = torch.cuda.get_device_capability(q.device)
             if capability != (8, 9):
                 raise EfficientSageError(
-                    "sage_mem_eff is SM89-only; device capability is %d.%d" % capability)
+                    "sage_mem_eff is SM89-only; device capability is %d.%d" % capability
+                )
         return batch, heads, sequence, head_dim
 
     def prepare(self, q, k, v, *, layer_index, transformer_options):
@@ -144,7 +262,9 @@ class SM89SageMemoryEfficientBackend:
             torch.cuda.set_device(q.device)
 
         q_int8, q_scale, k_int8, k_scale = self.quantizer(
-            q, k, None,
+            q,
+            k,
+            None,
             BLKQ=128,
             WARPQ=32,
             BLKK=64,
@@ -153,11 +273,10 @@ class SM89SageMemoryEfficientBackend:
         )
 
         guarded_v = guard_v_stride(v)
-        # Match stock SM89's fp32+fp16 path: scale_max 2.25, smooth_v False.
         v_fp8, v_scale, _ = self.api.per_channel_fp8(
             guarded_v,
             tensor_layout="HND",
-            scale_max=2.25,
+            scale_max=self.api.v_scale_max,
             smooth_v=False,
         )
         del guarded_v
@@ -166,9 +285,12 @@ class SM89SageMemoryEfficientBackend:
         if not self._logged:
             logging.info(
                 "[H3 attention] sage_mem_eff active: SageAttention %s, HND, "
-                "per-thread int64 Q/K, stock FP8 V, kernel=%s",
+                "per-thread int64 Q/K, stock FP8 V, accumulation=%s, "
+                "kernel=%s via %s",
                 self.api.version,
+                self.api.accumulation,
                 self.api.kernel_name,
+                self.api.kernel_source,
             )
             self._logged = True
 
@@ -184,7 +306,7 @@ class SM89SageMemoryEfficientBackend:
             sequence=int(sequence),
             heads=int(heads),
             head_dim=int(head_dim),
-            softmax_scale=head_dim ** -0.5,
+            softmax_scale=head_dim**-0.5,
             kernel=self.api.kernel,
             kernel_name=self.api.kernel_name,
         )
