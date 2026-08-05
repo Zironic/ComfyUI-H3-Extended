@@ -54,7 +54,11 @@ import time
 
 import torch
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_COMFYUI_ROOT = os.path.abspath(os.path.join(_HERE, "..", ".."))
+
+if _COMFYUI_ROOT not in sys.path:
+    sys.path.insert(0, _COMFYUI_ROOT)
 
 FPS = 24
 AUDIO_LATENT_FPS = 40
