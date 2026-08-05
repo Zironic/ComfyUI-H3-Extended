@@ -29,11 +29,11 @@ class ApplyResult:
     device_name: str
 
 
-def _record_status(model_patcher, result, config):
+def _record_status(model_patcher, result, config, pool_policy=None):
     options = model_patcher.model_options["transformer_options"] = (
         model_patcher.model_options.get("transformer_options", {}).copy()
     )
-    options[STATUS_KEY] = {
+    status = {
         "attention_requested": result.attention_requested,
         "attention_selected": result.attention_selected,
         "attention_reason": result.attention_reason,
@@ -43,12 +43,20 @@ def _record_status(model_patcher, result, config):
         "chunk_rows": int(config.chunk_rows),
         "architecture": result.architecture,
         "device_name": result.device_name,
+        "cuda_async_soft_gc": bool(config.cuda_async_soft_gc),
+        "cuda_async_release_threshold_gib": float(
+            config.cuda_async_release_threshold_gib
+        ),
     }
+    if pool_policy is not None:
+        status["cuda_async_pool_policy"] = pool_policy.as_status()
+    options[STATUS_KEY] = status
 
 
 def apply(model_patcher, config=None, decision=None,
           attention_configurer=configure_backend,
-          activation_installer=install_activation):
+          activation_installer=install_activation,
+          pool_policy=None):
     """Install both optimizations on one already-cloned ModelPatcher.
 
     Resolution is performed before patch installation. Unsupported attention
@@ -86,13 +94,19 @@ def apply(model_patcher, config=None, decision=None,
         architecture=decision.environment.architecture,
         device_name=decision.environment.device_name,
     )
-    _record_status(model_patcher, result, config)
+    _record_status(
+        model_patcher,
+        result,
+        config,
+        pool_policy=pool_policy,
+    )
 
     level = logging.INFO if decision.selected != ATTENTION_EXISTING else logging.WARNING
     logging.log(
         level,
         "%s armed: attention=%s (requested=%s, reason=%s) attention_blocks=%d "
-        "activation=%s activation_blocks=%d chunk_rows=%d device=%s arch=%s",
+        "activation=%s activation_blocks=%d chunk_rows=%d cuda_async_soft_gc=%s "
+        "device=%s arch=%s",
         LOG_PREFIX,
         result.attention_selected,
         result.attention_requested,
@@ -101,6 +115,7 @@ def apply(model_patcher, config=None, decision=None,
         result.activation_mode,
         result.activation_blocks,
         int(config.chunk_rows),
+        bool(config.cuda_async_soft_gc),
         result.device_name,
         result.architecture,
     )
