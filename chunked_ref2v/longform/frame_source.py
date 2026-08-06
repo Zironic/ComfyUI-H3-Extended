@@ -17,12 +17,21 @@ class FrameSourceError(RuntimeError):
 
 def resolve_ffmpeg(explicit=None):
     if explicit:
-        candidate = explicit
-        if os.path.isdir(candidate):
-            candidate = os.path.join(candidate, "ffmpeg.exe" if os.name == "nt" else "ffmpeg")
-        if not os.path.exists(candidate):
-            raise FrameSourceError("ffmpeg not found at %r" % explicit)
-        return candidate
+        exe = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
+        if os.path.isdir(explicit):
+            # Released builds unpack as <dir>/bin/ffmpeg.exe, so pointing at the
+            # extracted folder - the obvious thing to do - has to work as well as
+            # pointing at the binary.
+            candidates = [os.path.join(explicit, exe),
+                          os.path.join(explicit, "bin", exe)]
+        else:
+            candidates = [explicit]
+        for candidate in candidates:
+            if os.path.isfile(candidate):
+                return candidate
+        raise FrameSourceError(
+            "ffmpeg not found at %r (looked for %s)"
+            % (explicit, ", ".join(candidates)))
     found = shutil.which("ffmpeg")
     if found:
         return found

@@ -74,8 +74,19 @@ class MiniMaxH3LongFormRef2V(io.ComfyNode):
                 io.Int.Input("width", default=0, min=0, max=nodes.MAX_RESOLUTION, step=32),
                 io.Int.Input("height", default=0, min=0, max=nodes.MAX_RESOLUTION, step=32),
                 io.String.Input("run_directory", default="", multiline=False,
-                                tooltip="Existing runs resume only when the immutable manifest matches."),
-                io.String.Input("ffmpeg_location", default="", multiline=False),
+                                tooltip=("Leave blank to create "
+                                         "output/h3_longform/<timestamp>_<carry>_c<chunk_frames>. "
+                                         "Point at an existing run to resume it - "
+                                         "it continues from the first incomplete "
+                                         "chunk, and only when the immutable "
+                                         "manifest matches this configuration.")),
+                io.String.Input("ffmpeg_location", default="", multiline=False,
+                                tooltip=("Leave blank to auto-detect: ffmpeg on "
+                                         "PATH, otherwise the imageio_ffmpeg "
+                                         "binary bundled with this environment. "
+                                         "Accepts either an executable or a "
+                                         "directory containing one. The resolved "
+                                         "path is echoed in the report output.")),
                 io.Boolean.Input("output_video", default=True),
                 io.Boolean.Input("preserve_source_audio", default=True),
                 io.Boolean.Input("save_frames", default=False,
@@ -208,6 +219,9 @@ class MiniMaxH3LongFormRef2V(io.ComfyNode):
             "video     %s" % (summary["output_path"] or "disabled"),
             "runtime   %s" % memory.describe(memory_status),
             "run dir   %s" % root,
+            # Both of these accept a blank widget and resolve themselves, so echo
+            # what was actually used rather than leaving the user to guess.
+            "ffmpeg    %s" % _describe_ffmpeg(ffmpeg_location.strip() or None),
         ])
         preview = None
         if save_frames:
@@ -218,6 +232,16 @@ class MiniMaxH3LongFormRef2V(io.ComfyNode):
         if preview is None:
             preview = torch.zeros(1, 64, 64, 3)
         return io.NodeOutput(preview, root, summary["output_path"], report)
+
+
+def _describe_ffmpeg(explicit):
+    """Resolved ffmpeg path for the report, never raising into a finished run."""
+    from .frame_source import resolve_ffmpeg
+    try:
+        resolved = resolve_ffmpeg(explicit)
+    except Exception as exc:
+        return "unresolved (%s)" % exc
+    return "%s%s" % (resolved, "" if explicit else "  (auto-detected)")
 
 
 def _preview_from_video(video_path, limit=48, ffmpeg_location=None):
