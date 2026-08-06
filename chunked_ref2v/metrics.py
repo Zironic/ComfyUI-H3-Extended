@@ -131,13 +131,68 @@ def source_adherence(chunk_b_pixels, source_chunk_b_pixels):
     }
 
 
+def monolithic_tail_metrics(monolithic_pixels, chunk_b_pixels, geometry,
+                            tail_frames=17):
+    """Compare the end of a chunked run against a single run of the same length.
+
+    This is the only metric here measured against *ground truth* rather than
+    against the harness's own first chunk. Everything else asks "did chunk B
+    follow chunk A"; this asks "did chunking reproduce what one run would have
+    produced", which is the question the production node actually has to answer.
+
+    The tail is chosen because it is furthest from the carried state - drift
+    accumulates away from the seam, so agreement here is the strong claim.
+
+    **It will never reach zero.** The two runs denoise different latent shapes
+    (T=37 vs T=22) and therefore consume different noise, so even a flawless
+    carry produces a different sample from the same distribution. Read these
+    numbers only by comparing arms against each other: a carry that works puts
+    its tail closer to the monolithic reference than the no-carry control does.
+    """
+    mono = _cpu(monolithic_pixels)
+    chunked = _cpu(chunk_b_pixels)
+    if mono is None or chunked is None:
+        return {}
+    start, stop = geometry.tail_range(tail_frames)
+    b_start, b_stop = geometry.tail_in_chunk_b(tail_frames)
+    if mono.shape[0] < stop or chunked.shape[0] < b_stop:
+        return {"monolithic_tail_note":
+                "not enough decoded frames (monolithic %d, chunk B %d)"
+                % (mono.shape[0], chunked.shape[0])}
+
+    mono_tail = mono[start:stop]
+    chunked_tail = chunked[b_start:b_stop]
+    if mono_tail.shape[1:] != chunked_tail.shape[1:]:
+        return {"monolithic_tail_note": "canvas mismatch between the two runs"}
+
+    out = {
+        "monolithic_tail_mae": mae(mono_tail, chunked_tail),
+        "monolithic_tail_mae_per_frame": per_frame_mae(mono_tail, chunked_tail),
+        "monolithic_tail_frames": [start, stop],
+    }
+    if mono_tail.shape[0] >= 2:
+        motion_mono = mono_tail[1:] - mono_tail[:-1]
+        motion_chunked = chunked_tail[1:] - chunked_tail[:-1]
+        out["monolithic_tail_motion_mae"] = mae(motion_mono, motion_chunked)
+    # Whole-length agreement over chunk B's span, for context: a tail that
+    # agrees while the body does not would mean something quite different.
+    body = mono[geometry.stride_frames:geometry.total_frames]
+    if body.shape[0] == chunked.shape[0]:
+        out["monolithic_chunk_b_mae"] = mae(body, chunked)
+    return out
+
+
 def collect(*, geometry, chunk_a_latent, chunk_a_pixels,
-            chunk_b_latent, chunk_b_pixels, source_chunk_b_pixels=None):
+            chunk_b_latent, chunk_b_pixels, source_chunk_b_pixels=None,
+            monolithic_pixels=None, tail_frames=17):
     out = {}
     out.update(pixel_overlap_metrics(chunk_a_pixels, chunk_b_pixels, geometry))
     out.update(latent_overlap_metrics(chunk_a_latent, chunk_b_latent, geometry))
     out.update(motion_metrics(chunk_a_pixels, chunk_b_pixels, geometry))
     out.update(source_adherence(chunk_b_pixels, source_chunk_b_pixels))
+    if monolithic_pixels is not None:
+        out.update(monolithic_tail_metrics(
+            monolithic_pixels, chunk_b_pixels, geometry, tail_frames))
     return out
 
 
@@ -145,11 +200,13 @@ def format_metrics(metrics):
     lines = []
     for key in ("pixel_overlap_mae", "first_frame_pixel_mae",
                 "latent_overlap_mae", "first_position_latent_mae",
-                "motion_delta_mae", "motion_energy_ratio"):
+                "motion_delta_mae", "motion_energy_ratio",
+                "monolithic_tail_mae", "monolithic_tail_motion_mae",
+                "monolithic_chunk_b_mae"):
         value = metrics.get(key)
         if value is not None:
             lines.append("    %-28s %.6f" % (key, value))
-    for key in ("latent_overlap_note", "error"):
+    for key in ("latent_overlap_note", "monolithic_tail_note", "error"):
         if metrics.get(key):
             lines.append("    %-28s %s" % (key, metrics[key]))
     return "\n".join(lines)
@@ -159,7 +216,8 @@ def compare_to_baseline(metrics, baseline_metrics):
     """Relative improvement over the control, where both numbers exist."""
     out = {}
     for key in ("pixel_overlap_mae", "first_frame_pixel_mae",
-                "latent_overlap_mae", "motion_delta_mae"):
+                "latent_overlap_mae", "motion_delta_mae",
+                "monolithic_tail_mae", "monolithic_tail_motion_mae"):
         value, base = metrics.get(key), (baseline_metrics or {}).get(key)
         if value is None or base in (None, 0):
             continue

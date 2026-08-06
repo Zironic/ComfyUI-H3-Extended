@@ -18,6 +18,11 @@ import torchaudio
 
 import comfy.utils
 
+try:
+    from .. import latent_cache
+except ImportError:  # the self-tests import this file as a top-level module
+    import latent_cache
+
 CANVAS_MULTIPLE = 32
 BASE_SHORT_EDGE = 768
 MAX_PIXELS = 768 * 1344
@@ -53,7 +58,7 @@ def pin_canvas(source_frames, width=0, height=0):
     return adapt_canvas(source_frames.shape[2], source_frames.shape[1])
 
 
-def encode_image_ref(vae, image, canvas, ref_image_size="match"):
+def encode_image_ref(vae, image, canvas, ref_image_size="match", cond_cache="auto"):
     """A static image reference, at `match` or `max` sizing."""
     h, w = image.shape[1], image.shape[2]
     width, height = canvas
@@ -64,7 +69,7 @@ def encode_image_ref(vae, image, canvas, ref_image_size="match"):
     tw = max(CANVAS_MULTIPLE, round(w * scale / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
     th = max(CANVAS_MULTIPLE, round(h * scale / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
     resized = resize(image[:1], tw, th)
-    latent = vae.encode(resized)
+    latent = latent_cache.encode(vae, resized, mode=cond_cache, label='ref image')
     item = {"type": "image", "data": resized}
     block = {"kind": "image", "latent_h": th // 16, "latent_w": tw // 16, "latent": latent}
     return item, block, "%dx%d source -> %dx%d encoded" % (w, h, tw, th)
@@ -87,7 +92,7 @@ def snap_video_frames(frames):
     return frames[:n]
 
 
-def encode_video_ref(vae, frames, canvas, audio=None, audio_vae=None):
+def encode_video_ref(vae, frames, canvas, audio=None, audio_vae=None, cond_cache="auto"):
     """A reference video pinned to the run's canvas.
 
     Returns `(qwen_items, dit_block, note)`. `qwen_items` is a list because a
@@ -96,12 +101,12 @@ def encode_video_ref(vae, frames, canvas, audio=None, audio_vae=None):
     """
     width, height = canvas
     frames = snap_video_frames(resize(frames, width, height))
-    latent = vae.encode(frames)
+    latent = latent_cache.encode(vae, frames, mode=cond_cache, label='ref video')
 
     items = []
     audio_latent, ref_audio_t = None, 0
     if audio is not None and audio_vae is not None:
-        audio_latent, ref_audio_t = encode_ref_audio(audio_vae, audio)
+        audio_latent, ref_audio_t = encode_ref_audio(audio_vae, audio, cond_cache)
         items.append({"type": "audio"})
     items.append(qwen_video_item(frames))
 
@@ -119,13 +124,14 @@ def encode_video_ref(vae, frames, canvas, audio=None, audio_vae=None):
     return items, block, note
 
 
-def encode_ref_audio(audio_vae, audio):
+def encode_ref_audio(audio_vae, audio, cond_cache="auto"):
     waveform = audio["waveform"]
     sample_rate = audio["sample_rate"]
     vae_sr = getattr(audio_vae, "audio_sample_rate", 32000)
     if sample_rate != vae_sr:
         waveform = torchaudio.functional.resample(waveform, sample_rate, vae_sr)
-    latent = audio_vae.encode(waveform[:1].movedim(1, -1))
+    latent = latent_cache.encode(audio_vae, waveform[:1].movedim(1, -1),
+                                 mode=cond_cache, label='ref audio')
     return latent, latent.shape[-1]
 
 

@@ -122,7 +122,10 @@ a curve. See §4.
 | Cost per output frame bottoms out at C=90; C=73 costs +2.7% and buys 0.90 GB margin | probe fit, §4.4 / §4.6 | **measured** |
 | Whether C=73 holds up with real prompts, references and desktop load | — | **unknown — Stage 0 §4.6** |
 | Whether quality improves with C independently of overlap (training-distribution effect) | — | **unknown — Stage 3** |
-| Ref2VA checkpoint obeys a keyframe latent Qwen never saw | — | **unknown — Stage 0** |
+| Ref2VA checkpoint obeys a keyframe latent Qwen never saw | harness `minimal` suite, 2026-08-05 | **measured — yes**, 2.6× lower overlap MAE than the control (0.2 MP) |
+| §1.1's corrected keyframe placement is load-bearing, not cosmetic | same run | **measured — yes**: stock placement scores 0.0275 vs the control's 0.0332; corrected halves it to 0.0128 |
+| Decode/re-encode round trip vs direct latent reuse | same run | **measured**: direct wins everywhere, 0.0448 vs 0.1086 first-position latent MAE |
+| Whether any of the above holds at a production canvas | — | **unknown** — the run above was 0.2 MP, far outside the trained range |
 
 ### 2.1 Two different 17s
 
@@ -691,6 +694,40 @@ This diagnoses: whether hybrid keyframe conditioning works at all; whether
 correct RoPE placement matters; whether an anchor unseen by Qwen suffices;
 whether Ref2VA still obeys source motion once an anchor is introduced; and
 whether the packed layout runs without row-count or latent-order errors.
+
+### Result — 2026-08-05, at 0.2 MP
+
+Run through the harness's `minimal` suite rather than three hand-built arms; it
+covers the same three questions plus the re-encode comparison. All five
+diagnoses came back positive: hybrid conditioning works, the corrected RoPE
+placement is what makes it work, an anchor Qwen never saw suffices, source
+motion is intact (motion-energy ratios 0.985–1.015), and the packed layout ran
+without a single row-count or latent-order error across four arms.
+
+See `chunked_ref2v/README.md` for the numbers. **The run was at 608×352, not the
+target profile's canvas**, so the ordering is trustworthy and the absolute
+quality is not — §4.6's headroom question and the C=73 fit are still open, since
+0.2 MP exercises none of that. The fallback list below was not needed.
+
+All ten implemented strategies were then measured on the same Chunk A. The
+**directly reused target-aligned overlap** is the production carry mode: it ties
+the single-frame anchor on pixel agreement but wins on latent agreement (0.276×
+baseline vs 0.428×) and on motion continuity (0.442× vs 0.601×). That is §16's
+"the carried frame fixes position, not velocity" showing up as a measurement.
+
+Three fallbacks from §10 can be struck, and the §12 interface simplified with
+them:
+
+1. *"Add the anchor to Qwen as an additional hidden reference image"* — prompt
+   text made no measurable difference (0.386 vs 0.387), so telling Qwen about
+   the carry is not the lever.
+2. *"Supply the previous generated overlap as an additional reference-video
+   block"* — measured worse than no carry at all (1.071×), though see the
+   README's canvas caveat before treating this as final.
+3. A composite source reference — worst arm measured (1.112×, latent 1.244×).
+
+What survives: target-aligned condition rows at the corrected temporal address,
+carrying the **full overlap** rather than one frame, with the unmodified prompt.
 
 ### Fallbacks, in order
 

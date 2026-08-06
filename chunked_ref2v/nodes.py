@@ -20,7 +20,7 @@ except ImportError:  # self-tests import the package as a top-level module
     import run_context
     from cond_cache import MODES as COND_CACHE_MODES
 
-from . import artifacts, comparison, harness, report
+from . import artifacts, comparison, harness, memory, report
 from .experiments import CATALOG, SUITE_NAMES, resolve_suite
 from .geometry import HarnessGeometry
 
@@ -44,8 +44,12 @@ class MiniMaxH3Ref2VExperimentHarness(io.ComfyNode):
                 "its own identity, so adding an experiment never regenerates it."
             ),
             inputs=[
-                io.Model.Input("model", tooltip="Apply the (Zi) sigma shift node first - "
-                                                "it also carries the attention backend and the VRAM guard."),
+                io.Model.Input("model", tooltip="Apply the (Zi) sigma shift node first for the "
+                                                "sigma shifts and the VRAM guard. Attention is armed "
+                                                "here instead, by the capability resolver - leave the "
+                                                "shift node's attention_backend on 'comfy'. A model "
+                                                "already patched by MiniMaxH3MemoryOptimizerZi is "
+                                                "inherited rather than re-armed."),
                 io.Clip.Input("clip"),
                 io.Vae.Input("video_vae"),
                 io.Vae.Input("audio_vae"),
@@ -71,6 +75,42 @@ class MiniMaxH3Ref2VExperimentHarness(io.ComfyNode):
                                 tooltip="Comma-separated experiment ids, used when the suite is 'custom'."),
                 io.Combo.Input("ref_image_size", options=["match", "max"], default="match"),
                 io.Combo.Input("cond_cache", options=COND_CACHE_MODES, default="auto"),
+                io.Boolean.Input("monolithic_reference", default=False,
+                                 tooltip="Also generate the whole span in ONE run and score every "
+                                         "arm's tail against it. This is the only measurement here "
+                                         "against ground truth rather than against the harness's "
+                                         "own first chunk. Costs one extra sample of "
+                                         "stride+chunk frames. Requires S %% 17 == 0."),
+                io.Int.Input("tail_frames", default=17, min=2, max=120,
+                             tooltip="How many frames at the far end to compare against the "
+                                     "monolithic run. The tail is furthest from the carried "
+                                     "state, so it is where a carry that lost the trajectory "
+                                     "shows up."),
+                io.Combo.Input("attention", options=list(memory.ATTENTION_MODES),
+                               default="auto",
+                               tooltip="Armed once for the whole run and shared by Chunk A and "
+                                       "every arm, so peak-VRAM and runtime stay comparable "
+                                       "across arms. 'auto' picks the prepared-QKV Sage backend "
+                                       "matching this GPU; 'existing' leaves the incoming "
+                                       "attention alone for an A/B."),
+                io.Combo.Input("attention_fallback", options=list(memory.FALLBACK_MODES),
+                               default="allow",
+                               tooltip="'allow' preserves existing attention when no optimized "
+                                       "adapter fits, and the report says so - arm-to-arm "
+                                       "comparison survives, absolute resource figures stop being "
+                                       "attributable. 'error' refuses to start the run instead."),
+                io.Combo.Input("activation", options=list(memory.ACTIVATION_MODES),
+                               default="mlp_chunked_bf16",
+                               tooltip="MLP activation chunking, armed with attention. 'off' "
+                                       "disables it."),
+                io.Boolean.Input("cuda_async_soft_gc", default=False,
+                                 tooltip="Under cudaMallocAsync, ask the default pool to return "
+                                         "memory above a soft threshold on later syncs. Worth "
+                                         "considering for an unattended multi-hour suite; it is "
+                                         "not a hard limit and does not empty the cache."),
+                io.Float.Input("cuda_async_release_threshold_gib", default=11.0,
+                               min=0.25, max=256.0, step=0.25,
+                               tooltip="Soft retention threshold, ignored unless soft GC is on."),
                 io.String.Input("reuse_run", default="", multiline=False,
                                 tooltip="Prior run id to reuse Chunk A from. Blank searches by "
                                         "identity and reuses a match automatically."),
@@ -103,7 +143,11 @@ class MiniMaxH3Ref2VExperimentHarness(io.ComfyNode):
     def execute(cls, model, clip, video_vae, audio_vae, source_video, prompt,
                 sampler, sigmas, seed, chunk_frames=73, overlap_frames=22,
                 experiment_suite="minimal", custom_experiments="",
-                ref_image_size="match", cond_cache="auto", reuse_run="",
+                ref_image_size="match", cond_cache="auto",
+                monolithic_reference=False, tail_frames=17,
+                attention="auto", attention_fallback="allow",
+                activation="mlp_chunked_bf16", cuda_async_soft_gc=False,
+                cuda_async_release_threshold_gib=11.0, reuse_run="",
                 width=0, height=0, save_latents=True, save_frames=True,
                 continue_after_failure=True, preview_experiment="",
                 ref_images=None, source_audio=None) -> io.NodeOutput:
@@ -114,6 +158,15 @@ class MiniMaxH3Ref2VExperimentHarness(io.ComfyNode):
         seeds = harness.SeedSet(seed)
         canvas = _pin_canvas(source_video, width, height)
 
+        # Armed before anything is sampled, and before the VAE work in Phase A,
+        # so an `error` fallback refuses the run in the first second rather than
+        # after Chunk A has been generated.
+        model, memory_status = memory.arm(
+            model, attention=attention, attention_fallback=attention_fallback,
+            activation=activation, cuda_async_soft_gc=cuda_async_soft_gc,
+            cuda_async_release_threshold_gib=cuda_async_release_threshold_gib)
+        logging.info("%s %s", LOG_PREFIX, memory.describe(memory_status))
+
         run_context.record(
             "MiniMax H3 Ref2V Experiment Harness (Zi)", run_context.node_id(cls),
             [("canvas", "%dx%d" % canvas),
@@ -121,6 +174,7 @@ class MiniMaxH3Ref2VExperimentHarness(io.ComfyNode):
              ("suite", "%s -> %s" % (experiment_suite, ", ".join(experiment_ids))),
              ("ref_image_size", ref_image_size),
              ("cond_cache", cond_cache),
+             ("memory optimizer", memory.describe(memory_status)),
              ("source_video", "%d frames %dx%d" % (source_video.shape[0],
                                                    source_video.shape[2], source_video.shape[1])),
              ("prompt", "%d chars" % len(prompt))],
@@ -136,7 +190,8 @@ class MiniMaxH3Ref2VExperimentHarness(io.ComfyNode):
         notes = harness.phase_a_vae(
             context, video_vae=video_vae, audio_vae=audio_vae,
             source_frames=source_video, ref_images=ref_images,
-            ref_image_size=ref_image_size, source_audio=source_audio)
+            ref_image_size=ref_image_size, source_audio=source_audio,
+            monolithic=monolithic_reference)
 
         identity = artifacts.chunk_a_identity(
             source_frames=context.source_chunk_a_pixels,
@@ -144,7 +199,8 @@ class MiniMaxH3Ref2VExperimentHarness(io.ComfyNode):
             ref_pixels=[b["latent"] for b in context.static_ref_blocks],
             canvas=canvas, geometry=geometry, seed=seeds.chunk_a_noise,
             sampler_name=type(sampler).__name__, sigmas=sigmas,
-            checkpoint=_checkpoint_identity(model))
+            checkpoint=_checkpoint_identity(model),
+            attention=memory_status.get("attention_selected"))
 
         root = artifacts.resolve_root()
         run_id = reuse_run.strip() or artifacts.find_reusable_run(root, identity) \
@@ -153,12 +209,19 @@ class MiniMaxH3Ref2VExperimentHarness(io.ComfyNode):
         store.write_text("prompt.txt", prompt)
 
         # Phase B - Qwen resident once
-        harness.phase_b_qwen(context, clip=clip, prompt=prompt, cond_cache=cond_cache)
+        harness.phase_b_qwen(context, clip=clip, prompt=prompt, cond_cache=cond_cache,
+                             monolithic=monolithic_reference)
 
         # Phase C - DiT resident, Chunk A generated at most once ever
         reused = harness.phase_c_chunk_a(
             context, model=model, sampler=sampler, sigmas=sigmas,
             store=store, identity=identity, video_vae=video_vae)
+        mono_reused = None
+        if monolithic_reference:
+            mono_reused = harness.phase_c_monolithic(
+                context, model=model, sampler=sampler, sigmas=sigmas,
+                store=store, identity=identity, video_vae=video_vae)
+
         store.write_manifest(chunk_a_identity=identity, profile=geometry.describe(),
                              canvas=list(canvas), seeds=seeds.as_dict())
 
@@ -173,13 +236,15 @@ class MiniMaxH3Ref2VExperimentHarness(io.ComfyNode):
             context, experiment_ids=experiment_ids, model=model, sampler=sampler,
             sigmas=sigmas, video_vae=video_vae, store=store,
             continue_after_failure=continue_after_failure,
-            save_latents=save_latents, save_frames=save_frames)
+            save_latents=save_latents, save_frames=save_frames,
+            tail_frames=tail_frames)
 
         document = report.build(
             run_id=run_id, geometry=geometry, seeds=seeds, canvas=canvas,
             experiment_ids=experiment_ids, results=results,
             chunk_a_reused=reused, dependencies=dependencies,
-            notes=notes + dynamic_notes)
+            notes=notes + dynamic_notes, memory_status=memory_status,
+            monolithic_reused=mono_reused, tail_frames=tail_frames)
         store.write_text("report.json", report.to_json(document))
         text = report.to_text(document)
         store.write_text("report.txt", text)

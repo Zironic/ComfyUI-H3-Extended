@@ -35,6 +35,11 @@ import cond_cache  # noqa: E402
 
 VISION_START, VISION_END = 151652, 151653
 
+# The key for a fixed input, pinned so it cannot drift. Verified equal across
+# the implementation before and after the diagnostics work by loading both
+# modules side by side; see test_key_is_pinned for why it matters.
+PINNED_DIGEST = "e8af1cdbd4ff2fd1e29b8a688199e7f058501d581d7b42b2931fc1b160e014a8"
+
 # deliberately outside the cache directory: the sweep must never be able to
 # reach a checkpoint, and a test that stored one inside would not notice
 _TE_FILE = os.path.join(_TMPROOT, "fake_te.safetensors")
@@ -386,6 +391,25 @@ def test_purge(clip, image):
     check(os.path.isdir(CACHE), "the directory itself survives")
 
 
+def test_key_is_pinned(clip, image, video):
+    """The key must never move without someone deciding it should.
+
+    Changing how tokens_digest hashes invalidates every entry on disk at once,
+    and the symptom — everything suddenly missing, then slowly re-storing — looks
+    exactly like the cache being broken rather than re-keyed. A refactor that
+    trips this needs a deliberate answer, not a surprise.
+    """
+    print("the cache key has not drifted")
+    write_te(b"x" * 1024)
+    os.utime(_TE_FILE, (1700000000, 1700000000))  # mtime is part of the fingerprint
+    try:
+        tokens = make_tokens([1, 2, 3], image, video[2:4])
+        check(cond_cache.tokens_digest(clip, tokens) == PINNED_DIGEST,
+              "tokens_digest still produces the pinned key")
+    finally:
+        write_te(b"x" * 1024)
+
+
 def test_hash_cost(clip):
     print("hashing cost stays negligible next to the encode it avoids")
     big = torch.rand(1, 2048, 2048, 3)  # a 'max' ref image, 50 MB fp32
@@ -418,6 +442,7 @@ def main():
     test_refuses_a_folder_it_does_not_own(clip, image)
     test_claims_folders_it_may_have(clip, image)
     test_purge(clip, image)
+    test_key_is_pinned(clip, image, video)
     test_hash_cost(clip)
     print("\nall cond cache tests passed")
 

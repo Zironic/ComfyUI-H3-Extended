@@ -14,12 +14,32 @@ import threading
 import numpy as np
 import torch
 
-from . import cond_cache
+try:
+    from . import cond_cache
+except ImportError:  # the self-tests import this file as a top-level module
+    import cond_cache
 
 LOG = cond_cache.LOG
 _SHORT = 12
 _last_by_label = {}
 _last_lock = threading.Lock()
+
+# Captured at import, before anything can install this wrapper over the name it
+# delegates to. Without this, installing at the `cond_cache.encode` seam — the
+# only seam that also catches callers doing a function-local
+# `from ..cond_cache import encode` — would recurse forever.
+_REAL_ENCODE = cond_cache.encode
+
+
+def install():
+    """Route every caller of the cache through these diagnostics.
+
+    Patching `cond_cache.encode` itself is what makes this reach callers that
+    import the function inside a function body, which module-level rebinding of
+    an already-imported name cannot do.
+    """
+    cond_cache.encode = encode
+    return encode
 
 
 def _digest_bytes(data):
@@ -169,7 +189,7 @@ def _log_bypass_context(clip, mode):
 def encode(clip, tokens, mode="auto", label=None):
     """Log component-level key evidence, then run the unmodified cache."""
     if _log_bypass_context(clip, mode):
-        return cond_cache.encode(clip, tokens, mode=mode, label=label)
+        return _REAL_ENCODE(clip, tokens, mode=mode, label=label)
 
     diagnostic = inspect_key(clip, tokens)
     label_key = _label_key(label)
@@ -217,4 +237,4 @@ def encode(clip, tokens, mode="auto", label=None):
     elif path is not None:
         logging.info("%s diagnostic: label=%s cache_path=%s", LOG, label_key, path)
 
-    return cond_cache.encode(clip, tokens, mode=mode, label=label)
+    return _REAL_ENCODE(clip, tokens, mode=mode, label=label)

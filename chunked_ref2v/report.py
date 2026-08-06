@@ -9,11 +9,12 @@ import json
 
 from .metrics import format_metrics
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def build(*, run_id, geometry, seeds, canvas, experiment_ids, results,
-          chunk_a_reused, dependencies, notes=None):
+          chunk_a_reused, dependencies, notes=None, memory_status=None,
+          monolithic_reused=None, tail_frames=17):
     from .geometry import UnalignedProfileError
 
     try:
@@ -39,13 +40,28 @@ def build(*, run_id, geometry, seeds, canvas, experiment_ids, results,
             "chunk_a_reused": bool(chunk_a_reused),
             "base_qwen_b_reused": True,
             "dynamic_dependencies": dependencies.as_dict() if dependencies else None,
+            "monolithic_reference": None if monolithic_reused is None else {
+                "total_frames": geometry.total_frames,
+                "tail_frames": tail_frames,
+                "tail_range": list(geometry.tail_range(tail_frames)),
+                "reused": bool(monolithic_reused),
+            },
         },
+        # Every arm shares one armed model, so the backend belongs to the run
+        # rather than to any single experiment - but each arm's resources carry
+        # a copy of the selection, because a resource number read without its
+        # backend is the one that gets misquoted later.
+        "runtime": dict(memory_status or {}) or None,
         "selected": list(experiment_ids),
         "notes": list(notes or []),
         "experiments": {},
     }
 
+    selected_attention = (memory_status or {}).get("attention_selected")
     for record in results:
+        resources = dict(record.get("resources") or {})
+        if selected_attention is not None:
+            resources["attention_selected"] = selected_attention
         document["experiments"][record["experiment_id"]] = {
             "status": record.get("status"),
             "note": record.get("note"),
@@ -53,7 +69,7 @@ def build(*, run_id, geometry, seeds, canvas, experiment_ids, results,
             "dependencies": record.get("dependencies") or {},
             "layout": record.get("prepared") or {},
             "metrics": record.get("metrics") or {},
-            "resources": record.get("resources") or {},
+            "resources": resources,
             "artifacts": record.get("artifacts") or {},
         }
     return document
@@ -78,8 +94,12 @@ def to_text(document):
            else profile["overlap_latent_start"] + profile["overlap_latent_t"] - 1),
         "chunk A   %s" % ("reused from cache" if document["common_assets"]["chunk_a_reused"]
                           else "generated this run"),
+        "runtime   %s" % _runtime_line(document.get("runtime")),
         "",
     ]
+    warning = _runtime_warning(document.get("runtime"))
+    if warning:
+        lines.extend([warning, ""])
     for note in document.get("notes") or []:
         lines.append("  %s" % note)
     if document.get("notes"):
@@ -111,7 +131,84 @@ def to_text(document):
         lines.append("")
 
     lines.append(_ranking(document))
+    ground_truth = _monolithic_ranking(document)
+    if ground_truth:
+        lines.extend(["", ground_truth])
     return "\n".join(lines)
+
+
+def _monolithic_ranking(document):
+    """Rank arms by agreement with a single run of the same length.
+
+    Printed separately from the overlap ranking because it answers a different
+    question. Overlap agreement asks whether chunk B followed chunk A; this asks
+    whether chunking reproduced what one run would have produced - which is the
+    question the production node exists to answer.
+    """
+    mono = (document.get("common_assets") or {}).get("monolithic_reference")
+    if not mono:
+        return None
+    rows = []
+    for experiment_id, entry in document["experiments"].items():
+        metrics = entry.get("metrics") or {}
+        value = metrics.get("monolithic_tail_mae")
+        if value is None:
+            continue
+        rows.append((value, experiment_id,
+                     metrics.get("monolithic_tail_motion_mae"),
+                     metrics.get("monolithic_chunk_b_mae"),
+                     metrics.get("monolithic_tail_mae_vs_baseline")))
+    if not rows:
+        return None
+
+    a, b = mono["tail_range"]
+    lines = [
+        "agreement with one %d-frame run (ground truth), over global frames %d-%d:"
+        % (mono["total_frames"], a, b - 1),
+        "  %-34s %10s %11s %10s %9s"
+        % ("experiment", "tail MAE", "tail motion", "chunk B", "vs base"),
+    ]
+    for value, experiment_id, motion, body, ratio in sorted(rows):
+        lines.append("  %-34s %10.6f %11s %10s %9s" % (
+            experiment_id, value,
+            "-" if motion is None else "%.6f" % motion,
+            "-" if body is None else "%.6f" % body,
+            "-" if ratio is None else "%.3f" % ratio))
+    lines.append("")
+    lines.append("  This never reaches zero: the two runs denoise different latent")
+    lines.append("  shapes and so consume different noise. Read it as a ranking - a")
+    lines.append("  carry that works lands its tail closer to the single run than the")
+    lines.append("  no-carry control does.")
+    return "\n".join(lines)
+
+
+def _runtime_line(status):
+    if not status:
+        return "memory optimizer not armed"
+    from .memory import describe
+    return describe(status).replace("memory optimizer: ", "", 1)
+
+
+def _runtime_warning(status):
+    """Say it plainly when the numbers are not the optimized path's numbers.
+
+    All arms still share one backend, so the comparison between them holds. What
+    stops holding is the absolute resource column - and that is exactly the
+    figure someone will later quote into a headroom budget.
+    """
+    if not status:
+        return None
+    from .memory import ATTENTION_EXISTING
+    if status.get("attention_selected") != ATTENTION_EXISTING:
+        return None
+    if status.get("armed_by") == "disabled":
+        return ("NOTE: the memory optimizer was disabled for this run. Arm-to-arm "
+                "comparison is valid; peak-VRAM and runtime describe the graph's "
+                "own attention backend, not optimized Sage.")
+    return ("WARNING: optimized attention was requested but fell back to the "
+            "existing backend (%s). Arm-to-arm comparison is still valid; the "
+            "absolute resource figures below are NOT attributable to optimized "
+            "Sage." % status.get("attention_reason"))
 
 
 def _ranking(document):

@@ -40,15 +40,20 @@ def _hash_value(h, value):
 
 
 def chunk_a_identity(*, source_frames, prompt, ref_pixels, canvas, geometry,
-                     seed, sampler_name, sigmas, checkpoint):
+                     seed, sampler_name, sigmas, checkpoint, attention=None):
     """Best-effort digest of the inputs represented by the current node API.
 
     This remains useful for validating an explicitly selected `reuse_run`, but
     it is not strong enough to authorize automatic reuse across arbitrary model
     changes. See `find_reusable_run`.
+
+    `attention` is part of the key because the attention backend is part of the
+    numerics: Sage quantizes Q/K to INT8, so a Chunk A generated on one backend
+    and reused against a Chunk B sampled on another would put a backend
+    difference into the overlap metrics and call it a carry-strategy result.
     """
     h = hashlib.blake2b(digest_size=16)
-    h.update(b"h3-ref2v-harness-chunk-a-v3")
+    h.update(b"h3-ref2v-harness-chunk-a-v4")
     _hash_tensor(h, source_frames)
     _hash_value(h, prompt)
     for pixels in ref_pixels or []:
@@ -59,6 +64,7 @@ def chunk_a_identity(*, source_frames, prompt, ref_pixels, canvas, geometry,
     _hash_value(h, sampler_name)
     _hash_tensor(h, sigmas)
     _hash_value(h, checkpoint)
+    _hash_value(h, attention)
     return h.hexdigest()
 
 

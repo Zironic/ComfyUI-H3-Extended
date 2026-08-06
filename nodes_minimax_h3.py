@@ -33,10 +33,12 @@ try:
     # bound as names, not as the module: the widget is also called cond_cache
     # and would shadow it inside execute()
     from .cond_cache import MODES as COND_CACHE_MODES, encode as encode_conditioning
+    from . import latent_cache
     from .vram_guard import install_unet_guard
 except ImportError:  # the self-tests import this file as a top-level module
     import run_context
     from cond_cache import MODES as COND_CACHE_MODES, encode as encode_conditioning
+    import latent_cache
     from vram_guard import install_unet_guard
 
 CANVAS_MULTIPLE = 32
@@ -260,7 +262,8 @@ class MiniMaxH3ImageToVideo(io.ComfyNode):
 
         if keyframes:
             for kf in keyframes:
-                kf["latent"] = vae.encode(kf.pop("image"))
+                kf["latent"] = latent_cache.encode(
+                    vae, kf.pop("image"), mode=cond_cache, label="keyframe")
             cond = node_helpers.conditioning_set_values(cond, {
                 "minimax_keyframes": keyframes,
                 "minimax_frame_count": frame_count,
@@ -329,13 +332,14 @@ class MiniMaxH3ReferenceToVideo(io.ComfyNode):
         )
 
     @staticmethod
-    def _encode_ref_audio(audio_vae, audio):
+    def _encode_ref_audio(audio_vae, audio, cond_cache="auto"):
         waveform = audio["waveform"]  # [B, C, L]
         sr = audio["sample_rate"]
         vae_sr = getattr(audio_vae, "audio_sample_rate", 32000)
         if sr != vae_sr:
             waveform = torchaudio.functional.resample(waveform, sr, vae_sr)
-        z = audio_vae.encode(waveform[:1].movedim(1, -1))  # [1, 32, 2, T]
+        z = latent_cache.encode(audio_vae, waveform[:1].movedim(1, -1),
+                                mode=cond_cache, label='ref audio')  # [1, 32, 2, T]
         return z, z.shape[-1]
 
     @classmethod
@@ -360,7 +364,7 @@ class MiniMaxH3ReferenceToVideo(io.ComfyNode):
             tw = max(CANVAS_MULTIPLE, round(w * scale / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
             th = max(CANVAS_MULTIPLE, round(h * scale / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
             resized = _resize(img[:1], tw, th, "disabled")
-            z = vae.encode(resized)
+            z = latent_cache.encode(vae, resized, mode=cond_cache, label='ref image')
             ref_items.append({"type": "image", "data": resized})
             ref_blocks.append({"kind": "image", "latent_h": th // 16, "latent_w": tw // 16, "latent": z})
             recorded.append((name, "%dx%d source -> %dx%d encoded (latent %dx%d)"
@@ -386,10 +390,10 @@ class MiniMaxH3ReferenceToVideo(io.ComfyNode):
             while n % 17 != 5:
                 n -= 1
             frames = frames[:n]
-            z = vae.encode(frames)
+            z = latent_cache.encode(vae, frames, mode=cond_cache, label='ref video')
             audio_latent, ref_audio_t = (None, 0)
             if soundtrack is not None:
-                audio_latent, ref_audio_t = cls._encode_ref_audio(audio_vae, soundtrack)
+                audio_latent, ref_audio_t = cls._encode_ref_audio(audio_vae, soundtrack, cond_cache)
                 # the soundtrack gets its own <Audio j> label, emitted before <Video k>
                 ref_items.append({"type": "audio"})
             # Qwen sees the video at 2 fps with timestamps
@@ -412,7 +416,7 @@ class MiniMaxH3ReferenceToVideo(io.ComfyNode):
         for name, audio in (ref_audios or {}).items():
             if audio is None:
                 continue
-            audio_latent, ref_audio_t = cls._encode_ref_audio(audio_vae, audio)
+            audio_latent, ref_audio_t = cls._encode_ref_audio(audio_vae, audio, cond_cache)
             ref_items.append({"type": "audio"})
             ref_blocks.append({"kind": "audio", "ref_audio_t": ref_audio_t, "audio_latent": audio_latent})
             recorded.append((name, "%s -> latent t=%d"

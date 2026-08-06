@@ -1,8 +1,9 @@
 # MiniMax H3 Ref2V experiment harness
 
-**Status: implemented, not yet run on the GPU.** Every CPU-testable claim below
-is covered by `tests/test_chunked_ref2v.py`; nothing here has been validated
-against real weights.
+**Status: the `minimal` suite has run.** Every CPU-testable claim below is
+covered by `tests/test_chunked_ref2v.py`; the machinery is validated against
+real weights, at 0.2 MP — see [Stage 0 result](#stage-0-result-2026-08-05).
+Nothing has yet run at a production canvas.
 
 Two planning documents sit alongside this code. `PLAN.md` is the arbitrary-length
 production design. The harness plan is the experiment that decides *which* carry
@@ -166,8 +167,61 @@ under-constrain.
 `MiniMax H3 Ref2V Experiment Harness (Zi)`, id
 `MiniMaxH3Ref2VExperimentHarnessZi`, category `model/video/minimax/testing`.
 
-Feed it a model that has already been through `MiniMaxH3SigmaShiftZi` — that node
-carries the sigma shifts, the attention backend and the VRAM guard.
+Feed it a model that has already been through `MiniMaxH3SigmaShiftZi` for the
+sigma shifts and the VRAM guard. **Leave that node's `attention_backend` on
+`comfy`** — attention is armed here instead, through the capability resolver.
+
+## Attention is armed by the harness, once
+
+The harness samples Chunk A plus one chunk per arm, so attention and activation
+memory decide whether a suite finishes at all on a 12 GB card. Rather than
+inheriting the sigma-shift node's name-based selector (`"sage"`/`"pytorch"`), the
+harness calls `h3_memory_optimizer.resolve_attention` itself and installs an
+architecture-matched prepared-QKV Sage backend.
+
+Two properties matter more here than in an ordinary graph.
+
+**Arm once, share everywhere.** Resolution and patch installation happen before
+Phase A, so Chunk A and every Chunk B arm run the *same* backend and the
+peak-VRAM and runtime columns stay comparable across arms. The 50 block forwards
+are patched once, not once per experiment. `patch_target_conditions` clones from
+the armed model and patches a different key (`extra_conds`), so the attention
+patches ride through untouched.
+
+**Say which backend produced the numbers.** A capability fallback is silent by
+design — it preserves the incoming attention rather than failing a long
+unattended run. But a resource figure attributed to the wrong backend is worse
+than no figure, and it is exactly the number someone later quotes into a
+headroom budget. So the resolved decision is recorded in `report["runtime"]`,
+copied into every arm's `resources` next to its peak VRAM, and the text report
+opens with an explicit warning when the run did *not* get optimized Sage:
+
+```
+WARNING: optimized attention was requested but fell back to the existing
+backend (...). Arm-to-arm comparison is still valid; the absolute resource
+figures below are NOT attributable to optimized Sage.
+```
+
+A deliberate A/B (`attention=existing`, `activation=off`) reads as a `NOTE:`
+rather than a warning — that distinction is the difference between a choice and
+a surprise.
+
+Widgets: `attention` (default `auto`), `attention_fallback` (`allow` keeps the
+run alive, `error` refuses to start), `activation` (default
+`mlp_chunked_bf16`), plus the optional `cuda_async_soft_gc` /
+`cuda_async_release_threshold_gib` pool policy, which is worth considering for
+an unattended multi-hour suite under cudaMallocAsync.
+
+A MODEL that already carries `MiniMaxH3MemoryOptimizerZi`'s status is
+**inherited, not re-armed**: re-applying the same backend is a no-op and a
+different one raises inside the installer, and neither is worth risking once a
+run has started. The report records `armed_by` so an inherited configuration is
+never mistaken for one the harness chose.
+
+The attention selection is part of the Chunk A cache key. Sage quantizes Q/K to
+INT8, so a Chunk A generated on one backend and reused against a Chunk B sampled
+on another would put a backend difference into the overlap metrics and label it
+a carry-strategy result.
 
 Outputs are `comparison_video`, `selected_preview`, `report` and
 `artifact_path`; there is no output socket per experiment, because the
@@ -201,6 +255,93 @@ original layout is not mutated, and that the patchified condition and reference
 latents fill exactly the non-target image rows. That last one is the invariant
 that does not raise when it is wrong — it silently pairs each condition with the
 wrong rows.
+
+## Stage 0 result (2026-08-05)
+
+`minimal` suite, C=73/O=22/S=51, **608x352 (0.2 MP)**, seed 1, `res_multistep` /
+`simple` / 20 steps, `efficient_sage_sm89` + `mlp_chunked_native`. Ten minutes
+for five chunks. Artifacts in
+`Output/h3_ref2v_harness/20260805_195850_ee6c74a8/`.
+
+All ten implemented arms, as ratios against the control (lower is better):
+
+```
+experiment                       pixel   latent   motion-delta   1st frame
+aligned_overlap_direct           0.396    0.276      0.442         0.229
+aligned_overlap_prompted         0.397    0.279      0.442         0.228
+frame_direct_prompted            0.386    0.424      0.596         0.270
+frame_direct_corrected           0.387    0.428      0.601         0.268
+frame_reencode_corrected         0.439    0.580      0.611         0.318
+frame_direct_stock_position      0.830    0.863      0.986         0.838
+baseline_none                    1.000    1.000      1.000         1.000
+aligned_overlap_stock_position   1.004    1.073      1.106         0.993
+generated_overlap_video2         1.071    1.040      0.743         1.083
+composite_source                 1.112    1.244      1.022         1.127
+```
+
+**The full overlap is the production mechanism.** Pixel MAE ties with the single
+frame, but the overlap wins where it matters: latent agreement 0.276 vs 0.428
+and motion-delta 0.442 vs 0.601. That is PLAN.md 16's prediction confirmed - "the
+carried frame fixes position, not velocity" - and motion-delta is exactly the
+metric that separates them. One frame cannot encode a trajectory; seven
+positions can.
+
+**Hybrid keyframe + reference conditioning works.** PLAN.md listed "Ref2VA
+checkpoint obeys a keyframe latent Qwen never saw" as the Stage-0 unknown. It
+obeys, without being told.
+
+**The MM-RoPE placement correction is the whole mechanism, not an improvement.**
+`aligned_overlap_stock_position` scores 1.004 - indistinguishable from carrying
+nothing at all, and slightly worse on latent and motion. Placed on the wrong
+timeline, seven positions of condition are seven positions of noise. PLAN.md 1.1
+called this blocking from a source reading alone; that call was right, and
+without the fix the whole technique reads as "the checkpoint ignores keyframes."
+
+**Prompt text adds nothing.** `frame_direct_prompted` vs `frame_direct_corrected`
+is 0.386 vs 0.387; the overlap pair is 0.397 vs 0.396. Both differences are far
+inside run-to-run noise. The `keyframe_completion` language is unnecessary - the
+model responds to the condition rows whether or not Qwen was told they exist.
+
+**Both Qwen-visible strategies fail.** `generated_overlap_video2` (1.071) and
+`composite_source` (1.112) are *worse than the control*. Composite is worst on
+latent agreement at 1.244, consistent with its known property that the original
+source geometry is unavailable inside the overlap. See the caveat below before
+treating these two as settled.
+
+**The VAE round trip costs real fidelity.** Direct beats decode-and-re-encode on
+every metric; first-position latent MAE 0.0448 vs 0.1086.
+
+Motion-energy ratios span 0.978-1.038, so no arm bought its score by freezing.
+
+### Caveat
+
+0.2 MP is far outside the model's trained range. This validates the machinery
+and the *relative ordering* of the arms; it says nothing about absolute quality,
+and the run should be repeated at a production canvas before the numbers are
+quoted as anything but a ranking.
+
+**The two Qwen-visible arms carry an extra confound and should not be treated as
+settled.** `generated_overlap_video2` and `composite_source` are the only
+strategies whose mechanism depends on Qwen *reading* the carried footage, and
+Qwen sees a reference video at 2 fps on a 608x352 canvas here. Their failure may
+be "the model cannot use a visible overlap" or merely "there was nothing legible
+to see at this size" - this run cannot distinguish those. Every other arm feeds
+the DiT through condition rows, which are canvas-independent in mechanism, so
+their ordering is on much firmer ground. Re-test these two at a production
+canvas before concluding anything about them.
+
+### Memory, measured
+
+torch peak reserved **1536 MB**, peak allocated 1245-1266 MB, against a
+driver-level total that sat at ~10.7-11.0 GB. The difference is AIMDO's
+reclaimable weight-page cache filling otherwise-idle VRAM, plus a ~2.3 GB
+desktop floor. The predicted transient at 116 KB/token was 1.27 GB against
+1.25 GB measured, so the cost model holds at this canvas.
+
+This run also exposed a real bug in `vram_guard.py`: it compared against raw
+`mem_get_info`, which counts AIMDO's reclaimable pages as used, and cancelled a
+healthy run at "free physical 341 MB" while torch held 320 MB. Core corrects for
+this at `comfy/model_patcher.py:421-425`; the guard now does too.
 
 ## First GPU run
 

@@ -313,6 +313,323 @@ def test_sample_saved_before_decode():
         harness.decode_video = original_decode
 
 
+class FakePatcher:
+    """Enough ModelPatcher for the memory-optimizer wiring."""
+
+    def __init__(self, transformer_options=None):
+        self.model_options = {
+            "transformer_options": dict(transformer_options or {})
+        }
+        self.clones = 0
+
+    def clone(self):
+        copy = FakePatcher(self.model_options["transformer_options"])
+        copy.clones = self.clones + 1
+        return copy
+
+
+def fake_environment(capability=(8, 9)):
+    from h3_memory_optimizer.attention import RuntimeEnvironment
+    return RuntimeEnvironment(
+        cuda_available=capability is not None,
+        device_index=0 if capability is not None else None,
+        capability=capability,
+        device_name="fake GPU" if capability is not None else "no CUDA device")
+
+
+def make_resolver(selected, backend, reason="synthetic", capability=(8, 9)):
+    from h3_memory_optimizer.attention import AttentionDecision
+
+    def resolver(requested, fallback, environment=None):
+        return AttentionDecision(
+            requested=requested, selected=selected, backend=backend,
+            adapter=selected, reason=reason,
+            environment=environment or fake_environment(capability))
+    return resolver
+
+
+def make_applier(calls):
+    """Stands in for h3_memory_optimizer.patch.apply, status recording included."""
+    from h3_memory_optimizer.patch import STATUS_KEY
+
+    class Result:
+        def __init__(self, decision, config):
+            self.attention_requested = config.attention
+            self.attention_selected = decision.selected
+            self.attention_reason = decision.reason
+            self.attention_blocks = 50 if decision.backend is not None else 0
+            self.activation_mode = config.activation
+            self.activation_blocks = 50
+            self.architecture = decision.environment.architecture
+            self.device_name = decision.environment.device_name
+
+    def applier(model, config=None, decision=None, pool_policy=None):
+        calls.append((model, config, decision, pool_policy))
+        result = Result(decision, config)
+        options = model.model_options["transformer_options"] = dict(
+            model.model_options.get("transformer_options", {}))
+        options[STATUS_KEY] = {
+            "attention_requested": result.attention_requested,
+            "attention_selected": result.attention_selected,
+            "attention_reason": result.attention_reason,
+            "attention_blocks": result.attention_blocks,
+            "activation_mode": result.activation_mode,
+            "activation_blocks": result.activation_blocks,
+            "architecture": result.architecture,
+            "device_name": result.device_name,
+        }
+        return result
+    return applier
+
+
+def null_pool(enabled, threshold, device_index=None):
+    return None
+
+
+def test_memory_arming():
+    print("memory optimizer arming")
+    from chunked_ref2v import memory
+
+    calls = []
+    model = FakePatcher()
+    armed, status = memory.arm(
+        model, attention="auto", activation="mlp_chunked_bf16",
+        resolver=make_resolver("efficient_sage_sm89", object()),
+        applier=make_applier(calls), pool_configurer=null_pool)
+
+    check(armed is not model and armed.clones == 1,
+          "arming clones rather than mutating the incoming MODEL")
+    check(len(calls) == 1, "the optimizer is applied exactly once for the run")
+    check(status["attention_selected"] == "efficient_sage_sm89",
+          "the resolved adapter is recorded")
+    check(status["armed_by"] == "harness", "the report can tell who armed it")
+    check(memory.is_optimized(status), "an SM-matched backend counts as optimized")
+    check("efficient_sage_sm89" in memory.describe(status),
+          "the one-line description names the backend")
+
+    raises(ValueError,
+           lambda: memory.arm(FakePatcher(), attention="not_a_mode"),
+           "an unknown attention mode is rejected before anything is patched")
+
+
+def test_memory_inherits_existing_patch():
+    print("memory optimizer inheritance")
+    from chunked_ref2v import memory
+    from h3_memory_optimizer.patch import STATUS_KEY
+
+    calls = []
+    inherited = {
+        "attention_selected": "efficient_sage_sm89",
+        "attention_requested": "auto",
+        "activation_mode": "mlp_chunked_bf16",
+    }
+    model = FakePatcher({STATUS_KEY: inherited})
+    armed, status = memory.arm(
+        model, resolver=make_resolver("efficient_sage_sm89", object()),
+        applier=make_applier(calls), pool_configurer=null_pool)
+
+    # Re-applying the same backend is a no-op and a different one raises inside
+    # the installer; neither is worth risking once a run has started.
+    check(armed is model, "an already-optimized MODEL is used as-is")
+    check(not calls, "the optimizer is not applied a second time")
+    check(status["armed_by"] == "incoming model",
+          "the report distinguishes inherited from harness-armed")
+    check(status["attention_selected"] == "efficient_sage_sm89",
+          "the inherited selection is what gets reported")
+
+
+def test_memory_disabled_and_fallback():
+    print("memory optimizer disabled and fallback")
+    from chunked_ref2v import memory
+
+    calls = []
+    model = FakePatcher()
+    armed, status = memory.arm(
+        model, attention="existing", activation="off",
+        applier=make_applier(calls), pool_configurer=null_pool)
+    check(armed is model and not calls,
+          "fully disabled leaves the MODEL completely untouched")
+    check(status["armed_by"] == "disabled" and not memory.is_optimized(status),
+          "a deliberate A/B is recorded as disabled, not as a failure")
+
+    calls = []
+    armed, status = memory.arm(
+        FakePatcher(), attention="auto",
+        resolver=make_resolver(memory.ATTENTION_EXISTING, None,
+                               reason="unsupported GPU", capability=(7, 5)),
+        applier=make_applier(calls), pool_configurer=null_pool)
+    check(len(calls) == 1,
+          "a capability fallback still installs activation chunking")
+    check(not memory.is_optimized(status),
+          "a fallback is not reported as optimized")
+    check("unsupported GPU" in memory.describe(status),
+          "the fallback reason survives into the description")
+
+
+def test_report_attributes_the_backend():
+    print("report backend attribution")
+    from chunked_ref2v import memory
+
+    class Seeds:
+        def as_dict(self):
+            return {"node_seed": 1}
+
+    def document_for(status):
+        return report.build(
+            run_id="r", geometry=geo.DEFAULT_GEOMETRY, seeds=Seeds(),
+            canvas=(128, 128), experiment_ids=["baseline_none"],
+            results=[{"experiment_id": "baseline_none", "status": "completed",
+                      "metrics": {"pixel_overlap_mae": 0.1},
+                      "resources": {"peak_reserved_mb": 9000}}],
+            chunk_a_reused=False, dependencies=strategies.StrategyDependencies(),
+            memory_status=status)
+
+    optimized = document_for({
+        "attention_selected": "efficient_sage_sm89",
+        "attention_requested": "auto", "activation_mode": "mlp_chunked_bf16",
+        "armed_by": "harness", "architecture": "sm89"})
+    entry = optimized["experiments"]["baseline_none"]
+    check(optimized["runtime"]["attention_selected"] == "efficient_sage_sm89",
+          "the run records which backend produced its numbers")
+    check(entry["resources"]["attention_selected"] == "efficient_sage_sm89",
+          "each arm's resources carry the backend alongside peak VRAM")
+    check("WARNING" not in report.to_text(optimized),
+          "an optimized run needs no caveat")
+
+    fell_back = document_for({
+        "attention_selected": memory.ATTENTION_EXISTING,
+        "attention_requested": "auto", "attention_reason": "unsupported GPU",
+        "activation_mode": "mlp_chunked_bf16", "armed_by": "harness"})
+    text = report.to_text(fell_back)
+    check("WARNING" in text and "NOT attributable" in text,
+          "a silent fallback is stated loudly next to the resource figures")
+    check("still valid" in text,
+          "the caveat says what remains valid, not just what broke")
+
+    disabled = document_for({
+        "attention_selected": memory.ATTENTION_EXISTING,
+        "armed_by": "disabled", "activation_mode": "off"})
+    check("NOTE:" in report.to_text(disabled),
+          "a deliberate A/B reads as a note rather than a warning")
+
+
+def test_identity_covers_the_backend():
+    print("chunk A identity covers the backend")
+    kwargs = dict(
+        source_frames=torch.rand(73, 8, 8, 3), prompt="p", ref_pixels=[],
+        canvas=(128, 128), geometry=geo.DEFAULT_GEOMETRY, seed=7,
+        sampler_name="euler", sigmas=torch.linspace(1, 0, 11), checkpoint="ckpt")
+    optimized = artifacts.chunk_a_identity(attention="efficient_sage_sm89", **kwargs)
+    existing = artifacts.chunk_a_identity(attention="existing", **kwargs)
+    # Sage quantizes Q/K to INT8, so Chunk A carries the backend's numerics into
+    # every overlap metric that compares it against Chunk B.
+    check(optimized != existing,
+          "a Chunk A from one attention backend is not reused against another")
+    check(artifacts.chunk_a_identity(attention="efficient_sage_sm89", **kwargs)
+          == optimized, "the backend-aware identity is still stable")
+
+
+def test_monolithic_geometry():
+    print("monolithic reference geometry")
+    g = geo.HarnessGeometry(73, 22).validate()
+    check(g.total_frames == 124, "two chunks at 73/22/51 span exactly 124 frames")
+    check(g.supports_monolithic, "124 is on the 17k+5 grid, so one run can match it")
+    check(g.monolithic_latent_t == 37, "124 frames is latent T=37")
+    check(geo.decoded_frame_count(37) == 124, "T=37 decodes back to 124 - exact, not snapped")
+    check(g.tail_range(17) == (107, 124), "the tail is global frames 107-123")
+    check(g.tail_in_chunk_b(17) == (56, 73), "the same tail is chunk B local 56-72")
+
+    # total = S + C and C % 17 == 5, so a legal total needs S % 17 == 0.
+    check(not geo.HarnessGeometry(73, 17).supports_monolithic,
+          "O=17 spans 129 frames, off-grid, so it cannot be compared like for like")
+    check(geo.HarnessGeometry(73, 39).supports_monolithic,
+          "O=39 spans 107 frames, which is on-grid")
+    check(all(geo.HarnessGeometry(73, o).supports_monolithic
+              for o in (5, 22, 39, 56)),
+          "the S %% 17 == 0 family is exactly the monolithic-comparable one")
+
+
+def test_monolithic_tail_metric():
+    print("monolithic tail metric")
+    g = geo.HarnessGeometry(73, 22).validate()
+    mono = torch.rand(124, 8, 8, 3)
+    # A chunk B whose tail is copied from the monolithic run should score ~0.
+    chunk_b = torch.rand(73, 8, 8, 3)
+    chunk_b[56:73] = mono[107:124]
+    out = metrics.monolithic_tail_metrics(mono, chunk_b, g, 17)
+    check(abs(out["monolithic_tail_mae"]) < 1e-6,
+          "a tail identical to the single run scores ~0")
+    check(out["monolithic_tail_frames"] == [107, 124],
+          "the metric reports which frames it compared")
+    check(len(out["monolithic_tail_mae_per_frame"]) == 17,
+          "per-frame values cover the whole tail")
+    check(out["monolithic_chunk_b_mae"] > out["monolithic_tail_mae"],
+          "the body still disagrees, so the tail is measured separately from it")
+
+    unrelated = metrics.monolithic_tail_metrics(mono, torch.rand(73, 8, 8, 3), g, 17)
+    check(unrelated["monolithic_tail_mae"] > out["monolithic_tail_mae"],
+          "an unrelated tail scores worse than a matching one")
+
+    short = metrics.monolithic_tail_metrics(mono[:50], chunk_b, g, 17)
+    check(short.get("monolithic_tail_note"),
+          "too few decoded frames reports why rather than a wrong number")
+
+    collected = metrics.collect(
+        geometry=g, chunk_a_latent=None, chunk_a_pixels=None,
+        chunk_b_latent=None, chunk_b_pixels=chunk_b, monolithic_pixels=mono)
+    check("monolithic_tail_mae" in collected,
+          "collect() surfaces the ground-truth metric when a reference exists")
+    check("monolithic_tail_mae" not in metrics.collect(
+        geometry=g, chunk_a_latent=None, chunk_a_pixels=None,
+        chunk_b_latent=None, chunk_b_pixels=chunk_b),
+        "and omits it entirely when there is none")
+
+
+def test_monolithic_report_section():
+    print("monolithic report section")
+
+    class Seeds:
+        def as_dict(self):
+            return {"node_seed": 1}
+
+    def doc(mono_reused):
+        return report.build(
+            run_id="r", geometry=geo.HarnessGeometry(73, 22).validate(), seeds=Seeds(),
+            canvas=(608, 352), experiment_ids=["baseline_none", "aligned_overlap_direct"],
+            results=[
+                {"experiment_id": "baseline_none", "status": "completed",
+                 "metrics": {"pixel_overlap_mae": 0.03, "monolithic_tail_mae": 0.20}},
+                {"experiment_id": "aligned_overlap_direct", "status": "completed",
+                 "metrics": {"pixel_overlap_mae": 0.01, "monolithic_tail_mae": 0.12,
+                             "monolithic_tail_mae_vs_baseline": 0.6}},
+            ],
+            chunk_a_reused=False, dependencies=strategies.StrategyDependencies(),
+            monolithic_reused=mono_reused)
+
+    d = doc(False)
+    ref = d["common_assets"]["monolithic_reference"]
+    check(ref["total_frames"] == 124 and ref["tail_range"] == [107, 124],
+          "the report records the span and tail it compared")
+    text = report.to_text(d)
+    check("ground truth" in text, "the ground-truth ranking is printed")
+    check(text.index("aligned_overlap_direct") < text.index("baseline_none",
+                                                            text.index("ground truth")),
+          "the better arm ranks first against the single run")
+    check("never reaches zero" in text,
+          "the report states why a perfect score is impossible")
+
+    without = report.build(
+        run_id="r", geometry=geo.DEFAULT_GEOMETRY, seeds=Seeds(), canvas=(608, 352),
+        experiment_ids=["baseline_none"],
+        results=[{"experiment_id": "baseline_none", "status": "completed",
+                  "metrics": {"pixel_overlap_mae": 0.03}}],
+        chunk_a_reused=False, dependencies=strategies.StrategyDependencies())
+    check(without["common_assets"]["monolithic_reference"] is None,
+          "no reference means the section is absent, not empty")
+    check("ground truth" not in report.to_text(without),
+          "and the text report does not mention it")
+
+
 def test_metrics_and_report():
     print("metrics and report")
     a = torch.rand(73, 8, 8, 3)
@@ -346,6 +663,14 @@ def main():
         test_artifact_reuse_policy,
         test_interruption_propagates,
         test_sample_saved_before_decode,
+        test_memory_arming,
+        test_memory_inherits_existing_patch,
+        test_memory_disabled_and_fallback,
+        test_report_attributes_the_backend,
+        test_identity_covers_the_backend,
+        test_monolithic_geometry,
+        test_monolithic_tail_metric,
+        test_monolithic_report_section,
         test_metrics_and_report,
     )
     for test in tests:

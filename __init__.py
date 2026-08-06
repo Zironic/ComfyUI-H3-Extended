@@ -5,17 +5,21 @@ from dataclasses import is_dataclass, replace
 from comfy_api.latest import ComfyExtension
 
 from . import nodes_minimax_h3
+from .chunked_ref2v.longform.nodes import MiniMaxH3LongFormExtension
 from .chunked_ref2v.nodes import MiniMaxH3HarnessExtension
-from .cond_cache_diagnostics import encode as encode_conditioning_diagnostic
+from . import cond_cache_diagnostics
 from .h3_activation_memory.nodes import MiniMaxH3ActivationMemoryExtension
 from .h3_attention.nodes import MiniMaxH3AttentionExtension
 from .h3_masked_cache.nodes import MiniMaxH3MaskedCacheExtension
 from .h3_memory_optimizer.nodes import MiniMaxH3MemoryOptimizerExtension
 from .h3_probe.nodes import MiniMaxH3ProbeExtension
 
-# The conditioning node module binds cond_cache.encode at import time. Replace
-# that module-level seam with a transparent diagnostic wrapper; the wrapper
-# delegates to the original cache without changing key or storage behaviour.
+# Install the diagnostic wrapper at `cond_cache.encode` itself. Rebinding only
+# `nodes_minimax_h3.encode_conditioning` covered the (Zi) nodes but silently
+# missed the harness, which resolves the function inside a function body — so
+# the diagnostics never once ran on the path that most needed them.
+encode_conditioning_diagnostic = cond_cache_diagnostics.install()
+# ...and the conditioning nodes bound the name at import, before the patch.
 nodes_minimax_h3.encode_conditioning = encode_conditioning_diagnostic
 MiniMaxH3Extension = nodes_minimax_h3.MiniMaxH3Extension
 
@@ -31,6 +35,7 @@ NODE_CATEGORIES = {
     "MiniMaxH3MemoryOptimizerZi": "H3-Extender/Model Patches",
     "MiniMaxH3AttentionProbeZi": "H3-Extender/Diagnostics",
     "MiniMaxH3Ref2VExperimentHarnessZi": "H3-Extender/Experiments",
+    "MiniMaxH3LongFormRef2VZi": "H3-Extender/Experiments",
 }
 
 
@@ -72,6 +77,7 @@ class H3ExtendedExtension(ComfyExtension):
             MiniMaxH3Extension(),
             MiniMaxH3ProbeExtension(),
             MiniMaxH3HarnessExtension(),
+            MiniMaxH3LongFormExtension(),
             MiniMaxH3MaskedCacheExtension(),
             MiniMaxH3AttentionExtension(),
             MiniMaxH3ActivationMemoryExtension(),

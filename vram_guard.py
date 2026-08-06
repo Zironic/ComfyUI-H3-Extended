@@ -17,6 +17,20 @@ which adds torch's reserved-but-unused bytes back in. The question here is what
 the driver can still hand out, and under cudaMallocAsync a full pool is exactly
 the condition worth trimming - so a breach first tries to release cached blocks
 and only cancels if the memory does not come back.
+
+**AIMDO changes what "can still hand out" means.** With dynamic VRAM loading the
+driver reports paged-in model weights as used, but AIMDO evicts those pages on
+demand to satisfy the next allocation - so a raw `mem_get_info` reading
+undercounts real availability by however much AIMDO has staged, which on a
+12 GB card running a 20 GB model is most of the card. Core makes exactly this
+correction when it decides whether a model fits
+(`comfy/model_patcher.py:421-425`: `get_free_memory(device) + vbars_analyze(...)`),
+and the guard has to make it too. Without it the guard fires on a condition
+core considers perfectly healthy - which is what cancelled the first harness
+run at "free physical 341 MB" while the DiT was streaming normally.
+
+Both numbers stay in the log: the raw driver reading and the reclaimable total,
+so a real exhaustion is still distinguishable from a full page cache.
 """
 
 import contextlib
@@ -44,14 +58,41 @@ def _free_physical(device):
     return free, total
 
 
-def _memory_report(device, free, total):
+def _reclaimable(device):
+    """Bytes AIMDO can hand back by evicting paged-in model weights.
+
+    Best-effort and always safe to under-report: a zero here just makes the
+    guard as conservative as it was before AIMDO existed.
+    """
+    try:
+        import comfy.memory_management
+        if not comfy.memory_management.aimdo_enabled:
+            return 0
+        import comfy_aimdo.model_vbar
+        index = device.index if _is_cuda(device) else None
+        return int(comfy_aimdo.model_vbar.vbars_analyze(index) or 0)
+    except Exception:
+        return 0
+
+
+def _available(device):
+    """What the next allocation can actually draw on: free + reclaimable."""
+    free, total = _free_physical(device)
+    return free + _reclaimable(device), free, total
+
+
+def _memory_report(device, free, total, reclaimable=None):
     reserved = torch.cuda.memory_reserved(device)
     allocated = torch.cuda.memory_allocated(device)
-    return (
+    text = (
         "free physical %.0f MB / %.0f MB total; "
         "torch reserved %.0f MB, allocated %.0f MB"
         % (free / MB, total / MB, reserved / MB, allocated / MB)
     )
+    if reclaimable:
+        text += ("; AIMDO reclaimable %.0f MB -> %.0f MB available"
+                 % (reclaimable / MB, (free + reclaimable) / MB))
+    return text
 
 
 def check_vram(threshold_mb, where, device=None, detail_lines=None):
@@ -73,29 +114,29 @@ def check_vram(threshold_mb, where, device=None, detail_lines=None):
         return None
 
     threshold = threshold_mb * MB
-    free, total = _free_physical(device)
-    if free >= threshold:
-        return free
+    available, free, total = _available(device)
+    if available >= threshold:
+        return available
 
     logging.warning(
         "[H3 Extended] VRAM guard tripped at %s: %s (threshold %d MB) - "
         "releasing cached blocks and re-checking",
-        where, _memory_report(device, free, total), threshold_mb,
+        where, _memory_report(device, free, total, available - free), threshold_mb,
     )
 
     comfy.model_management.soft_empty_cache(force=True)
-    free, total = _free_physical(device)
-    if free >= threshold:
+    available, free, total = _available(device)
+    if available >= threshold:
         logging.warning(
             "[H3 Extended] VRAM guard recovered at %s: %s - continuing",
-            where, _memory_report(device, free, total),
+            where, _memory_report(device, free, total, available - free),
         )
-        return free
+        return available
 
     lines = [
         "[H3 Extended] VRAM guard cancelling run at %s" % where,
         "  memory: %s (threshold %d MB, still under it after releasing cached blocks)"
-        % (_memory_report(device, free, total), threshold_mb),
+        % (_memory_report(device, free, total, available - free), threshold_mb),
     ]
     if detail_lines is not None:
         try:

@@ -4,7 +4,8 @@ import os
 import sys
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.dirname(_HERE))
+sys.path.insert(0, os.path.dirname(_HERE))                                  # the package
+sys.path.insert(0, os.path.abspath(os.path.join(_HERE, "..", "..", "..")))  # ComfyUI root
 
 from h3_memory_optimizer.config import MemoryOptimizerConfig  # noqa: E402
 from h3_memory_optimizer.cuda_pool import (  # noqa: E402

@@ -153,6 +153,41 @@ class HarnessGeometry:
         return find_exact_overlap_slice(
             self.target_latent_t, self.stride_frames, self.overlap_frames)
 
+    @property
+    def total_frames(self):
+        """Frames the two chunks cover end to end - the monolithic equivalent."""
+        return self.stride_frames + self.chunk_frames
+
+    @property
+    def supports_monolithic(self):
+        """True when the two-chunk span is itself a legal generation length.
+
+        `total = S + C` and `C % 17 == 5`, so `total % 17 == 5` exactly when
+        `S % 17 == 0`. Only those profiles can be compared against a single run
+        of the same length without snapping one side to a different duration and
+        making the comparison inexact.
+        """
+        return self.total_frames % 17 == 5
+
+    @property
+    def monolithic_latent_t(self):
+        return video_latent_t(self.total_frames)
+
+    def tail_range(self, tail_frames=17):
+        """Global frame range of the tail both renderings should agree on.
+
+        The tail is the far end of the second chunk - the frames furthest from
+        the carried state, and therefore where a carry that failed to hold the
+        trajectory shows up worst.
+        """
+        tail = min(tail_frames, self.chunk_frames)
+        return self.total_frames - tail, self.total_frames
+
+    def tail_in_chunk_b(self, tail_frames=17):
+        """Same tail, as local frame indices inside chunk B."""
+        tail = min(tail_frames, self.chunk_frames)
+        return self.chunk_frames - tail, self.chunk_frames
+
     def validate(self):
         """Check the generation grid and the plan's stated latent assertions."""
         if self.chunk_frames % 17 != 5:
