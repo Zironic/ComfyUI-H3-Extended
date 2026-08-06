@@ -12,7 +12,11 @@ from chunked_ref2v.longform.chunk_stream import (
     plan_chunks,
 )
 from chunked_ref2v.longform.manifest import RunManifest, identity_hash
-from chunked_ref2v.longform.runner import _pack_conditioning, _unpack_conditioning
+from chunked_ref2v.longform.runner import (
+    _pack_conditioning,
+    _unpack_conditioning,
+    decode_chunk,
+)
 from chunked_ref2v.longform.writer import _partial_path
 
 
@@ -72,6 +76,23 @@ class ConditioningPersistenceTests(unittest.TestCase):
         self.assertIsNone(rebuilt[0][1]["mask"])
         self.assertEqual(rebuilt[0][1]["strength"], 0.5)
         self.assertEqual(rebuilt[0][1]["labels"], ["a", "b"])
+
+
+class DecodeTests(unittest.TestCase):
+    def test_decode_chunk_disables_autograd(self):
+        class RecordingVAE:
+            grad_enabled = None
+
+            def decode(self, latent):
+                self.grad_enabled = torch.is_grad_enabled()
+                return latent
+
+        vae = RecordingVAE()
+        latent = torch.zeros(1, 2, 3, 4)
+        with torch.enable_grad():
+            output = decode_chunk(vae, latent)
+        self.assertFalse(vae.grad_enabled)
+        self.assertIs(output, latent)
 
 
 class WriterTests(unittest.TestCase):
