@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from dataclasses import is_dataclass, replace
 
 from comfy_api.latest import ComfyExtension, io
@@ -86,14 +85,10 @@ class MiniMaxH3LongFormRef2VPreview(MiniMaxH3LongFormRef2V):
                 current_preview_frames=17, completed_chunks_preview=True,
                 live_preview_width=512, preview_vae=None, ref_images=None,
                 unique_id=None) -> io.NodeOutput:
-        # Match the base node's run-directory resolution so preview files and
-        # the production run share one identity in logs.  The base execute still
-        # owns creation and validation of the actual output directory.
-        root_hint = run_directory.strip() or "pending automatic run directory"
         publisher = LongFormPreviewPublisher(
             node_id=unique_id,
             video_vae=preview_vae or video_vae,
-            root=root_hint,
+            root=run_directory.strip() or "pending automatic run directory",
             fps=24,
             ffmpeg_location=ffmpeg_location.strip() or None,
             options=PreviewOptions(
@@ -105,6 +100,7 @@ class MiniMaxH3LongFormRef2VPreview(MiniMaxH3LongFormRef2V):
             ),
         )
         token = activate(publisher)
+        publisher._announce("reset")
         logging.info(
             "%s enabled for node %s: current=%s every=%d frames=%d; "
             "completed=%s width=%d",
