@@ -99,6 +99,18 @@ function buildPreviewWidget(node) {
     return state;
 }
 
+function resetState(state) {
+    state.currentTitle.textContent = "Current chunk — waiting";
+    state.currentImage.removeAttribute("src");
+    state.completedTitle.textContent = "Completed output — waiting";
+    state.completedVideo.pause();
+    state.completedVideo.removeAttribute("src");
+    state.completedVideo.load();
+    state.segments.length = 0;
+    state.segmentKeys.clear();
+    state.playingIndex = -1;
+}
+
 function playSegment(state, index, autoplay) {
     if (index < 0 || index >= state.segments.length) return;
     state.playingIndex = index;
@@ -138,7 +150,12 @@ function onCompleted(state, detail) {
 api.addEventListener(EVENT_NAME, (event) => {
     const detail = event.detail || {};
     const state = states.get(String(detail.node_id));
-    if (!state || !detail.asset) return;
+    if (!state) return;
+    if (detail.kind === "reset") {
+        resetState(state);
+        return;
+    }
+    if (!detail.asset) return;
     if (detail.kind === "current_chunk") onCurrent(state, detail);
     if (detail.kind === "completed_chunk") onCompleted(state, detail);
 });
