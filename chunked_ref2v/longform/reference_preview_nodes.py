@@ -10,7 +10,7 @@ import torch
 from comfy_api.latest import ComfyExtension, io
 
 from ..geometry import HarnessGeometry
-from . import audio_runtime, runner
+from . import chunk_aligned_audio_refs, runner
 from .chunk_stream import chunk_count_for
 from .nodes import (
     _describe_ffmpeg,
@@ -57,6 +57,17 @@ class MiniMaxH3LongFormReferenceVideoPreview(
         schema = super().define_schema()
         inputs = list(schema.inputs)
         preview_inputs = [
+            io.Boolean.Input(
+                "chunk_align_audio_references",
+                default=False,
+                tooltip=(
+                    "When enabled, each model invocation receives only the "
+                    "chronological slice of every audio reference matching that "
+                    "video chunk, including the same overlap. The audio never "
+                    "wraps or restarts at sample zero. Leave disabled to reuse "
+                    "the complete audio reference in every chunk."
+                ),
+            ),
             io.Boolean.Input(
                 "current_chunk_preview",
                 default=True,
@@ -154,6 +165,7 @@ class MiniMaxH3LongFormReferenceVideoPreview(
         ffmpeg_location="",
         output_video=True,
         save_frames=False,
+        chunk_align_audio_references=False,
         current_chunk_preview=True,
         preview_every_steps=2,
         current_preview_frames=17,
@@ -205,7 +217,7 @@ class MiniMaxH3LongFormReferenceVideoPreview(
         publisher._announce("reset")
         logging.info(
             "%s enabled for node %s: current=%s every=%d frames=%d; "
-            "completed=%s width=%d exact_vae=%s",
+            "completed=%s width=%d exact_vae=%s audio_refs=%s",
             LOG,
             unique_id,
             current_chunk_preview,
@@ -214,9 +226,11 @@ class MiniMaxH3LongFormReferenceVideoPreview(
             completed_chunks_preview,
             live_preview_width,
             preview_vae is not None,
+            "chunk-aligned" if chunk_align_audio_references else "full-track",
         )
         try:
-            summary = audio_runtime.run(
+            summary = chunk_aligned_audio_refs.run(
+                chunk_align_audio_references=chunk_align_audio_references,
                 chunk_frames=chunk_frames,
                 overlap_frames=overlap_frames,
                 chunk_count=chunk_count,
@@ -246,6 +260,11 @@ class MiniMaxH3LongFormReferenceVideoPreview(
                     "activation": activation,
                     "audio_carry_frames": overlap_frames,
                     "audio_output": bool(output_video),
+                    "audio_reference_mode": (
+                        "chunk_aligned"
+                        if chunk_align_audio_references
+                        else "full_track"
+                    ),
                 },
             )
         finally:
@@ -269,6 +288,12 @@ class MiniMaxH3LongFormReferenceVideoPreview(
                 summary["frames"],
                 summary["frames"] / geometry.fps,
                 geometry.fps,
+            ),
+            "audio refs %s"
+            % (
+                "chunk-aligned chronological slices"
+                if chunk_align_audio_references
+                else "complete references reused per chunk"
             ),
             "audio     %s"
             % (
