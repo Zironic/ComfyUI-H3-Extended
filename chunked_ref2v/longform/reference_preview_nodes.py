@@ -61,8 +61,9 @@ class MiniMaxH3LongFormReferenceVideoPreview(
                 "current_chunk_preview",
                 default=True,
                 tooltip=(
-                    "Decode a bounded 17-frame view of the current "
-                    "denoised chunk while it is sampling."
+                    "Show a lightweight approximation of the current "
+                    "denoised chunk while it is sampling. Connect "
+                    "preview_vae only for an exact bounded VAE animation."
                 ),
             ),
             io.Int.Input(
@@ -83,8 +84,9 @@ class MiniMaxH3LongFormReferenceVideoPreview(
                 max=17,
                 step=1,
                 tooltip=(
-                    "Frames retained from the bounded five-latent H3 "
-                    "preview decode."
+                    "Maximum decoded frames when preview_vae is connected. "
+                    "The default lightweight mode shows up to five temporal "
+                    "latent positions instead."
                 ),
             ),
             io.Boolean.Input(
@@ -108,8 +110,10 @@ class MiniMaxH3LongFormReferenceVideoPreview(
                 "preview_vae",
                 optional=True,
                 tooltip=(
-                    "Optional VAE used only for every-N-step previews. "
-                    "Leave disconnected to reuse video_vae."
+                    "Optional VAE used only for an exact every-N-step "
+                    "animation. Leave disconnected for the lightweight "
+                    "latent preview. The production video VAE is never "
+                    "loaded from inside the active sampler callback."
                 ),
             ),
         ]
@@ -184,7 +188,8 @@ class MiniMaxH3LongFormReferenceVideoPreview(
         root = _resolve_root(run_directory, carry, chunk_frames)
         publisher = LongFormPreviewPublisher(
             node_id=unique_id,
-            video_vae=preview_vae or video_vae,
+            model=model,
+            video_vae=preview_vae,
             root=root,
             fps=geometry.fps,
             ffmpeg_location=ffmpeg_location.strip() or None,
@@ -198,6 +203,18 @@ class MiniMaxH3LongFormReferenceVideoPreview(
         )
         token = activate(publisher)
         publisher._announce("reset")
+        logging.info(
+            "%s enabled for node %s: current=%s every=%d frames=%d; "
+            "completed=%s width=%d exact_vae=%s",
+            LOG,
+            unique_id,
+            current_chunk_preview,
+            preview_every_steps,
+            current_preview_frames,
+            completed_chunks_preview,
+            live_preview_width,
+            preview_vae is not None,
+        )
         try:
             summary = audio_runtime.run(
                 chunk_frames=chunk_frames,
