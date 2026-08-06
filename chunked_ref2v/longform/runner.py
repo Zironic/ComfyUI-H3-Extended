@@ -85,6 +85,32 @@ def decode_chunk(video_vae, latent):
     return images
 
 
+def _progress_bar(total):
+    """A node progress bar, or None outside a running prompt."""
+    try:
+        import comfy.utils
+        return comfy.utils.ProgressBar(total)
+    except Exception:
+        return None
+
+
+def _send_preview(pbar, frame_u8, done, total):
+    """Push one finished frame to the node's progress preview.
+
+    A long run is otherwise a blank wait: at ~78 s per chunk a 3 minute output
+    is over an hour before anything is visible. The frame is already decoded, so
+    this only costs a JPEG encode.
+    """
+    if pbar is None:
+        return
+    try:
+        from PIL import Image
+        image = Image.fromarray(frame_u8.numpy())
+        pbar.update_absolute(done, total, ("JPEG", image, 768))
+    except Exception as exc:
+        logging.debug("%s preview frame unavailable: %s", LOG, exc)
+
+
 def _pack_conditioning(conditioning):
     tensor_payload = {"cond": conditioning[0][0]}
     meta = {"tensor_keys": [], "none_keys": [], "scalar": {}}
@@ -263,7 +289,7 @@ class LongFormRun:
         logging.info("%s pass B complete: %d chunks in %.1f s", LOG, done, time.time() - started)
         return done
 
-    def pass_c(self, *, model, sampler, sigmas, chunk_count):
+    def pass_c(self, *, model, sampler, sigmas, chunk_count, on_sampled=None):
         geometry = self.geometry
         started = time.time()
         overlap_start, overlap_count = (None, None)
@@ -329,12 +355,53 @@ class LongFormRun:
             })
             carry_latent = video_latent
             self.event(pass_="C", chunk=index, carry=self.carry, conditions=len(conditions))
+            # Decoding here rather than in a later pass costs nothing extra -
+            # the same decode happens either way - and it is the only point at
+            # which finished pixels exist while the run is still going.
+            if on_sampled is not None:
+                on_sampled(index, video_latent)
             if self.manifest:
                 self.manifest.update_state(pass_c_chunks=index + 1)
             del stored, cond_store, conditioning, arm_model, latent, audio_latent
             elapsed = time.time() - started
             logging.info("%s pass C: chunk %d/%d done (%.1f s)", LOG, index + 1, chunk_count, elapsed)
         return chunk_count
+
+    def _emit_chunk(self, index, latent, *, video_vae, chunk_count, writer,
+                    save_frames, written, out_dir, pbar=None):
+        """Decode one chunk, append it to the video, return frames written.
+
+        Shared by the batched and interleaved decode paths so both cut at the
+        stride identically - the seam behaviour must not depend on when the
+        decode happened.
+        """
+        geometry = self.geometry
+        pixels = decode_chunk(video_vae, latent).to("cpu", torch.float32)
+        remaining = self.target_frames - written
+        if remaining <= 0:
+            return 0
+        take = min(
+            int(pixels.shape[0]) if index == chunk_count - 1 else geometry.stride_frames,
+            remaining,
+        )
+        frames_u8 = (pixels[:take].clamp(0, 1) * 255.0 + 0.5).to(torch.uint8)
+        if writer is not None:
+            writer.write(frames_u8)
+        if save_frames:
+            from PIL import Image
+            for i in range(take):
+                Image.fromarray(frames_u8[i].numpy()).save(
+                    os.path.join(out_dir, "frame_%06d.png" % (written + i))
+                )
+        if pbar is not None:
+            _send_preview(pbar, frames_u8[-1], index + 1, chunk_count)
+        self.event(pass_="D", chunk=index, frames=take, total=written + take)
+        if self.manifest:
+            self.manifest.update_state(pass_d_chunks=index + 1,
+                                       frames_written=written + take)
+        del pixels, frames_u8
+        gc.collect()
+        return take
 
     def pass_d(self, *, video_vae, chunk_count, save_frames=True,
                output_video=True, source_video=None, start_frame=0,
@@ -345,6 +412,7 @@ class LongFormRun:
         final_video = os.path.join(self.root, "output", "final.mp4")
         written = 0
         started = time.time()
+        pbar = _progress_bar(chunk_count)
 
         writer = None
         if output_video:
@@ -360,29 +428,15 @@ class LongFormRun:
                 stored = _load(self.path("samples", index))
                 if stored is None:
                     raise RuntimeError("pass D: chunk %d has no sampled latent" % index)
-                pixels = decode_chunk(video_vae, stored["video_latent"]).to("cpu", torch.float32)
-                remaining = self.target_frames - written
-                if remaining <= 0:
+                take = self._emit_chunk(
+                    index, stored["video_latent"], video_vae=video_vae,
+                    chunk_count=chunk_count, writer=writer,
+                    save_frames=save_frames, written=written, out_dir=out_dir,
+                    pbar=pbar)
+                if take == 0:
                     break
-                take = min(
-                    int(pixels.shape[0]) if index == chunk_count - 1 else geometry.stride_frames,
-                    remaining,
-                )
-                frames_u8 = (pixels[:take].clamp(0, 1) * 255.0 + 0.5).to(torch.uint8)
-                if writer is not None:
-                    writer.write(frames_u8)
-                if save_frames:
-                    from PIL import Image
-                    for i in range(take):
-                        Image.fromarray(frames_u8[i].numpy()).save(
-                            os.path.join(out_dir, "frame_%06d.png" % (written + i))
-                        )
                 written += take
-                self.event(pass_="D", chunk=index, frames=take, total=written)
-                if self.manifest:
-                    self.manifest.update_state(pass_d_chunks=index + 1, frames_written=written)
-                del stored, pixels, frames_u8
-                gc.collect()
+                del stored
         finally:
             if writer is not None:
                 writer.close(commit=True)
@@ -407,13 +461,95 @@ class LongFormRun:
         logging.info("%s pass D complete: %d frames in %.1f s", LOG, written, time.time() - started)
         return written, output_path
 
+    def _finalize_video(self, *, written, output_video, preserve_audio,
+                        source_video, start_frame, ffmpeg_location, raw_video,
+                        final_video):
+        if written != self.target_frames:
+            raise RuntimeError("assembled %d frames, expected exactly %d"
+                               % (written, self.target_frames))
+        output_path = raw_video if output_video else ""
+        if output_video and preserve_audio and source_video:
+            try:
+                output_path = mux_source_audio(
+                    raw_video, source_video, final_video,
+                    start_frame=start_frame, frame_count=written,
+                    fps=self.geometry.fps, ffmpeg_location=ffmpeg_location)
+            except Exception as exc:
+                logging.warning("%s source-audio mux failed; keeping video-only "
+                                "output: %s", LOG, exc)
+                output_path = raw_video
+        return output_path
+
+    def pass_cd(self, *, model, sampler, sigmas, video_vae, chunk_count,
+                save_frames=True, output_video=True, source_video=None,
+                start_frame=0, preserve_audio=True, ffmpeg_location=None):
+        """Sample and decode chunk by chunk, writing the video as it goes.
+
+        The decode is the same work either way, so doing it here rather than in
+        a trailing pass costs nothing and makes the run watchable: each chunk's
+        last frame goes to the node preview as soon as it exists. The trade is
+        model residency - the DiT and the VAE alternate every chunk instead of
+        each staying put for a whole pass - which is why `pass_d` remains for
+        the batched path.
+        """
+        out_dir = os.path.join(self.root, "frames")
+        raw_video = os.path.join(self.root, "output", "video_only.mkv")
+        final_video = os.path.join(self.root, "output", "final.mp4")
+        started = time.time()
+        pbar = _progress_bar(chunk_count)
+        state = {"written": 0}
+
+        writer = None
+        if output_video:
+            writer = FFmpegVideoWriter(
+                raw_video, width=self.canvas[0], height=self.canvas[1],
+                fps=self.geometry.fps, ffmpeg_location=ffmpeg_location).open()
+
+        def emit(index, latent):
+            take = self._emit_chunk(
+                index, latent, video_vae=video_vae, chunk_count=chunk_count,
+                writer=writer, save_frames=save_frames,
+                written=state["written"], out_dir=out_dir, pbar=pbar)
+            state["written"] += take
+
+        try:
+            # Chunks sampled by an earlier interrupted run are skipped by
+            # pass_c, so their frames would never reach the writer. Decode them
+            # from disk first, in order, before sampling resumes.
+            resume_from = self._first_invalid("samples", chunk_count)
+            if resume_from:
+                logging.info("%s resuming: decoding %d already-sampled chunk(s)",
+                             LOG, resume_from)
+            for index in range(resume_from):
+                stored = _load(self.path("samples", index))
+                if stored is None:
+                    raise RuntimeError("pass CD: chunk %d has no sampled latent" % index)
+                emit(index, stored["video_latent"])
+                del stored
+
+            self.pass_c(model=model, sampler=sampler, sigmas=sigmas,
+                        chunk_count=chunk_count, on_sampled=emit)
+        finally:
+            if writer is not None:
+                writer.close(commit=True)
+
+        written = state["written"]
+        output_path = self._finalize_video(
+            written=written, output_video=output_video,
+            preserve_audio=preserve_audio, source_video=source_video,
+            start_frame=start_frame, ffmpeg_location=ffmpeg_location,
+            raw_video=raw_video, final_video=final_video)
+        logging.info("%s passes C+D complete: %d frames in %.1f s",
+                     LOG, written, time.time() - started)
+        return written, output_path
+
 
 def run(*, video_path, start_frame, chunk_frames, overlap_frames, chunk_count,
         target_frames, model, clip, video_vae, audio_vae, prompt, sampler,
         sigmas, seed, carry, canvas, root, ref_images=None,
         ref_image_size="match", cond_cache="auto", save_frames=True, fps=24,
         output_video=True, preserve_audio=True, ffmpeg_location=None,
-        runtime_config=None):
+        runtime_config=None, interleave_decode=True):
     geometry = HarnessGeometry(
         chunk_frames=chunk_frames,
         overlap_frames=overlap_frames,
@@ -479,17 +615,27 @@ def run(*, video_path, start_frame, chunk_frames, overlap_frames, chunk_count,
             ffmpeg_location=ffmpeg_location,
         )
         run_obj.pass_b(clip=clip, prompt=prompt, chunk_count=chunk_count, cond_cache=cond_cache)
-        run_obj.pass_c(model=model, sampler=sampler, sigmas=sigmas, chunk_count=chunk_count)
-        frames, output_path = run_obj.pass_d(
-            video_vae=video_vae,
-            chunk_count=chunk_count,
-            save_frames=save_frames,
-            output_video=output_video,
-            source_video=video_path,
-            start_frame=start_frame,
-            preserve_audio=preserve_audio,
-            ffmpeg_location=ffmpeg_location,
-        )
+        if interleave_decode:
+            frames, output_path = run_obj.pass_cd(
+                model=model, sampler=sampler, sigmas=sigmas,
+                video_vae=video_vae, chunk_count=chunk_count,
+                save_frames=save_frames, output_video=output_video,
+                source_video=video_path, start_frame=start_frame,
+                preserve_audio=preserve_audio, ffmpeg_location=ffmpeg_location,
+            )
+        else:
+            run_obj.pass_c(model=model, sampler=sampler, sigmas=sigmas,
+                           chunk_count=chunk_count)
+            frames, output_path = run_obj.pass_d(
+                video_vae=video_vae,
+                chunk_count=chunk_count,
+                save_frames=save_frames,
+                output_video=output_video,
+                source_video=video_path,
+                start_frame=start_frame,
+                preserve_audio=preserve_audio,
+                ffmpeg_location=ffmpeg_location,
+            )
     manifest.update_state(complete=True, frames_written=frames, output_path=output_path)
     return {
         "root": root,
