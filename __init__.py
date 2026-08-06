@@ -11,6 +11,7 @@ from .chunked_ref2v.longform.preview_nodes import (
 from .chunked_ref2v.longform.reference_preview_nodes import (
     MiniMaxH3LongFormReferencePreviewExtension,
 )
+from .chunked_ref2v.longform.video_output_contract import adapt_longform_node
 from .chunked_ref2v.longform import (
     completed_preview_runtime,
     v2v_audio_runtime,
@@ -76,8 +77,9 @@ def _replace_schema_category(schema, category):
 
 
 def _categorized_node(node):
-    """Wrap a node class so its existing schema is exposed under our menu."""
+    """Wrap a node class with the H3 category and native video contract."""
 
+    node = adapt_longform_node(node)
     schema = node.define_schema()
     category = NODE_CATEGORIES.get(schema.node_id)
     if category is None:
