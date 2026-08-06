@@ -40,11 +40,14 @@ def _publish_completed_resilient(
     chunk_index,
     frames_u8,
     completed_frames,
+    **extra,
 ):
     """Publish MP4 first, then GIF, then a visible error event.
 
     The method deliberately consumes only the already-decoded committed frame
     batch.  It never loads a model or VAE and cannot affect the sampled result.
+    ``extra`` carries optional MP4-only enrichment such as ``audio=``; the GIF
+    fallback silently drops it, since GIF has no audio track.
     """
 
     if not self.options.completed_enabled or int(frames_u8.shape[0]) == 0:
@@ -56,6 +59,7 @@ def _publish_completed_resilient(
             chunk_index=chunk_index,
             frames_u8=frames_u8,
             completed_frames=completed_frames,
+            **extra,
         )
     except Exception as primary_exc:
         primary_message = _message(primary_exc)

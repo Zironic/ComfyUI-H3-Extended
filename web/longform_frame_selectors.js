@@ -43,26 +43,40 @@ function makeComboWidget(widget, values) {
     // doing that changes the socket type from INT to COMBO and makes the
     // timeline node's INT passthrough outputs impossible to connect.
     widget.type = "combo";
-    widget.options = {
-        ...(widget.options || {}),
-        values,
-    };
-    delete widget.options.min;
-    delete widget.options.max;
-    delete widget.options.step;
+
+    // Mutate the existing options object instead of replacing it. Nodes 2.0
+    // keeps a second reference to this exact object in the widget value store
+    // (BaseWidget copies the reference once, at construction) and the Vue
+    // select reads its option list from that copy. Assigning a fresh object
+    // here leaves the store holding the original INT options, which have no
+    // `values` — that is what renders as "No Results Found".
+    const options = widget.options || (widget.options = {});
+    // The select compares option values to the widget value with ===, and it
+    // stringifies every option, so keep both sides strings. execution.py
+    // coerces INT widget values with int() before the node runs.
+    options.values = values.map((value) => String(value));
+    // min/max/step/step2 stay. The select ignores them, and useIntWidget's
+    // onValueChange callback still runs underneath: it snaps to
+    // round((v - min % step2) / step2) * step2 + min % step2. Without min, the
+    // 22-frame offset is lost and every legal 17k+5 pick collapses onto a bare
+    // multiple of 17 (141 -> 136).
 }
 
 function setWidgetValue(node, widget, value) {
-    if (!widget || value === undefined || Number(widget.value) === Number(value)) {
-        return;
-    }
+    if (!widget || value === undefined) return;
+
+    const next = String(value);
+    if (widget.value === next) return;
 
     const previous = widget.value;
-    widget.value = value;
-    widget.callback?.(value);
+    widget.value = next;
+    widget.callback?.(next);
+    // onValueChange writes a rounded number back over the value; restore the
+    // string so the select recognises it as one of its options.
+    widget.value = next;
     node.onWidgetChanged?.(
         widget.name,
-        value,
+        next,
         previous,
         widget,
     );
@@ -78,13 +92,16 @@ function syncOverlapChoices(node) {
     );
     makeComboWidget(overlapWidget, allowed);
 
-    if (!allowed.includes(Number(overlapWidget.value))) {
-        setWidgetValue(
-            node,
-            overlapWidget,
-            nearestAllowed(overlapWidget.value, allowed),
-        );
-    }
+    // Always run the value back through setWidgetValue, even when it is already
+    // legal: a widget loaded as the number 4 has to become the string "4" or the
+    // select treats it as an unknown value and flags the widget as invalid.
+    setWidgetValue(
+        node,
+        overlapWidget,
+        allowed.includes(Number(overlapWidget.value))
+            ? Number(overlapWidget.value)
+            : nearestAllowed(overlapWidget.value, allowed),
+    );
 }
 
 function installLegalSelectors(node) {
@@ -93,20 +110,22 @@ function installLegalSelectors(node) {
     if (!chunkWidget || !overlapWidget) return;
 
     makeComboWidget(chunkWidget, CHUNK_FRAMES);
-    if (!CHUNK_FRAMES.includes(Number(chunkWidget.value))) {
-        setWidgetValue(
-            node,
-            chunkWidget,
-            nearestAllowed(chunkWidget.value, CHUNK_FRAMES),
-        );
-    }
+    setWidgetValue(
+        node,
+        chunkWidget,
+        CHUNK_FRAMES.includes(Number(chunkWidget.value))
+            ? Number(chunkWidget.value)
+            : nearestAllowed(chunkWidget.value, CHUNK_FRAMES),
+    );
 
     if (!chunkWidget.__h3LegalFramesWrapped) {
         const originalCallback = chunkWidget.callback;
         chunkWidget.callback = function (value, ...args) {
             const legal = nearestAllowed(value, CHUNK_FRAMES);
-            if (legal !== undefined) this.value = legal;
-            const result = originalCallback?.call(this, legal, ...args);
+            const next = legal === undefined ? value : String(legal);
+            this.value = next;
+            const result = originalCallback?.call(this, next, ...args);
+            this.value = next;
             syncOverlapChoices(node);
             return result;
         };
@@ -120,8 +139,11 @@ function installLegalSelectors(node) {
                 (frames) => frames < Number(chunkWidget.value),
             );
             const legal = nearestAllowed(value, allowed);
-            if (legal !== undefined) this.value = legal;
-            return originalCallback?.call(this, legal, ...args);
+            const next = legal === undefined ? value : String(legal);
+            this.value = next;
+            const result = originalCallback?.call(this, next, ...args);
+            this.value = next;
+            return result;
         };
         overlapWidget.__h3LegalFramesWrapped = true;
     }

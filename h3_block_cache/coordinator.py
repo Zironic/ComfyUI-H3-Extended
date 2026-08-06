@@ -9,8 +9,11 @@ remaining block calls as identities.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import logging
+import os
 import threading
+import time
 
 import torch
 
@@ -59,12 +62,52 @@ class FirstBlockCacheCoordinator:
             "diffs": [],
         }
         self._lock = threading.RLock()
+        self._records = []
+        self._request_id = -1
+        self._request_started = None
+        self._sequence_length = None
+        self._min_free_bytes = None
+
+    def _sample_free_bytes(self):
+        """Physical free VRAM, which PyTorch's allocator counters do not show."""
+        if not torch.cuda.is_available():
+            return
+        try:
+            free = int(torch.cuda.mem_get_info()[0])
+        except Exception:
+            return
+        if self._min_free_bytes is None or free < self._min_free_bytes:
+            self._min_free_bytes = free
+
+    def _record(self, snapshot, diff, decision, reason=None):
+        if self._sequence_length is None and snapshot.layout is not None:
+            self._sequence_length = int(snapshot.layout.seq_len)
+        row = {
+            "step": int(snapshot.step_index),
+            "branch": list(snapshot.branch),
+            "sigma": float(snapshot.sigma),
+            "diff": None if diff is None else float(diff),
+            "decision": decision,
+        }
+        if reason is not None:
+            row["reason"] = reason
+        self._records.append(row)
 
     def on_request_reset(self, request_id):
         with self._lock:
             for state in self.states.values():
                 state.release()
             self.states.clear()
+            self._records = []
+            self._request_id = int(request_id)
+            self._sequence_length = None
+            self._min_free_bytes = None
+            self._request_started = time.perf_counter()
+            if torch.cuda.is_available():
+                try:
+                    torch.cuda.reset_peak_memory_stats()
+                except Exception:
+                    pass
 
     def _decline(self, reason):
         declines = self.stats["declines"]
@@ -137,6 +180,7 @@ class FirstBlockCacheCoordinator:
 
         state = self._state(snapshot, output)
         state.step_index = snapshot.step_index
+        self._sample_free_bytes()
 
         if state.prev_head_residual is None:
             state.prev_head_residual = torch.empty_like(output)
@@ -144,11 +188,13 @@ class FirstBlockCacheCoordinator:
             state.current_head_output = original_input
             state.current_head_output.copy_(output.detach())
             state.skip = False
-            self._decline(
+            reason = (
                 "warmup_step"
                 if snapshot.step_index < self.config.warmup_steps
                 else "cache_not_ready"
             )
+            self._decline(reason)
+            self._record(snapshot, None, "compute", reason)
             return False
 
         diff = self._global_residual_diff(
@@ -162,16 +208,24 @@ class FirstBlockCacheCoordinator:
             state.current_head_output.copy_(output.detach())
             state.skip = False
             self._decline("warmup_step")
+            self._record(snapshot, diff, "compute", "warmup_step")
             return False
         if state.cached_tail is None:
             state.current_head_output = original_input
             state.current_head_output.copy_(output.detach())
             state.skip = False
             self._decline("cache_not_ready")
+            self._record(snapshot, diff, "compute", "cache_not_ready")
             return False
 
         state.skip = diff <= float(self.config.threshold)
         self.stats["diffs"].append(diff)
+        self._record(
+            snapshot,
+            diff,
+            "skip" if state.skip else "compute",
+            None if state.skip else "above_threshold",
+        )
         if state.skip:
             state.current_head_output = None
         else:
@@ -231,6 +285,70 @@ class FirstBlockCacheCoordinator:
         state.current_head_output = None
         state.skip = False
         self.stats["skipped_tails"] += 1
+
+    def report(self, seconds=None):
+        """Per-request decision trace: scalar diffs only, never residual tensors."""
+        head_calls = int(self.stats["head_calls"])
+        skipped = int(self.stats["skipped_tails"])
+        computed = int(self.stats["computed_tails"])
+        decided = skipped + computed
+        peak_allocated = None
+        if torch.cuda.is_available():
+            try:
+                peak_allocated = int(torch.cuda.max_memory_allocated())
+            except Exception:
+                pass
+        return {
+            "request_id": self._request_id,
+            "mode": self.config.mode,
+            "threshold": float(self.config.threshold),
+            "warmup_steps": int(self.config.warmup_steps),
+            "sequence_length": self._sequence_length,
+            "sampler_seconds": None if seconds is None else float(seconds),
+            "peak_allocated_gib": (
+                None if peak_allocated is None else peak_allocated / (1024 ** 3)
+            ),
+            "minimum_physical_free_mib": (
+                None
+                if self._min_free_bytes is None
+                else self._min_free_bytes / (1024 ** 2)
+            ),
+            "head_calls": head_calls,
+            "computed_tails": computed,
+            "skipped_tails": skipped,
+            "skip_fraction": (skipped / decided) if decided else 0.0,
+            "cache_bytes": int(self.stats["cache_bytes"]),
+            "peak_cache_bytes": int(self.stats["peak_cache_bytes"]),
+            "declines": dict(self.stats["declines"]),
+            "steps": list(self._records),
+        }
+
+    def on_request_end(self, request_id, seconds=None):
+        directory = str(self.config.report_directory or "").strip()
+        if not directory:
+            return None
+        payload = self.report(seconds)
+        try:
+            os.makedirs(directory, exist_ok=True)
+            path = os.path.join(
+                directory,
+                "fbc_request_%d_t%s.json"
+                % (int(request_id), ("%.4f" % self.config.threshold).replace(".", "p")),
+            )
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2)
+        except Exception:
+            if self.config.strict:
+                raise
+            logging.warning("%s could not write report", LOG_PREFIX, exc_info=True)
+            return None
+        logging.info(
+            "%s wrote %s (skip_fraction=%.3f)",
+            LOG_PREFIX,
+            path,
+            payload["skip_fraction"],
+        )
+        return path
 
     def as_status(self):
         return {

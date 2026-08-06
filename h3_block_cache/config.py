@@ -15,6 +15,7 @@ class FirstBlockCacheConfig:
     warmup_steps: int = 3
     strict: bool = False
     collective: bool = True
+    report_directory: str = ""
 
     def __post_init__(self):
         if self.mode not in MODES:

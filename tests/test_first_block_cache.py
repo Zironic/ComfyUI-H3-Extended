@@ -67,8 +67,46 @@ def main():
     check(status["skipped_tails"] == 1 and status["computed_tails"] == 2, "coordinator records compute/skip counts")
     check(status["cache_bytes"] > 0, "cache memory is reported")
 
+    report = coordinator.report(seconds=12.5)
+    check(
+        [row["decision"] for row in report["steps"]] == ["compute", "skip", "compute"],
+        "the recorder keeps the per-step decision trace",
+    )
+    check(
+        report["steps"][0]["diff"] is None
+        and report["steps"][1]["diff"] is not None,
+        "the first step has no diff and later steps carry the scalar",
+    )
+    check(
+        report["steps"][2]["reason"] == "above_threshold",
+        "a recomputed step records why it was not skipped",
+    )
+    check(
+        report["skip_fraction"] == 1 / 3 and report["sampler_seconds"] == 12.5,
+        "the report carries skip fraction and wall time",
+    )
+    check(
+        all("residual" not in key for key in report),
+        "the report holds scalars only, never residual tensors",
+    )
+
     coordinator.on_request_reset(1)
     check(not coordinator.states, "new request releases all cached tensors")
+    check(not coordinator.report()["steps"], "a new request starts an empty trace")
+
+    zero = FirstBlockCacheCoordinator(
+        FirstBlockCacheConfig(
+            mode="first_block", threshold=0.0, warmup_steps=0, collective=False
+        )
+    )
+    base = torch.ones(4, 8)
+    zero.after_head(torch.zeros_like(base), base, options(0))
+    zero.finish_compute(base + tail, options(0))
+    moved = base * 1.0001
+    check(
+        not zero.after_head(torch.zeros_like(moved), moved, options(1)),
+        "threshold zero never skips, so it measures wrapper overhead alone",
+    )
     print("\nall FirstBlockCache tests passed")
 
 

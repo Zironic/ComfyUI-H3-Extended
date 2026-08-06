@@ -11,6 +11,7 @@ from comfy_api.latest import ComfyExtension, io
 
 from ..geometry import HarnessGeometry
 from . import chunk_aligned_audio_refs, runner
+from .audio_runtime import resolve_audio_aligned_overlap
 from .chunk_stream import chunk_count_for
 from .nodes import (
     _describe_ffmpeg,
@@ -80,7 +81,7 @@ class MiniMaxH3LongFormReferenceVideoPreview(
             ),
             io.Int.Input(
                 "preview_every_steps",
-                default=2,
+                default=1,
                 min=1,
                 max=100,
                 step=1,
@@ -130,11 +131,15 @@ class MiniMaxH3LongFormReferenceVideoPreview(
             ),
         ]
 
+        # Anchor above align_audio_chunks so that widget stays last: Comfy maps
+        # widgets_values by position, and the preview widgets already have saved
+        # positions in existing workflows.
+        anchors = ("align_audio_chunks", "ref_images")
         insert_at = next(
             (
                 index
                 for index, item in enumerate(inputs)
-                if getattr(item, "name", None) == "ref_images"
+                if getattr(item, "name", None) in anchors
             ),
             len(inputs),
         )
@@ -157,6 +162,7 @@ class MiniMaxH3LongFormReferenceVideoPreview(
         height=768,
         chunk_frames=90,
         overlap_frames=4,
+        align_audio_chunks=False,
         carry=runner.CARRY_OVERLAP,
         ref_image_size="native",
         cond_cache="auto",
@@ -168,7 +174,7 @@ class MiniMaxH3LongFormReferenceVideoPreview(
         save_frames=False,
         chunk_align_audio_references=False,
         current_chunk_preview=True,
-        preview_every_steps=2,
+        preview_every_steps=1,
         current_preview_frames=17,
         completed_chunks_preview=True,
         live_preview_width=512,
@@ -179,6 +185,11 @@ class MiniMaxH3LongFormReferenceVideoPreview(
         ref_audios=None,
         unique_id=None,
     ) -> io.NodeOutput:
+        overlap_frames, alignment_note = resolve_audio_aligned_overlap(
+            chunk_frames, overlap_frames, align_audio_chunks,
+        )
+        if alignment_note:
+            logging.warning("%s %s", LOG, alignment_note)
         geometry = HarnessGeometry(
             chunk_frames=chunk_frames,
             overlap_frames=overlap_frames,
@@ -217,6 +228,9 @@ class MiniMaxH3LongFormReferenceVideoPreview(
                 current_frames=int(current_preview_frames),
                 width=int(live_preview_width),
             ),
+            # This runtime decodes a waveform per chunk, but only when it is
+            # writing a video; without one there is nothing to wait for.
+            audio_expected=bool(output_video),
         )
         token = activate(publisher)
         publisher._announce("reset")
@@ -273,6 +287,12 @@ class MiniMaxH3LongFormReferenceVideoPreview(
                 },
             )
         finally:
+            # An aborted or audio-less run can leave the last chunk staged;
+            # publish it silently rather than dropping it from the pane.
+            try:
+                publisher.flush_completed_chunk()
+            except Exception as exc:
+                logging.warning("%s final preview flush failed: %s", LOG, exc)
             deactivate(token)
 
         audio_start, audio_count = summary["audio_overlap_latent"]
@@ -326,6 +346,8 @@ class MiniMaxH3LongFormReferenceVideoPreview(
                 ffmpeg_location.strip() or None
             ),
         ]
+        if alignment_note:
+            report_lines.append("align     %s" % alignment_note)
         report_lines.extend(
             "ref       %s" % note
             for note in summary.get("reference_notes", [])

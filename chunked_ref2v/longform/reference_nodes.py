@@ -19,6 +19,7 @@ except ImportError:  # pragma: no cover
     COND_CACHE_MODES = ["auto", "off", "refresh"]
 
 from . import reference_runner, runner
+from .audio_runtime import resolve_audio_aligned_overlap
 from .chunk_stream import chunk_count_for
 from .nodes import _describe_ffmpeg, _preview, _preview_from_video, _video_result
 
@@ -120,6 +121,23 @@ class MiniMaxH3LongFormReferenceVideo(io.ComfyNode):
                     "save_frames", default=False,
                     tooltip="Save a diagnostic PNG sequence in addition to the video.",
                 ),
+                # Must stay the LAST widget. Comfy maps widgets_values by
+                # position, so a new widget inserted anywhere earlier shifts
+                # every saved value after it in existing workflows.
+                io.Boolean.Input(
+                    "align_audio_chunks", default=False,
+                    tooltip=(
+                        "Snap overlap_frames to the nearest value that lands on "
+                        "both the video and the audio latent grid. Video frames "
+                        "are 1/24 s and audio latents 1/40 s, so they coincide "
+                        "only every 3 frames; on a stride that misses, the audio "
+                        "carry rounds to the nearest latent and the continuation "
+                        "is up to 8.3 ms out of step with its own video. For "
+                        "C=90 the aligned overlaps are 9, 21, 30, 39, 51, 60, 72 "
+                        "and 81. Snapping changes the generated result and the "
+                        "run directory, so it is off by default."
+                    ),
+                ),
                 io.Autogrow.Input(
                     "ref_images", optional=True,
                     template=io.Autogrow.TemplatePrefix(
@@ -169,13 +187,18 @@ class MiniMaxH3LongFormReferenceVideo(io.ComfyNode):
     def execute(
         cls, model, clip, video_vae, audio_vae, prompt, sampler, sigmas, seed,
         output_seconds=30, width=1344, height=768, chunk_frames=90,
-        overlap_frames=4, carry=runner.CARRY_OVERLAP,
+        overlap_frames=4, align_audio_chunks=False, carry=runner.CARRY_OVERLAP,
         ref_image_size="native", cond_cache="auto", attention="auto",
         activation="mlp_chunked_native", run_directory="",
         ffmpeg_location="", output_video=True, save_frames=False,
         ref_images=None, ref_videos=None, ref_video_audios=None,
         ref_audios=None,
     ) -> io.NodeOutput:
+        overlap_frames, alignment_note = resolve_audio_aligned_overlap(
+            chunk_frames, overlap_frames, align_audio_chunks,
+        )
+        if alignment_note:
+            logging.warning("%s %s", LOG, alignment_note)
         geometry = HarnessGeometry(
             chunk_frames=chunk_frames, overlap_frames=overlap_frames,
         ).validate()

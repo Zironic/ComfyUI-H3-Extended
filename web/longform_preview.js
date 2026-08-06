@@ -89,6 +89,9 @@ function buildPreviewWidget(node) {
     const completedTitle = title("Completed output — waiting");
     const completedVideo = document.createElement("video");
     completedVideo.controls = true;
+    // Muted is required for autoplay, and the pane autoplays. Segments now
+    // carry an audio track, so the controls' unmute button does something; the
+    // choice is remembered across the source swaps a growing stitch causes.
     completedVideo.muted = true;
     completedVideo.playsInline = true;
     completedVideo.preload = "auto";
@@ -114,6 +117,7 @@ function buildPreviewWidget(node) {
         segments: [],
         segmentKeys: new Set(),
         playingIndex: -1,
+        stitchedUrl: null,
     };
 
     completedVideo.addEventListener("ended", () => {
@@ -140,6 +144,7 @@ function resetState(state) {
     state.segments.length = 0;
     state.segmentKeys.clear();
     state.playingIndex = -1;
+    state.stitchedUrl = null;
 }
 
 function playSegment(state, index, autoplay) {
@@ -157,8 +162,9 @@ function playSegment(state, index, autoplay) {
 
 function onCurrent(state, detail) {
     const mode = detail.mode === "vae" ? "VAE" : "latent approx";
+    const rate = detail.preview_fps ? ` @ ${detail.preview_fps} fps` : "";
     state.currentTitle.textContent =
-        `Current chunk ${detail.chunk_index + 1} — step ${detail.step}/${detail.total_steps} — ${mode}`;
+        `Current chunk ${detail.chunk_index + 1} — step ${detail.step}/${detail.total_steps} — ${mode}${rate}`;
     state.currentTitle.title = detail.fallback_reason || "";
     state.currentImage.src = assetUrl(detail.asset, detail.revision);
 }
@@ -172,7 +178,55 @@ function onCurrentError(state, detail) {
     console.warn("[H3 Extended] current chunk preview failed:", message);
 }
 
+// The server stitches every finished chunk into one growing MP4, so the pane
+// swaps in a longer file each time rather than playing a per-chunk playlist.
+// The swap keeps the viewer's position and play state: a reload that jumped
+// back to zero on every chunk would be as unwatchable as showing one chunk.
+function onStitched(state, detail) {
+    const video = state.completedVideo;
+    const hadStitch = Boolean(state.stitchedUrl);
+    const resumeAt = hadStitch ? video.currentTime || 0 : 0;
+    const wasPlaying = hadStitch ? !video.paused || video.ended : true;
+
+    state.stitchedUrl = assetUrl(detail.asset, detail.revision);
+    state.segments.length = 0;
+    state.segmentKeys.clear();
+    state.playingIndex = -1;
+
+    const onMetadata = () => {
+        video.removeEventListener("loadedmetadata", onMetadata);
+        if (resumeAt > 0 && resumeAt < video.duration) {
+            try {
+                video.currentTime = resumeAt;
+            } catch (error) {
+                // Seeking before the container is seekable is not worth failing.
+            }
+        }
+        if (wasPlaying) {
+            video.play().catch(() => {
+                // Browser autoplay policy can still require a click.
+            });
+        }
+    };
+    video.addEventListener("loadedmetadata", onMetadata);
+    video.src = state.stitchedUrl;
+    video.load();
+
+    const sound = detail.has_audio
+        ? video.muted
+            ? " — sound (unmute)"
+            : " — sound"
+        : "";
+    state.completedTitle.textContent =
+        `Completed output — ${detail.chunk_index + 1} chunks, ${detail.completed_frames} frames${sound}`;
+    state.completedTitle.title = detail.audio_error || "";
+}
+
 function onCompleted(state, detail) {
+    if (detail.stitched) {
+        onStitched(state, detail);
+        return;
+    }
     const key = `${detail.chunk_index}:${detail.asset.filename}`;
     if (!state.segmentKeys.has(key)) {
         state.segmentKeys.add(key);

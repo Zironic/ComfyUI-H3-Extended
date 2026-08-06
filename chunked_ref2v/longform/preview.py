@@ -8,9 +8,18 @@ Two independent channels are published while a node is running:
   ``preview_vae`` is connected, an exact bounded VAE animation is attempted
   first and the latent preview remains the failure-safe fallback.
 * ``completed_chunk`` writes the already-decoded committed frames of each
-  completed chunk as a small MP4 segment. The browser plays the finalized
-  segments as a playlist, so the main still-open output container never has to
-  be readable mid-run.
+  completed chunk as a small MP4 segment, then stream-copies every segment
+  produced so far into one growing ``completed_all`` MP4. The browser gets that
+  single stitched file, so the pane shows the whole finished output instead of
+  the newest chunk alone, and the main still-open output container never has to
+  be readable mid-run. If the concat step fails the per-chunk segment is
+  published on its own and the browser falls back to playlist playback.
+
+  Runtimes that generate audio hand each chunk's committed samples over after
+  ``_emit_chunk`` returns, so the frames are staged rather than published
+  immediately (see ``stage_completed_chunk``). The samples accumulate as raw
+  PCM and are encoded once per stitch, which keeps the pane in sync instead of
+  drifting by an AAC frame per chunk.
 
 The production runner predates these callbacks. This module patches its two
 narrow seams at import time rather than duplicating the complete runner:
@@ -27,6 +36,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 import time
 from dataclasses import dataclass
 
@@ -34,13 +44,18 @@ import torch
 import torch.nn.functional as F
 
 from .. import harness
+from ..geometry import FRAME_PER_TOKEN
 from ..layout_ops import TargetAlignedCondition
 from ..model_patch import patch_target_conditions
 from . import runner
+from .frame_source import resolve_ffmpeg
 from .writer import FFmpegVideoWriter
 
 LOG = "[H3 Extended] longform preview"
 EVENT = "h3_longform_preview"
+# One temporal latent position stands for this many pixel frames, so a latent
+# preview image has to be held that many frame periods to run at real speed.
+LATENT_FRAME_STRIDE = max(FRAME_PER_TOKEN)
 _ACTIVE = contextvars.ContextVar("h3_longform_preview_publisher", default=None)
 _PATCHED = False
 
@@ -214,8 +229,13 @@ class LongFormPreviewPublisher:
         fps=24,
         ffmpeg_location=None,
         options=None,
+        audio_expected=False,
     ):
         self.node_id = str(node_id)
+        # Set by runtimes that decode a waveform per chunk. It makes the
+        # completed pane wait for that decode instead of publishing silence.
+        self.audio_expected = bool(audio_expected)
+        self.pending_chunk = None
         self.video_vae = video_vae
         self.latent_previewer = _build_latent_previewer(model)
         self.latent_process_out = _latent_process_out(model)
@@ -225,6 +245,11 @@ class LongFormPreviewPublisher:
         self.options = options or PreviewOptions()
         self.revision = 0
         self.completed_frames = 0
+        self.segment_paths = []
+        self.stitched_path = None
+        self.stitch_index = 0
+        self.audio_channels = None
+        self.audio_rate = None
 
         import folder_paths
 
@@ -234,6 +259,14 @@ class LongFormPreviewPublisher:
             _safe_component(self.node_id),
         )
         os.makedirs(self.temp_root, exist_ok=True)
+        # Appended to per chunk. A previous run of the same node left its own
+        # track here, and appending to that would prefix the preview with stale
+        # audio, so start every run from an empty file.
+        self.audio_path = os.path.join(self.temp_root, "completed_audio.f32le")
+        try:
+            os.remove(self.audio_path)
+        except OSError:
+            pass
 
     def _announce(self, kind, **fields):
         self.revision += 1
@@ -321,14 +354,23 @@ class LongFormPreviewPublisher:
         if images is None:
             images = self._latent_images(video)
 
+        # The VAE path decodes real consecutive frames, so it plays at the
+        # production rate. A latent image covers LATENT_FRAME_STRIDE frames and
+        # has to be held that much longer, or the pane runs at 4x speed.
+        preview_fps = (
+            self.fps
+            if mode == "vae"
+            else max(1, round(self.fps / LATENT_FRAME_STRIDE))
+        )
         path = os.path.join(self.temp_root, "current.gif")
-        self._write_animation(path, images)
+        self._write_animation(path, images, fps=preview_fps)
         fields = {
             "chunk_index": int(chunk_index),
             "step": int(step),
             "total_steps": int(total_steps),
             "frames": len(images),
             "mode": mode,
+            "preview_fps": int(preview_fps),
             "asset": _asset_payload(path, "temp"),
         }
         if fallback_reason:
@@ -338,7 +380,13 @@ class LongFormPreviewPublisher:
         gc.collect()
 
     def _exact_vae_images(self, video):
-        """Decode the first five H3 temporal positions to at most 17 frames."""
+        """Decode the first five H3 temporal positions to at most 17 frames.
+
+        Five is the free tier, not a display preference. The VAE decodes a whole
+        1+4*4 group at once, so one frame and seventeen frames cost the same
+        wall-clock; a sixth latent position starts a second group and doubles
+        the decode inside the sampler callback. Keep this at five.
+        """
         latent_t = min(5, int(video.shape[2]))
         preview_latent = video[:, :, :latent_t].detach().to(torch.float32)
         if self.latent_process_out is not None:
@@ -414,7 +462,49 @@ class LongFormPreviewPublisher:
             )
         return images
 
-    def publish_completed_chunk(self, *, chunk_index, frames_u8, completed_frames):
+    def stage_completed_chunk(self, *, chunk_index, frames_u8, completed_frames):
+        """Hold a chunk's committed frames until its audio has been decoded.
+
+        The audio runtime decodes a chunk's waveform only after ``_emit_chunk``
+        returns, so publishing from inside that call could never produce a
+        segment with sound. Staging costs one resized frame batch (a few tens of
+        MB at preview width) and the wait is the length of one audio decode.
+        """
+        if not self.options.completed_enabled or int(frames_u8.shape[0]) == 0:
+            return
+        # A previous stage that never got its audio must not be lost.
+        self.flush_completed_chunk()
+        self.pending_chunk = {
+            "chunk_index": int(chunk_index),
+            "frames": _resize_frames_u8(frames_u8, self.options.width),
+            "completed_frames": int(completed_frames),
+        }
+
+    def flush_completed_chunk(self, *, waveform=None, sample_rate=None):
+        """Publish the staged chunk, with its audio when one was decoded."""
+        pending = getattr(self, "pending_chunk", None)
+        self.pending_chunk = None
+        if pending is None:
+            return
+        audio = None
+        if waveform is not None and sample_rate:
+            audio = (waveform, int(sample_rate))
+        # Route back through the public method so the GIF fallback still wraps it.
+        self.publish_completed_chunk(
+            chunk_index=pending["chunk_index"],
+            frames_u8=pending["frames"],
+            completed_frames=pending["completed_frames"],
+            audio=audio,
+        )
+
+    def publish_completed_chunk(
+        self,
+        *,
+        chunk_index,
+        frames_u8,
+        completed_frames,
+        audio=None,
+    ):
         """Publish only frames actually committed after overlap trimming."""
         if not self.options.completed_enabled or int(frames_u8.shape[0]) == 0:
             return
@@ -437,23 +527,205 @@ class LongFormPreviewPublisher:
         finally:
             writer.close(commit=True)
         self.completed_frames = int(completed_frames)
-        self._announce(
-            "completed_chunk",
-            chunk_index=int(chunk_index),
-            chunk_frames=int(frames.shape[0]),
-            completed_frames=self.completed_frames,
-            fps=self.fps,
-            asset=_asset_payload(path, "temp"),
-        )
+
+        # Sound is a bonus on a preview: a failed append keeps the silent
+        # segment rather than costing the pane a chunk.
+        audio_error = None
+        if audio is not None:
+            try:
+                self._append_preview_audio(*audio)
+            except Exception as exc:
+                audio_error = ("%s: %s" % (type(exc).__name__, exc))[:500]
+                logging.warning(
+                    "%s completed preview audio failed at chunk %d: %s",
+                    LOG,
+                    int(chunk_index),
+                    audio_error,
+                )
+
+        segments = self._segment_paths()
+        if path not in segments:
+            segments.append(path)
+        fields = {
+            "chunk_index": int(chunk_index),
+            "chunk_frames": int(frames.shape[0]),
+            "completed_frames": self.completed_frames,
+            "fps": self.fps,
+            "segments": len(segments),
+            # Only the stitched file carries sound; segments stay video-only.
+            "has_audio": self._has_preview_audio(),
+            "segment_asset": _asset_payload(path, "temp"),
+        }
+        if audio_error:
+            fields["audio_error"] = audio_error
+
+        # The pane should show everything finished so far, not just this chunk.
+        # A concat failure is never fatal: publishing the bare segment leaves the
+        # browser on its older playlist path.
+        stitched = None
+        try:
+            stitched = self._stitch_segments(segments)
+        except Exception as exc:
+            fields["stitch_error"] = ("%s: %s" % (type(exc).__name__, exc))[:500]
+            logging.warning(
+                "%s stitched completed preview failed at chunk %d: %s",
+                LOG,
+                int(chunk_index),
+                fields["stitch_error"],
+            )
+
+        if stitched is None:
+            fields["stitched"] = False
+            fields["asset"] = fields["segment_asset"]
+        else:
+            fields["stitched"] = True
+            fields["asset"] = _asset_payload(stitched, "temp")
+        self._announce("completed_chunk", **fields)
         del frames
 
-    def _write_animation(self, path, images):
+    def _append_preview_audio(self, waveform, sample_rate):
+        """Append a chunk's committed samples to the running preview track.
+
+        Audio is accumulated as raw PCM and encoded once per stitch rather than
+        per segment. Encoding each segment separately would pad every one of
+        them out to an AAC frame boundary, and concatenating those pads drifts
+        the preview out of sync by ~30 ms per chunk -- across a 50-chunk run,
+        more than a second of false lip-sync error.
+        """
+        audio = waveform.detach().to("cpu", torch.float32)
+        if audio.ndim == 3:
+            audio = audio[0]
+        if audio.ndim != 2:
+            raise ValueError(
+                "expected [channels, samples] audio, got %r" % (tuple(audio.shape),)
+            )
+        channels = int(audio.shape[0])
+        if channels < 1 or int(audio.shape[1]) < 1:
+            raise ValueError("empty audio chunk")
+        if self.audio_channels is None:
+            self.audio_channels = channels
+            self.audio_rate = int(sample_rate)
+        elif channels != self.audio_channels or int(sample_rate) != self.audio_rate:
+            raise ValueError(
+                "preview audio format changed: %d ch @ %d -> %d ch @ %d"
+                % (self.audio_channels, self.audio_rate, channels, int(sample_rate))
+            )
+        # ffmpeg wants interleaved samples; the decoder hands over planar.
+        with open(self.audio_path, "ab") as handle:
+            handle.write(audio.transpose(0, 1).contiguous().numpy().tobytes())
+        return self.audio_path
+
+    def _mux_stitched_audio(self, ffmpeg, video_path, output):
+        """Attach the whole accumulated track to the stitched video."""
+        args = [
+            ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error",
+            "-f", "f32le", "-ar", str(self.audio_rate),
+            "-ac", str(self.audio_channels), "-i", self.audio_path,
+            "-i", video_path,
+            "-map", "1:v:0", "-map", "0:a:0",
+            "-c:v", "copy", "-c:a", "aac", "-b:a", "96k",
+            "-movflags", "+faststart", "-shortest", "-y", output,
+        ]
+        proc = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if proc.returncode != 0:
+            raise RuntimeError(
+                "ffmpeg audio mux exited with %d: %s"
+                % (proc.returncode, proc.stderr.decode("utf-8", "replace")[-2000:])
+            )
+        return output
+
+    def _has_preview_audio(self):
+        return (
+            self.audio_channels is not None
+            and os.path.exists(self.audio_path)
+            and os.path.getsize(self.audio_path) > 0
+        )
+
+    def _segment_paths(self):
+        # Tests and older callers may build a publisher without __init__.
+        if not hasattr(self, "segment_paths"):
+            self.segment_paths = []
+        return self.segment_paths
+
+    def _stitch_segments(self, segments):
+        """Stream-copy every finished segment into one growing preview MP4.
+
+        The segments all come from the same encoder settings and the same
+        resized geometry, so the concat demuxer can copy them without
+        re-encoding. Each stitch writes a fresh filename: the browser may still
+        be streaming the previous one, and on Windows overwriting a file that is
+        open for reading fails.
+        """
+        if not segments:
+            return None
+        ffmpeg = resolve_ffmpeg(self.ffmpeg_location)
+        listing = os.path.join(self.temp_root, "completed_segments.txt")
+        with open(listing, "w", encoding="utf-8") as handle:
+            for segment in segments:
+                escaped = segment.replace("\\", "/").replace("'", r"'\''")
+                handle.write("file '%s'\n" % escaped)
+
+        self.stitch_index = int(getattr(self, "stitch_index", 0)) + 1
+        output = os.path.join(
+            self.temp_root,
+            "completed_all_%06d.mp4" % self.stitch_index,
+        )
+        # FFmpeg picks the muxer from the extension, so the in-progress name has
+        # to keep ".mp4" last.
+        partial = output[: -len(".mp4")] + ".partial.mp4"
+        args = [
+            ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error",
+            "-f", "concat", "-safe", "0", "-i", listing,
+            "-c", "copy", "-movflags", "+faststart", "-y", partial,
+        ]
+        proc = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if proc.returncode != 0:
+            try:
+                os.remove(partial)
+            except OSError:
+                pass
+            raise RuntimeError(
+                "ffmpeg concat exited with %d: %s"
+                % (proc.returncode, proc.stderr.decode("utf-8", "replace")[-2000:])
+            )
+
+        # One AAC encode over the whole accumulated track, so the pane's audio
+        # lines up with its video at every chunk instead of drifting.
+        if self._has_preview_audio():
+            sounded = output[: -len(".mp4")] + ".sound.mp4"
+            try:
+                self._mux_stitched_audio(ffmpeg, partial, sounded)
+                os.replace(sounded, partial)
+            except Exception as exc:
+                logging.warning(
+                    "%s stitched preview audio failed; staying silent: %s",
+                    LOG,
+                    exc,
+                )
+                try:
+                    os.remove(sounded)
+                except OSError:
+                    pass
+        os.replace(partial, output)
+
+        previous = getattr(self, "stitched_path", None)
+        self.stitched_path = output
+        if previous and previous != output:
+            try:
+                os.remove(previous)
+            except OSError:
+                # The browser can still hold the old file open; it is temp data.
+                pass
+        return output
+
+    def _write_animation(self, path, images, *, fps=None):
         """Write an animated GIF; GIF support is mandatory in Pillow."""
         if not images:
             raise ValueError("preview produced no images")
         images = [image.convert("RGB") for image in images]
         partial = path + ".tmp"
-        duration = max(20, round(1000 / max(1, self.fps)))
+        # Browsers clamp anything under ~20 ms up to 100 ms, so never ask for it.
+        duration = max(20, round(1000 / max(1, int(fps or self.fps))))
         images[0].save(
             partial,
             format="GIF",
@@ -666,7 +938,14 @@ def _emit_chunk_with_preview(
     publisher = current_publisher()
     if publisher is not None:
         try:
-            publisher.publish_completed_chunk(
+            # With audio the caller publishes once the waveform is decoded; see
+            # LongFormPreviewPublisher.stage_completed_chunk.
+            publish = (
+                publisher.stage_completed_chunk
+                if getattr(publisher, "audio_expected", False)
+                else publisher.publish_completed_chunk
+            )
+            publish(
                 chunk_index=index,
                 frames_u8=frames_u8,
                 completed_frames=written + take,

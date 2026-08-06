@@ -15,10 +15,16 @@ import os
 import torch
 
 from .. import harness
-from ..geometry import AUDIO_LATENT_FPS, HarnessGeometry, latent_frame_spans
+from ..geometry import (
+    AUDIO_LATENT_FPS,
+    HarnessGeometry,
+    aligned_overlap_frames,
+    audio_boundary_is_exact,
+    latent_frame_spans,
+)
 from ..layout_ops import TargetAlignedCondition
 from ..model_patch import patch_target_conditions
-from . import reference_runner
+from . import preview, reference_runner
 from .audio_conditions import (
     TargetAlignedAudioCondition,
     patch_target_audio_conditions,
@@ -46,6 +52,39 @@ def audio_latent_boundary(
     """Audio-latent boundary matching H3 target construction."""
 
     return round(int(frame_index) / float(fps) * int(audio_latent_fps))
+
+
+def resolve_audio_aligned_overlap(chunk_frames, overlap_frames, enabled, fps=24):
+    """Snap the overlap onto the shared video/audio grid when asked.
+
+    Returns ``(overlap_frames, note)``; ``note`` is None when nothing moved.
+    Callers log the note, because silently changing a profile also changes the
+    generated result and which run directories can be resumed.
+    """
+    if not enabled:
+        if not audio_boundary_is_exact(int(chunk_frames) - int(overlap_frames), fps=fps):
+            return int(overlap_frames), (
+                "audio carry is off-grid for C=%d O=%d (stride %d): the carry "
+                "rounds to the nearest audio latent, up to 8.3 ms out of step "
+                "with the video. Enable align_audio_chunks to correct it."
+                % (chunk_frames, overlap_frames, int(chunk_frames) - int(overlap_frames))
+            )
+        return int(overlap_frames), None
+
+    aligned = aligned_overlap_frames(chunk_frames, overlap_frames, fps=fps)
+    if aligned == int(overlap_frames):
+        return aligned, None
+    return aligned, (
+        "align_audio_chunks: overlap %d -> %d (stride %d -> %d) so the audio "
+        "carry lands on a whole latent; this changes the generated result and "
+        "starts a different run directory"
+        % (
+            overlap_frames,
+            aligned,
+            int(chunk_frames) - int(overlap_frames),
+            int(chunk_frames) - aligned,
+        )
+    )
 
 
 def audio_overlap_slice(geometry):
@@ -268,6 +307,27 @@ def _sample_and_write_av(
             ffmpeg_location=ffmpeg_location,
         ).open()
 
+    def _publish_preview_chunk(waveform, sample_rate):
+        """Release the chunk the live preview staged inside _emit_chunk.
+
+        Preview failures never touch the real output, so this swallows its own
+        errors rather than aborting a run that is otherwise fine.
+        """
+        publisher = preview.current_publisher()
+        if publisher is None:
+            return
+        try:
+            publisher.flush_completed_chunk(
+                waveform=waveform, sample_rate=sample_rate
+            )
+        except Exception as exc:
+            logging.warning(
+                "%s completed preview publish failed: %s: %s",
+                LOG,
+                type(exc).__name__,
+                exc,
+            )
+
     def emit(index, video_latent, audio_latent):
         nonlocal audio_writer
         take_frames = self._emit_chunk(
@@ -322,9 +382,16 @@ def _sample_and_write_av(
                         take_frames,
                     )
                 )
-            audio_writer.write(waveform[..., :take_samples])
+            committed = waveform[..., :take_samples]
+            audio_writer.write(committed)
             state["audio_samples"] += take_samples
-            del waveform
+            # The live preview staged this chunk's frames inside _emit_chunk and
+            # is waiting for exactly these samples, so its segment carries the
+            # same audio the final mux will.
+            _publish_preview_chunk(committed, sample_rate)
+            del waveform, committed
+        else:
+            _publish_preview_chunk(None, None)
 
         state["frames"] += take_frames
 

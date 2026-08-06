@@ -97,6 +97,48 @@ def find_exact_overlap_slice(latent_t, stride_frames, overlap_frames):
     return latent_start, latent_count
 
 
+def audio_boundary_is_exact(stride_frames, fps=FPS, audio_latent_fps=AUDIO_LATENT_FPS):
+    """Whether a chunk boundary lands on a whole audio latent position.
+
+    Video frames are 1/24 s and audio latents 1/40 s, so the two grids only
+    coincide every three frames. On a stride that misses, the audio carry slice
+    rounds to the nearest latent and the model is handed a continuation that is
+    up to a third of a latent (8.3 ms) out of step with its own video, while the
+    video carry stays exact. Nothing downstream detects that.
+    """
+    return (int(stride_frames) * int(audio_latent_fps)) % int(fps) == 0
+
+
+def aligned_overlap_frames(chunk_frames, overlap_frames, fps=FPS):
+    """Nearest overlap that is exact on the video *and* audio grids.
+
+    Returns the requested overlap unchanged when it already aligns. Ties prefer
+    the larger overlap: more carried context is the safer direction to move a
+    profile that the caller asked to have corrected.
+    """
+    chunk_frames = int(chunk_frames)
+    overlap_frames = int(overlap_frames)
+    candidates = []
+    for candidate in range(1, chunk_frames):
+        stride = chunk_frames - candidate
+        if stride < 1 or not audio_boundary_is_exact(stride, fps=fps):
+            continue
+        try:
+            find_exact_overlap_slice(
+                video_latent_t(chunk_frames), stride, candidate
+            )
+        except UnalignedProfileError:
+            continue
+        candidates.append(candidate)
+    if not candidates:
+        raise UnalignedProfileError(
+            "no overlap aligns video and audio for chunk_frames=%d" % chunk_frames
+        )
+    if overlap_frames in candidates:
+        return overlap_frames
+    return min(candidates, key=lambda c: (abs(c - overlap_frames), -c))
+
+
 def _boundaries(spans):
     out, cumulative = [], 0
     for span in spans:

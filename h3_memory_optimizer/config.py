@@ -51,6 +51,7 @@ class MemoryOptimizerConfig:
     block_cache_threshold: float = 0.08
     block_cache_warmup_steps: int = 3
     block_cache_strict: bool = False
+    block_cache_report_directory: str = ""
 
     def __post_init__(self):
         if self.attention not in ATTENTION_MODES:
@@ -126,4 +127,5 @@ class MemoryOptimizerConfig:
             threshold=float(self.block_cache_threshold),
             warmup_steps=int(self.block_cache_warmup_steps),
             strict=bool(self.block_cache_strict),
+            report_directory=str(self.block_cache_report_directory or ""),
         )

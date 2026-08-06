@@ -12,6 +12,7 @@ from dataclasses import dataclass
 import logging
 import math
 import threading
+import time
 from typing import Any, Iterable
 
 import torch
@@ -168,7 +169,7 @@ class H3RuntimeSession:
         self._outer_local.token = token
         return token
 
-    def end_outer_request(self, token):
+    def end_outer_request(self, token, seconds=None):
         depth = int(getattr(self._outer_local, "depth", 0))
         if depth > 1:
             self._outer_local.depth = depth - 1
@@ -179,6 +180,18 @@ class H3RuntimeSession:
             if self._active_outer_token == token:
                 self._active_outer_token = None
                 self._explicit_layout_pending = False
+            request_id = self.request_id
+            listeners = tuple(self.listeners)
+        for listener in listeners:
+            callback = getattr(listener, "on_request_end", None)
+            if callback is None:
+                continue
+            try:
+                callback(request_id, seconds)
+            except Exception:
+                logging.warning(
+                    "%s request-end listener failed", LOG_PREFIX, exc_info=True
+                )
 
     def observe(self, x, timestep, context, transformer_options, payload=None):
         payload = payload or {}
@@ -273,10 +286,11 @@ def get_runtime_snapshot(transformer_options):
 def make_outer_wrapper(session):
     def wrapper(executor, *args, **kwargs):
         token = session.begin_outer_request()
+        started = time.perf_counter()
         try:
             return executor(*args, **kwargs)
         finally:
-            session.end_outer_request(token)
+            session.end_outer_request(token, time.perf_counter() - started)
     return wrapper
 
 
