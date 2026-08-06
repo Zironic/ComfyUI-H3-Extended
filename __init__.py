@@ -11,6 +11,7 @@ from .chunked_ref2v.longform.preview_nodes import (
 from .chunked_ref2v.longform.reference_preview_nodes import (
     MiniMaxH3LongFormReferencePreviewExtension,
 )
+from .chunked_ref2v.longform import v2v_audio_runtime
 from .chunked_ref2v.nodes import MiniMaxH3HarnessExtension
 from . import cond_cache_diagnostics
 from .h3_activation_memory.nodes import MiniMaxH3ActivationMemoryExtension
@@ -23,6 +24,12 @@ from .h3_probe.nodes import MiniMaxH3ProbeExtension
 # two independent live preview panes because the standard progress protocol
 # carries only one replaceable preview image.
 WEB_DIRECTORY = "./web"
+
+# The preview module patches the original Ref2V sampling seam first. Install the
+# audiovisual runtime afterwards so it retains those preview callbacks while
+# replacing the duplicated video-only sampler with synchronized video+audio
+# carry, source-audio conditioning, and dual-track output.
+v2v_audio_runtime.install()
 
 # Install the diagnostic wrapper at `cond_cache.encode` itself. Rebinding only
 # `nodes_minimax_h3.encode_conditioning` covered the (Zi) nodes but silently
