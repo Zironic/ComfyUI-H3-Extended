@@ -9,6 +9,12 @@ from . import mask as mask_ops
 from .config import THRESHOLD_SWEEP
 
 
+# How often the progress write also checkpoints mask.npz. Every step is
+# quadratic and unaffordable; never is one hard kill away from losing the raw
+# maps of a 25-minute run.
+ARRAY_CHECKPOINT_EVERY = 10
+
+
 def _pct(x):
     return "  n/a " if x is None else "%5.1f%%" % (100.0 * x)
 
@@ -70,7 +76,13 @@ def _policy_sweep(run):
     return out
 
 
-def aggregate(run):
+def aggregate(run, include_policy_sweep=True):
+    """Summarise a run.
+
+    ``include_policy_sweep`` rebuilds every mask at all 17 swept thresholds, which
+    is by far the most expensive part of this function. Progress writes during
+    sampling pass ``False``; the closing write keeps the default.
+    """
     steps = run.steps
     if not steps:
         return None
@@ -119,16 +131,19 @@ def aggregate(run):
                          if run.union_mask is not None else None),
         "final": run.final,
         "threshold_sweep": sweep,
-        "policy_sweep": _policy_sweep(run),
+        "policy_sweep": _policy_sweep(run) if include_policy_sweep else None,
     }
 
 
-def render(run, summary):
+def render(run, summary, complete=True):
     cfg = run.config
     layout = run.layout
     lines = [
         "MiniMax H3 masked Ref2V - measurement - %s" % run.tag,
         "=" * 78,
+        "status:      %s" % ("complete" if complete else
+                             "RUNNING - partial snapshot, %d prediction%s so far"
+                             % (len(run.steps), "" if len(run.steps) == 1 else "s")),
         "mode:        %s (strict=%s)" % (cfg.mode, cfg.strict),
         "source:      %s" % (run.source.describe() if run.source else "n/a"),
         "layout:      %s" % (layout.describe() if layout else "n/a"),
@@ -188,14 +203,17 @@ def render(run, summary):
                 row["threshold"], _pct(row["active_core_mean"]), _pct(row["active_core_max"]),
                 _pct(row["active_expanded_mean"]), _pct(row["active_expanded_max"])))
 
-        lines.extend(["", "  FROZEN POLICY SWEEP",
-                      "    threshold  guided mean  frozen  later escape  final active  final escape  excess missed"])
-        for row in summary["policy_sweep"]:
-            lines.append("    %9.4g  %s     %s   %s       %s      %s       %s" % (
-                row["threshold"], _pct(row["guided_active_mean"]),
-                _pct(row["frozen_active"]), _pct(row["later_escaped_max"]),
-                _pct(row["final_active"]), _pct(row["final_escaped"]),
-                _pct(row["final_missed_excess_mass"])))
+        if summary["policy_sweep"]:
+            lines.extend(["", "  FROZEN POLICY SWEEP",
+                          "    threshold  guided mean  frozen  later escape  final active  final escape  excess missed"])
+            for row in summary["policy_sweep"]:
+                lines.append("    %9.4g  %s     %s   %s       %s      %s       %s" % (
+                    row["threshold"], _pct(row["guided_active_mean"]),
+                    _pct(row["frozen_active"]), _pct(row["later_escaped_max"]),
+                    _pct(row["final_active"]), _pct(row["final_escaped"]),
+                    _pct(row["final_missed_excess_mass"])))
+        else:
+            lines.extend(["", "  FROZEN POLICY SWEEP: deferred to the closing write"])
         lines.append("")
 
     lines.extend(["PER GUIDED PREDICTION", "-" * 78,
@@ -215,17 +233,37 @@ def render(run, summary):
     return "\n".join(lines)
 
 
-def write_run(run):
+def write_run(run, complete=True, arrays=None):
+    """Persist a run.
+
+    ``complete=False`` is the progress write made after each guided prediction:
+    it refreshes report.txt/summary.json/steps.jsonl and skips the two costly
+    parts - the policy sweep and recompressing the whole array set. Rewriting
+    mask.npz on every step is quadratic in step count and lands on the sampling
+    thread (~1 s and ~25 MB per write on a 42-frame clip).
+
+    ``arrays`` controls mask.npz independently, defaulting to ``complete``.
+    The observer checkpoints the arrays every ``ARRAY_CHECKPOINT_EVERY``
+    predictions so a hard process kill cannot destroy a long run's raw maps -
+    an ordinary exception cannot, because session.end() writes from a finally.
+
+    Consumers must treat a directory as finished only when ``status`` is
+    ``"complete"`` in summary.json. mask.npz may exist for a run still in
+    flight, holding only the predictions observed at the last checkpoint.
+    """
     if not run.steps and run.disabled_reason is None and run.final is None:
         return None
+    if arrays is None:
+        arrays = complete
     os.makedirs(run.out_dir, exist_ok=True)
-    summary = aggregate(run)
+    summary = aggregate(run, include_policy_sweep=complete)
 
     report_path = os.path.join(run.out_dir, "report.txt")
     with open(report_path, "w", encoding="utf-8") as f:
-        f.write(render(run, summary))
+        f.write(render(run, summary, complete))
 
     payload = {
+        "status": "complete" if complete else "running",
         "tag": run.tag,
         "config": run.config.as_dict(),
         "layout": run.layout.as_dict() if run.layout else None,
@@ -247,22 +285,26 @@ def write_run(run):
         for s in run.steps:
             f.write(json.dumps(s) + "\n")
 
-    arrays = {}
+    if not arrays:
+        return report_path
+
+    out = {}
     for label, x in run.score_maps:
-        arrays["score_" + label] = x.numpy().astype(np.float32)
+        out["score_" + label] = x.numpy().astype(np.float32)
     for label, x in run.error_maps:
-        arrays["error_rms_" + label] = x.numpy().astype(np.float32)
+        out["error_rms_" + label] = x.numpy().astype(np.float32)
     for label, x in run.source_maps:
-        arrays["source_rms_" + label] = x.numpy().astype(np.float32)
+        out["source_rms_" + label] = x.numpy().astype(np.float32)
     for label, x in run.saliency_maps:
-        arrays["saliency_" + label] = x.numpy().astype(np.float32)
+        out["saliency_" + label] = x.numpy().astype(np.float32)
     for label, x in run.masks:
-        arrays["mask_" + label] = x.numpy()
+        out["mask_" + label] = x.numpy()
     if run.union_mask is not None:
-        arrays["mask_union"] = run.union_mask.detach().cpu().numpy()
+        out["mask_union"] = run.union_mask.detach().cpu().numpy()
     if run.frozen_mask is not None:
-        arrays["mask_frozen"] = run.frozen_mask.detach().cpu().numpy()
-    arrays["index"] = np.array(json.dumps({
+        out["mask_frozen"] = run.frozen_mask.detach().cpu().numpy()
+    out["index"] = np.array(json.dumps({
+        "status": "complete" if complete else "running",
         "tag": run.tag,
         "config": run.config.as_dict(),
         "video_shape": list(run.layout.video_shape) if run.layout else None,
@@ -270,5 +312,5 @@ def write_run(run):
                    "source_kind": s.get("source_kind")} for i, s in enumerate(run.steps)],
         "has_final": run.final is not None,
     }))
-    np.savez_compressed(os.path.join(run.out_dir, "mask.npz"), **arrays)
+    np.savez_compressed(os.path.join(run.out_dir, "mask.npz"), **out)
     return report_path

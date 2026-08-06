@@ -54,10 +54,19 @@ class MiniMaxH3LongFormRef2V(io.ComfyNode):
                 io.Int.Input("output_seconds", default=180, min=1, max=3600,
                              tooltip="Exact output duration at 24 fps."),
                 io.Int.Input("chunk_frames", default=90, min=22, max=362, step=17),
-                io.Int.Input("overlap_frames", default=22, min=5, max=180),
+                io.Int.Input("overlap_frames", default=4, min=4, max=180,
+                             tooltip=("Source overlap, and the only compute knob: "
+                                      "asymptotic overhead is O/(C-O), so O=4 costs "
+                                      "4.7% over monolithic and O=22 costs 32.4%. "
+                                      "H3 packs 4 frames per latent, so O=4 carries "
+                                      "exactly one latent position - measured "
+                                      "sufficient for full coherence. Legal values "
+                                      "are quantized by the 17-frame grid: 4, 5, 9, "
+                                      "13, 17, 21, 22, 26...; anything else raises "
+                                      "UnalignedProfileError.")),
                 io.Combo.Input("carry", options=list(runner.CARRY_MODES),
                                default="direct_latent_overlap"),
-                io.Combo.Input("ref_image_size", options=["match", "max"], default="match"),
+                io.Combo.Input("ref_image_size", options=["native", "match", "max"], default="native"),
                 io.Combo.Input("cond_cache", options=list(COND_CACHE_MODES), default="auto"),
                 io.Combo.Input("attention", options=list(memory.ATTENTION_MODES), default="auto"),
                 io.Combo.Input("activation", options=list(memory.ACTIVATION_MODES),
@@ -88,8 +97,8 @@ class MiniMaxH3LongFormRef2V(io.ComfyNode):
     @classmethod
     def execute(cls, model, clip, video_vae, audio_vae, video_path, prompt,
                 sampler, sigmas, seed, start_frame=0, output_seconds=180,
-                chunk_frames=90, overlap_frames=22, carry="direct_latent_overlap",
-                ref_image_size="match", cond_cache="auto", attention="auto",
+                chunk_frames=90, overlap_frames=4, carry="direct_latent_overlap",
+                ref_image_size="native", cond_cache="auto", attention="auto",
                 activation="mlp_chunked_native", width=0, height=0,
                 run_directory="", ffmpeg_location="", output_video=True,
                 preserve_source_audio=True, save_frames=False,
@@ -181,8 +190,46 @@ class MiniMaxH3LongFormRef2V(io.ComfyNode):
             "runtime   %s" % memory.describe(memory_status),
             "run dir   %s" % root,
         ])
-        preview = _preview(os.path.join(root, "frames"))
+        preview = None
+        if save_frames:
+            preview = _preview(os.path.join(root, "frames"))
+        if preview is None and summary["output_path"]:
+            preview = _preview_from_video(
+                summary["output_path"], ffmpeg_location=ffmpeg_location.strip() or None)
+        if preview is None:
+            preview = torch.zeros(1, 64, 64, 3)
         return io.NodeOutput(preview, root, summary["output_path"], report)
+
+
+def _preview_from_video(video_path, limit=48, ffmpeg_location=None):
+    """Sample the written video so the preview works without `save_frames`.
+
+    `save_frames` defaults off - a PNG per frame is a diagnostic, not something
+    a normal run should pay for - so without this the node's only visual output
+    is a black square. Reads a bounded, evenly spaced sample straight from the
+    file rather than the whole thing, which is the point of the node.
+    """
+    from .frame_source import probe as probe_video, read_window
+
+    try:
+        meta = probe_video(video_path)
+        total = meta.estimated_frames or 0
+        if total <= 0:
+            return None
+        step = max(1, total // limit)
+        out = []
+        for index in range(0, min(total, step * limit), step):
+            try:
+                out.append(read_window(video_path, index, 1,
+                                       ffmpeg_location=ffmpeg_location)[0])
+            except Exception:
+                break
+        if not out:
+            return None
+        return torch.stack(out)
+    except Exception as exc:
+        logging.warning("%s preview unavailable: %s", LOG, exc)
+        return None
 
 
 def _preview(frames_dir, limit=48, width=384):

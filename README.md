@@ -69,6 +69,36 @@ card is most of the point, not just a time saving.
 | `off` | bypass entirely, neither read nor write |
 | `refresh` | ignore any stored entry, re-encode, overwrite |
 
+## The VAE pass is cached too
+
+The conditioning key is built from the tokenizer presentation, which is
+assembled *alongside* the reference latents — so consulting it happens after
+every reference has already been through the VAE. A conditioning hit still paid
+for the whole VAE pass, and the reference latents were never cached at all,
+because they travel to the DiT as `minimax_refs` rather than as part of the
+encoder output.
+
+[`latent_cache.py`](latent_cache.py) moves that check in front of the work:
+hash the resized pixels, and on a hit skip both the encode and staging the
+~5 GB video VAE onto the card. Every `vae.encode` on the reference path goes
+through it — the `(Zi)` nodes, `chunked_ref2v/ref_builder.py`, and the harness's
+phase-D anchor re-encode — keyed on the pixels plus the VAE file's
+identity, and controlled by the same `cond_cache` widget.
+
+This is only sound because the H3 VAEs are deterministic:
+`MiniMaxH3VideoVAE.encode` returns `torch.chunk(moments, 2)[0]`, the posterior
+mean, and the audio VAE documents the same. Neither samples, so a cached latent
+is the value a re-encode *would* have produced rather than an equally valid
+draw. A VAE that sampled could not be cached this way without changing what the
+node means.
+
+Entries share the conditioning cache's folder, marker and janitor, and are small
+beside it — roughly 80 KB for a reference image and 2 MB for a 73-frame clip,
+against ~40 MB for the Qwen hidden states.
+
+`H3_LATENT_CACHE_DISABLE=1` turns this off alone; `H3_COND_CACHE_DISABLE=1`
+turns off both.
+
 ## Identifying the text encoder without hashing 14.6 GB
 
 Core's loaders record how to rebuild a patcher in `cached_patcher_init`, which
@@ -656,6 +686,8 @@ python custom_nodes/ComfyUI-H3-Extended/tests/test_probe.py
 python custom_nodes/ComfyUI-H3-Extended/tests/test_attention_backend.py
 python custom_nodes/ComfyUI-H3-Extended/tests/test_vram_guard.py
 python custom_nodes/ComfyUI-H3-Extended/tests/test_cond_cache.py
+python custom_nodes/ComfyUI-H3-Extended/tests/test_cond_cache_diagnostics.py
+python custom_nodes/ComfyUI-H3-Extended/tests/test_latent_cache.py
 python custom_nodes/ComfyUI-H3-Extended/tests/test_chunked_ref2v.py
 python custom_nodes/ComfyUI-H3-Extended/tests/test_masked_cache.py
 ```

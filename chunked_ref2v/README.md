@@ -360,3 +360,104 @@ first run.
 If both single-frame arms are ignored, test `frame_direct_prompted` before
 building anything else. If either works, run `aligned_overlap_direct` before
 investing in the Qwen-visible or sampler-clamped alternatives.
+
+## Long-form result (2026-08-06) — carry is required
+
+First multi-boundary test. Three carry arms over the same window, C=90/O=22/S=68,
+**7 chunks = 480 frames (20 s)**, 608x320 (0.2 MP), seed 1, `res_multistep` /
+`simple` / **15 steps**, models loaded once for all three arms. 40.2 min total.
+Artifacts in `Output/h3_longform/20260806_070129_3arm_c90/<arm>/output/final.mp4`.
+
+| arm | carried into chunk i | wall | verdict |
+|---|---|---|---|
+| `direct_latent_overlap` | 7 latent positions (`20:27`) | 14.6 min | fully coherent |
+| `direct_latent_frame` | 1 latent position (`20`) | 12.9 min | fully coherent |
+| `none` | nothing | 12.7 min | **fails** — reads as unrelated clips spliced together |
+
+**The source video reference alone does not hold a long-form edit together.**
+Every chunk in `none` still received its own source-chunk reference and the same
+static reference images, and the chunks still overlapped by 22 source frames —
+`none` removes only the *generated* state. That is enough to destroy continuity
+across six boundaries.
+
+Two consequences:
+
+- Carry is not an optimization, it is load-bearing. Chunked Ref2V without it is
+  not a viable technique at any length beyond a single boundary.
+- **Chunks cannot be generated in parallel.** `none` was the only arm whose
+  chunk *i* did not depend on chunk *i-1*, so the parallel-generation idea dies
+  with it.
+
+This overturns the Stage 0 reading in which `baseline_none` scored best. That
+run had **one** boundary and a known prompt-corruption; a single boundary does
+not exercise the question. Treat the old `none` number as void.
+
+`frame` and `overlap` are not yet separated — both look coherent, and `frame`
+carries one seventh as much state for 1.7 min less. Separating them needs a
+harder case than this clip, not a longer one.
+
+### O=4 (2026-08-06) — the overlap tax was almost entirely waste
+
+`C=90 O=4 S=86`, overlap latent `[26:27]`, 6 chunks, 480 frames, same clip /
+prompt / refs / seed / 15 steps as above. **12.3 min** against 14.6 min for the
+O=22 arm at identical output length. **Fully coherent.**
+
+**O in frames is not O in latents.** H3 compresses 4 frames per latent token, so
+a 4-frame overlap contains exactly *one* latent position. `direct_latent_overlap`
+at O=4 therefore already carries everything the overlap holds - nothing is
+discarded, and carrying "more" requires widening O itself:
+
+| O frames | latent positions | asymptotic overhead `O/(C-O)` |
+|---|---|---|
+| 4 | 1 | **4.7%** |
+| 5 | 2 | 5.9% |
+| 9 | 3 | 11.1% |
+| 13 | 4 | 16.9% |
+| 22 | 7 | 32.4% |
+
+Legal O values are quantized by the 17-frame grid: 4, 5, 9, 13, 17, 21, 22, 26...
+O=4 is the floor; O=1 does not exist.
+
+So **one latent position at the chunk boundary is sufficient**, and chunked Ref2V
+costs ~5% over monolithic rather than ~32%. The frame-vs-overlap question at O=22
+was the wrong axis: carry width does not change compute at all, only O does.
+
+### Reference images are sized wrong for low canvases
+
+`ref_image_size="match"` scales references to the *output canvas* pixel budget.
+At 608x320 that encoded a 3000x1462 identity reference down to **640x320**, and
+the two references together were 395 of 12479 sequence rows - 3.2%. Outfit and
+tattoo likeness were visibly poor because the model could not resolve them.
+
+A reference is conditioning: the resolution it needs depends on the detail it
+must carry, not on the output size. Coupling the two is pathological at test
+canvases. Cost of decoupling is small:
+
+| short edge | jinx encoded | added rows | seq cost |
+|---|---|---|---|
+| match | 640x320 | - | - |
+| 512 | 1056x512 | +421 | **+3%** |
+| 768 | 1568x768 | +1429 | +11% |
+| max (2048) | 3008x1472 | +5483 | +44% |
+
+`max` clamps at native resolution and is poor value. A configurable short edge
+defaulting near 512-768 is the fix; `ref_builder` currently exposes only the two
+modes.
+
+### Settled configuration (2026-08-06)
+
+`C=90 O=4 S=86`, `carry=direct_latent_overlap`, `ref_image_size=native`. Fully
+coherent over 6 chunks with good outfit and tattoo likeness. 14.0 min for 480
+frames at 0.2 MP / 15 steps. These are now the node defaults.
+
+`native` reference sizing reproduces what the production workflows already did by
+hand: resize to the model's own canvas first, then `max` - which is inert
+afterwards, because `2048 / 768` clamps to 1.0. The resize was doing all the
+work, and `match` had been undoing it.
+
+**Reference resolution has a second-order cost through the text encoder.** Going
+`match` -> `native` added 1243 reference rows as predicted, but total sequence
+went 12479 -> 15155 (+21%), because `text` grew 1524 -> 2767: Qwen emits more
+tokens once it can actually resolve the images it is describing. Wall time went
+12.3 -> 14.0 min (+14%). A rows-only estimate understates the true cost by about
+half.

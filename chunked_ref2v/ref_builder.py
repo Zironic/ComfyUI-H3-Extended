@@ -59,15 +59,35 @@ def pin_canvas(source_frames, width=0, height=0):
 
 
 def encode_image_ref(vae, image, canvas, ref_image_size="match", cond_cache="auto"):
-    """A static image reference, at `match` or `max` sizing."""
+    """A static image reference, at `native`, `match` or `max` sizing.
+
+    `native` sizes the reference on the model's own canvas (768 short edge,
+    768x1344 area cap) and ignores the target canvas entirely. That is what the
+    production workflows do - resize to the native canvas first, then `max`,
+    which is inert afterwards because `2048 / 768` clamps to 1.0.
+
+    `match` ties reference resolution to the *output* canvas, which is wrong for
+    a reference: how much resolution a reference needs depends on the detail it
+    must convey, not on how large the output is. At the 0.2 MP test canvas that
+    coupling encoded a 3000x1462 six-view character turnaround down to 640x320 -
+    roughly 107 px per figure - and outfit and tattoo likeness were unrecoverable
+    by prompting because the model could not resolve them. Faces survived only
+    because the other reference was already a tight portrait.
+
+    Prefer `native` unless the reference genuinely shares the target's framing.
+    """
     h, w = image.shape[1], image.shape[2]
     width, height = canvas
-    if ref_image_size == "match":
+    if ref_image_size == "native":
+        tw, th = adapt_canvas(w, h)
+        scale = None
+    elif ref_image_size == "match":
         scale = min(1.0, math.sqrt((width * height) / (w * h)))
     else:
         scale = min(1.0, REF_IMAGE_SHORT_EDGE / min(w, h))
-    tw = max(CANVAS_MULTIPLE, round(w * scale / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
-    th = max(CANVAS_MULTIPLE, round(h * scale / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
+    if scale is not None:
+        tw = max(CANVAS_MULTIPLE, round(w * scale / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
+        th = max(CANVAS_MULTIPLE, round(h * scale / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
     resized = resize(image[:1], tw, th)
     latent = latent_cache.encode(vae, resized, mode=cond_cache, label='ref image')
     item = {"type": "image", "data": resized}

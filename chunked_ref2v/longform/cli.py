@@ -267,11 +267,17 @@ def main(argv=None):
 
     geometry = HarnessGeometry(chunk_frames=args.chunk,
                                overlap_frames=args.overlap).validate()
+    # `target_frames` is the exact output length; `chunk_count` is how many
+    # chunks cover it. Deriving one from the other keeps the last chunk from
+    # silently extending the run past what was asked for.
     if args.chunks:
         chunk_count = args.chunks
+        target_frames = ((chunk_count - 1) * geometry.stride_frames
+                         + geometry.chunk_frames)
     else:
-        chunk_count = chunk_count_for(int(args.seconds * geometry.fps),
-                                      geometry.chunk_frames, geometry.stride_frames)
+        target_frames = int(args.seconds * geometry.fps)
+        chunk_count = chunk_count_for(target_frames, geometry.chunk_frames,
+                                      geometry.stride_frames)
     needed = frames_needed_for(chunk_count, geometry.chunk_frames,
                                geometry.stride_frames)
 
@@ -326,7 +332,8 @@ def main(argv=None):
     summary = runner.run(
         video_path=args.video, start_frame=args.start_frame,
         chunk_frames=args.chunk, overlap_frames=args.overlap,
-        chunk_count=chunk_count, model=model, clip=clip, video_vae=video_vae,
+        chunk_count=chunk_count, target_frames=target_frames,
+        model=model, clip=clip, video_vae=video_vae,
         audio_vae=audio_vae, prompt=prompt, sampler=sampler, sigmas=sigmas,
         seed=args.seed, carry=args.carry, canvas=canvas, root=root,
         ref_images=load_ref_images(args.ref_image),

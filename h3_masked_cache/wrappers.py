@@ -6,6 +6,7 @@ wrapper also scores the final sampled latent, which is the Stage-0 ground truth.
 """
 
 import logging
+import time
 
 import torch
 import comfy.utils
@@ -158,7 +159,12 @@ def make_diffusion_wrapper(session):
             run.disable(reason)
             return executor(*args, **kwargs)
 
+        # Timed so the report carries a dense baseline to compare any future
+        # compact execution against. Accumulated because CFG calls the DiT more
+        # than once per sigma; record_step consumes and clears it.
+        _t0 = time.perf_counter()
         out = executor(*args, **kwargs)
+        run.pending_dense_wall_s += time.perf_counter() - _t0
 
         # CPU self-tests and direct wrapper users do not pass through Comfy's
         # sampler/post-CFG path. Preserve a conditional raw-output fallback only
@@ -213,8 +219,12 @@ def make_post_cfg_observer(session):
                 ", J=%.3f vs previous" % row["jaccard_prev"],
                 session.config.score_threshold)
             try:
-                from .report import write_run
-                write_run(run)
+                # Progress snapshot: no policy sweep, and the arrays only every
+                # ARRAY_CHECKPOINT_EVERY predictions. session.end() writes the
+                # full set and flips status to "complete".
+                from .report import ARRAY_CHECKPOINT_EVERY, write_run
+                write_run(run, complete=False,
+                          arrays=len(run.steps) % ARRAY_CHECKPOINT_EVERY == 0)
             except Exception:
                 logging.exception("%s incremental report write failed", LOG_PREFIX)
         except MeasurementUnavailable as exc:

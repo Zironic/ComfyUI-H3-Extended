@@ -435,6 +435,71 @@ def test_report(tmp):
     text = open(path, encoding="utf-8").read()
     check("THRESHOLD SWEEP" in text and "MiniMax H3 masked Ref2V" in text,
           "report.txt renders the sweep")
+    check("status:      complete" in text, "a finished report is labelled complete")
+
+
+def test_progress_write(tmp):
+    """A run in flight must be distinguishable from a finished one, and the
+    per-step write must not rebuild the arrays or the policy sweep."""
+    print("progress writes and completion status")
+    import numpy as np
+
+    src = make_source()
+    out = os.path.join(tmp, "progress")
+    session, run, _ = _drive({"refs": [video_block(src)]}, out_dir=out)
+    npz = os.path.join(run.out_dir, "mask.npz")
+
+    report_mod.write_run(run, complete=False)
+    with open(os.path.join(run.out_dir, "summary.json"), encoding="utf-8") as f:
+        data = json.load(f)
+    check(data["status"] == "running", "a progress write is labelled running")
+    check(data["summary"]["policy_sweep"] is None,
+          "the progress write skips the costly policy sweep")
+    check(not os.path.exists(npz),
+          "the progress write does not recompress mask.npz")
+    check("RUNNING" in open(os.path.join(run.out_dir, "report.txt"),
+                            encoding="utf-8").read(),
+          "a partial report.txt says so in its header")
+
+    report_mod.write_run(run, complete=False, arrays=True)
+    check(os.path.exists(npz), "an array checkpoint preserves the raw maps mid-run")
+    with np.load(npz) as z:
+        check(json.loads(str(z["index"]))["status"] == "running",
+              "a checkpointed archive is labelled running, not complete")
+
+    session.end()
+    with open(os.path.join(run.out_dir, "summary.json"), encoding="utf-8") as f:
+        data = json.load(f)
+    check(data["status"] == "complete", "the closing write flips status to complete")
+    check(data["summary"]["policy_sweep"] is not None,
+          "the closing write carries the policy sweep")
+    with np.load(npz) as z:
+        check(json.loads(str(z["index"]))["status"] == "complete",
+              "the closing archive is labelled complete")
+
+
+def test_wall_times(tmp):
+    """The dense baseline any future compact execution has to beat."""
+    print("wall-clock accounting")
+    src = make_source()
+    _, run, _ = _drive({"refs": [video_block(src)]},
+                       out_dir=os.path.join(tmp, "timing"))
+
+    check(all(s["dense_wall_s"] is not None and s["dense_wall_s"] >= 0.0
+              for s in run.steps),
+          "every guided row carries the dense DiT wall time")
+    check(run.steps[0]["step_wall_s"] is None,
+          "step wall time is a delta, so the first observation has none")
+    check(run.steps[1]["step_wall_s"] is not None and run.steps[1]["step_wall_s"] >= 0.0,
+          "later observations carry the sync-accurate per-step wall time")
+    check(run.pending_dense_wall_s > 0.0,
+          "an unscored uncond forward leaves its time pending for the next prediction")
+
+    # ...and when the scored conditional branch is last, nothing is left over.
+    _, cond_only, _ = _drive({"refs": [video_block(src)]}, cond_and_uncond=False,
+                             out_dir=os.path.join(tmp, "timing_cond"))
+    check(cond_only.pending_dense_wall_s == 0.0,
+          "the accumulator is cleared once a prediction has consumed it")
 
 
 # --------------------------------------------------------------------------
@@ -483,6 +548,8 @@ def main():
         test_sigma_promotion()
         test_end_to_end(tmp)
         test_report(tmp)
+        test_progress_write(tmp)
+        test_wall_times(tmp)
         test_fail_closed(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

@@ -41,6 +41,13 @@ class MaskedCacheRun:
         self.sigma_count = 0
         self.disabled_reason = None
 
+        # Wall-clock accounting. `pending_dense_wall_s` accumulates the host-side
+        # time spent inside the DiT call(s) for the sigma currently in flight;
+        # `last_observed_at` is the previous post-CFG observation, which gives a
+        # device-accurate per-step figure because scoring forces a sync anyway.
+        self.pending_dense_wall_s = 0.0
+        self.last_observed_at = None
+
     def disable(self, reason):
         if self.disabled_reason is None:
             self.disabled_reason = reason
@@ -88,6 +95,8 @@ class MaskedCacheRun:
         self.frozen_mask = None
         self.prev_observed = None
         self.sample_sigmas_tensor = None
+        self.pending_dense_wall_s = 0.0
+        self.last_observed_at = None
         self.score_maps = []
         self.error_maps = []
         self.source_maps = []
@@ -128,10 +137,24 @@ class MaskedCacheSession:
             token_scores, cfg.score_threshold, cfg.tile_h, cfg.tile_w,
             cfg.spatial_halo, cfg.temporal_halo)
         frozen_before = run.frozen_mask
+
+        # The DiT time accumulated for this sigma, unless a caller timed it
+        # itself. Host-side around the model call, so it does not include work
+        # still queued on the device; `step_wall_s` below is the sync-accurate
+        # figure, since the scoring that follows forces a device sync.
+        now = time.time()
+        if dense_wall_s is None and run.pending_dense_wall_s > 0.0:
+            dense_wall_s = run.pending_dense_wall_s
+        run.pending_dense_wall_s = 0.0
+        step_wall_s = (None if run.last_observed_at is None
+                       else now - run.last_observed_at)
+        run.last_observed_at = now
+
         row = {
             "step": int(step), "sigma": float(sigma), "source_kind": source_kind,
             "cond_or_uncond": int(cond_or_uncond), "sigma_index": run.sigma_count - 1,
             "dense_wall_s": dense_wall_s,
+            "step_wall_s": step_wall_s,
             "score_quantiles": mask_ops.quantiles(token_scores, SCORE_QUANTILES),
             "saliency_quantiles": mask_ops.quantiles(mask_ops.spatial_saliency(token_scores), SCORE_QUANTILES),
             "threshold": cfg.score_threshold,
@@ -154,9 +177,12 @@ class MaskedCacheSession:
         run.error_maps.append((label, error_rms.detach().cpu().float()))
         run.source_maps.append((label, source_rms.detach().cpu().float()))
         run.saliency_maps.append((label, mask_ops.spatial_saliency(token_scores).detach().cpu().float()))
-        run.masks.append((label, expanded.detach().cpu()))
-        run.stage_mask(expanded)
-        run.prev_observed = expanded
+        # One CPU copy drives the stored mask, the running union and the next
+        # step's Jaccard, so those can never end up on different devices.
+        expanded_cpu = expanded.detach().cpu()
+        run.masks.append((label, expanded_cpu))
+        run.stage_mask(expanded_cpu)
+        run.prev_observed = expanded_cpu
         return row
 
     def record_final(self, run, token_scores, error_rms, source_rms):

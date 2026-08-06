@@ -73,7 +73,7 @@ class MiniMaxH3Ref2VExperimentHarness(io.ComfyNode):
                 io.Combo.Input("experiment_suite", options=SUITE_NAMES, default="minimal"),
                 io.String.Input("custom_experiments", default="", multiline=False,
                                 tooltip="Comma-separated experiment ids, used when the suite is 'custom'."),
-                io.Combo.Input("ref_image_size", options=["match", "max"], default="match"),
+                io.Combo.Input("ref_image_size", options=["native", "match", "max"], default="native"),
                 io.Combo.Input("cond_cache", options=COND_CACHE_MODES, default="auto"),
                 io.Boolean.Input("monolithic_reference", default=False,
                                  tooltip="Also generate the whole span in ONE run and score every "
@@ -143,7 +143,7 @@ class MiniMaxH3Ref2VExperimentHarness(io.ComfyNode):
     def execute(cls, model, clip, video_vae, audio_vae, source_video, prompt,
                 sampler, sigmas, seed, chunk_frames=73, overlap_frames=22,
                 experiment_suite="minimal", custom_experiments="",
-                ref_image_size="match", cond_cache="auto",
+                ref_image_size="native", cond_cache="auto",
                 monolithic_reference=False, tail_frames=17,
                 attention="auto", attention_fallback="allow",
                 activation="mlp_chunked_bf16", cuda_async_soft_gc=False,

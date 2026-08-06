@@ -457,30 +457,39 @@ def run(*, video_path, start_frame, chunk_frames, overlap_frames, chunk_count,
         manifest=manifest,
     )
 
-    run_obj.pass_a(
-        video_path=video_path,
-        start_frame=start_frame,
-        chunk_count=chunk_count,
-        video_vae=video_vae,
-        audio_vae=audio_vae,
-        ref_images=ref_images,
-        ref_image_size=ref_image_size,
-        cond_cache=cond_cache,
-        fps=fps,
-        ffmpeg_location=ffmpeg_location,
-    )
-    run_obj.pass_b(clip=clip, prompt=prompt, chunk_count=chunk_count, cond_cache=cond_cache)
-    run_obj.pass_c(model=model, sampler=sampler, sigmas=sigmas, chunk_count=chunk_count)
-    frames, output_path = run_obj.pass_d(
-        video_vae=video_vae,
-        chunk_count=chunk_count,
-        save_frames=save_frames,
-        output_video=output_video,
-        source_video=video_path,
-        start_frame=start_frame,
-        preserve_audio=preserve_audio,
-        ffmpeg_location=ffmpeg_location,
-    )
+    # `execution.py:751` runs every prompt inside `torch.inference_mode()`, so
+    # nodes never think about autograd. Calling the passes directly skips that.
+    # The samplers carry their own `@torch.no_grad()` and `decode_chunk` is
+    # decorated, but pass A runs the video/audio VAE encoders and pass B runs
+    # the text encoder with no guard at all - the same exposure that let pass D
+    # build an autograd graph over 5 temporal clips x 6 spatial tiles and pin
+    # 22.5 GiB on a 12 GB card. Covering the whole run closes the rest.
+    # Nesting this under the node path is a no-op.
+    with torch.inference_mode():
+        run_obj.pass_a(
+            video_path=video_path,
+            start_frame=start_frame,
+            chunk_count=chunk_count,
+            video_vae=video_vae,
+            audio_vae=audio_vae,
+            ref_images=ref_images,
+            ref_image_size=ref_image_size,
+            cond_cache=cond_cache,
+            fps=fps,
+            ffmpeg_location=ffmpeg_location,
+        )
+        run_obj.pass_b(clip=clip, prompt=prompt, chunk_count=chunk_count, cond_cache=cond_cache)
+        run_obj.pass_c(model=model, sampler=sampler, sigmas=sigmas, chunk_count=chunk_count)
+        frames, output_path = run_obj.pass_d(
+            video_vae=video_vae,
+            chunk_count=chunk_count,
+            save_frames=save_frames,
+            output_video=output_video,
+            source_video=video_path,
+            start_frame=start_frame,
+            preserve_audio=preserve_audio,
+            ffmpeg_location=ffmpeg_location,
+        )
     manifest.update_state(complete=True, frames_written=frames, output_path=output_path)
     return {
         "root": root,
