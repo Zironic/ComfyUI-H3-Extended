@@ -50,11 +50,96 @@ def resize(image, width, height, crop="disabled"):
     return samples.movedim(1, -1)
 
 
-def pin_canvas(source_frames, width=0, height=0):
-    """One canvas for the whole run, derived from the source unless overridden."""
+def canvas_for_megapixels(width, height, megapixels):
+    """Largest 32-aligned canvas at `megapixels`, keeping the source aspect.
+
+    Asking for width and height directly makes aspect preservation the caller's
+    problem, and getting it wrong stretches every frame of a long run. The pixel
+    budget is the useful control; the shape should follow the source.
+    """
+    if megapixels <= 0:
+        raise ValueError("megapixels must be positive")
+    ratio = width / height
+    nom_h = math.sqrt(megapixels * 1e6 / ratio)
+
+    # Rounding height and width independently against the *unrounded* nominal
+    # lets both errors point the same way: 16:9 at 0.2 MP lands on 608x320,
+    # which is 1.900:1 against a 1.778:1 source - a 6.9% stretch applied to
+    # every frame. Search the 32-aligned pairs near the budget and keep the one
+    # closest in aspect, breaking ties on how near it sits to the requested area.
+    best = None
+    steps = [s for s in range(-3, 4)]
+    for dh in steps:
+        h = int(round(nom_h / CANVAS_MULTIPLE) + dh) * CANVAS_MULTIPLE
+        if h < CANVAS_MULTIPLE:
+            continue
+        for dw in (-1, 0, 1):
+            w = (int(round(h * ratio / CANVAS_MULTIPLE)) + dw) * CANVAS_MULTIPLE
+            if w < CANVAS_MULTIPLE:
+                continue
+            area = w * h
+            if not 0.7 <= area / (megapixels * 1e6) <= 1.3:
+                continue
+            aspect_err = abs((w / h) / ratio - 1.0)
+            area_err = abs(area / (megapixels * 1e6) - 1.0)
+            score = (round(aspect_err, 4), area_err)
+            if best is None or score < best[0]:
+                best = (score, (w, h))
+    if best is None:
+        return (max(CANVAS_MULTIPLE, round(nom_h * ratio / CANVAS_MULTIPLE) * CANVAS_MULTIPLE),
+                max(CANVAS_MULTIPLE, round(nom_h / CANVAS_MULTIPLE) * CANVAS_MULTIPLE))
+    return best[1]
+
+
+def canvas_for_source(width, height):
+    """The source's own resolution, snapped to the 32-pixel grid."""
+    return (max(CANVAS_MULTIPLE, round(width / CANVAS_MULTIPLE) * CANVAS_MULTIPLE),
+            max(CANVAS_MULTIPLE, round(height / CANVAS_MULTIPLE) * CANVAS_MULTIPLE))
+
+
+CANVAS_MODES = ("native", "source", "megapixels", "explicit")
+
+
+def resolve_canvas(width, height, mode="native", megapixels=0.0,
+                   explicit_width=0, explicit_height=0):
+    """One canvas for a whole run, chosen by an explicit mode.
+
+    `width`/`height` are the source's *display* dimensions. Modes rather than
+    silent precedence, so the graph states which rule applied:
+
+    - `native`     the model's own canvas: 768 short edge, ~1.03 MP cap
+    - `source`     the source resolution, snapped to the 32-pixel grid
+    - `megapixels` a pixel budget, shape taken from the source aspect
+    - `explicit`   exactly `explicit_width` x `explicit_height`
+    """
+    if mode == "explicit":
+        if not (explicit_width and explicit_height):
+            raise ValueError("canvas_mode 'explicit' needs both width and height")
+        return (max(CANVAS_MULTIPLE, explicit_width // CANVAS_MULTIPLE * CANVAS_MULTIPLE),
+                max(CANVAS_MULTIPLE, explicit_height // CANVAS_MULTIPLE * CANVAS_MULTIPLE))
+    if mode == "source":
+        return canvas_for_source(width, height)
+    if mode == "megapixels":
+        if megapixels <= 0:
+            raise ValueError("canvas_mode 'megapixels' needs megapixels > 0")
+        return canvas_for_megapixels(width, height, megapixels)
+    if mode != "native":
+        raise ValueError("unknown canvas_mode %r" % mode)
+    return adapt_canvas(width, height)
+
+
+def pin_canvas(source_frames, width=0, height=0, megapixels=0.0):
+    """One canvas for the whole run, derived from the source unless overridden.
+
+    Precedence: an explicit width *and* height wins, then `megapixels` against
+    the source aspect, then the model's native canvas.
+    """
     if width and height:
         return (max(CANVAS_MULTIPLE, width // CANVAS_MULTIPLE * CANVAS_MULTIPLE),
                 max(CANVAS_MULTIPLE, height // CANVAS_MULTIPLE * CANVAS_MULTIPLE))
+    if megapixels and megapixels > 0:
+        return canvas_for_megapixels(source_frames.shape[2], source_frames.shape[1],
+                                     megapixels)
     return adapt_canvas(source_frames.shape[2], source_frames.shape[1])
 
 

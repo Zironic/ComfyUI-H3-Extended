@@ -56,6 +56,25 @@ class VideoMetadata:
         self.rotation = rotation
 
     @property
+    def is_rotated_quarter(self):
+        """True when the display matrix turns the frame on its side."""
+        return abs(int(self.rotation or 0)) % 180 == 90
+
+    @property
+    def display_width(self):
+        """Width as presented, which is what a canvas must match.
+
+        `probe` reports codec dimensions, so a clip carrying a +/-90 display
+        matrix reports them the wrong way round; deriving a canvas from those
+        gives a landscape frame for portrait footage.
+        """
+        return self.source_height if self.is_rotated_quarter else self.source_width
+
+    @property
+    def display_height(self):
+        return self.source_width if self.is_rotated_quarter else self.source_height
+
+    @property
     def estimated_frames(self):
         if not self.duration:
             return None

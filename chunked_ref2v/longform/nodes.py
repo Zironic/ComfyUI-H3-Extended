@@ -11,12 +11,12 @@ from comfy_api.latest import ComfyExtension, io
 try:
     from .. import memory
     from ..geometry import HarnessGeometry
-    from ..ref_builder import pin_canvas
+    from ..ref_builder import CANVAS_MODES, resolve_canvas
     from ...cond_cache import MODES as COND_CACHE_MODES
 except ImportError:  # pragma: no cover
     import memory
     from geometry import HarnessGeometry
-    from ref_builder import pin_canvas
+    from ref_builder import CANVAS_MODES, resolve_canvas
     COND_CACHE_MODES = ["auto", "off", "refresh"]
 
 from . import runner
@@ -77,8 +77,28 @@ class MiniMaxH3LongFormRef2V(io.ComfyNode):
                 io.Combo.Input("attention", options=list(memory.ATTENTION_MODES), default="auto"),
                 io.Combo.Input("activation", options=list(memory.ACTIVATION_MODES),
                                default="mlp_chunked_native"),
-                io.Int.Input("width", default=0, min=0, max=nodes.MAX_RESOLUTION, step=32),
-                io.Int.Input("height", default=0, min=0, max=nodes.MAX_RESOLUTION, step=32),
+                io.Combo.Input("canvas_mode", options=list(CANVAS_MODES),
+                               default="native",
+                               tooltip=("How the output canvas is chosen. All modes "
+                                        "except 'explicit' preserve the source "
+                                        "aspect ratio and handle rotated footage.\n"
+                                        "native: the model's own canvas, 768 short "
+                                        "edge capped near 1.03 MP.\n"
+                                        "source: the input video's resolution, "
+                                        "snapped to the 32-pixel grid. Can exceed "
+                                        "the model's trained range and get slow.\n"
+                                        "megapixels: a pixel budget, shape from the "
+                                        "source.\n"
+                                        "explicit: exactly width x height; the only "
+                                        "mode that can distort the aspect ratio.")),
+                io.Float.Input("megapixels", default=1.0, min=0.05, max=4.0, step=0.05,
+                               tooltip=("Pixel budget for canvas_mode 'megapixels', "
+                                        "ignored otherwise. 0.2 reproduces the "
+                                        "low-res test runs; ~1.0 matches native.")),
+                io.Int.Input("width", default=0, min=0, max=nodes.MAX_RESOLUTION, step=32,
+                             tooltip="Only for canvas_mode 'explicit'."),
+                io.Int.Input("height", default=0, min=0, max=nodes.MAX_RESOLUTION, step=32,
+                             tooltip="Only for canvas_mode 'explicit'."),
                 io.String.Input("run_directory", default="", multiline=False,
                                 tooltip=("Leave blank to create "
                                          "output/h3_longform/<timestamp>_<carry>_c<chunk_frames>. "
@@ -116,7 +136,8 @@ class MiniMaxH3LongFormRef2V(io.ComfyNode):
                 sampler, sigmas, seed, start_frame=0, output_seconds=180,
                 chunk_frames=90, overlap_frames=4, carry="direct_latent_overlap",
                 ref_image_size="native", cond_cache="auto", attention="auto",
-                activation="mlp_chunked_native", width=0, height=0,
+                activation="mlp_chunked_native", canvas_mode="native", megapixels=1.0,
+                width=0, height=0,
                 run_directory="", ffmpeg_location="", output_video=True,
                 preserve_source_audio=True, save_frames=False,
                 ref_images=None) -> io.NodeOutput:
@@ -167,10 +188,11 @@ class MiniMaxH3LongFormRef2V(io.ComfyNode):
             )
             logging.warning("%s %s", LOG, clamp_note)
 
-        if width and height:
-            canvas = (max(32, width // 32 * 32), max(32, height // 32 * 32))
-        else:
-            canvas = pin_canvas(torch.zeros(1, metadata.source_height, metadata.source_width, 3))
+        # Display dimensions, not codec ones: rotated footage reports them
+        # swapped, and a canvas built from those stretches every frame.
+        canvas = resolve_canvas(
+            metadata.display_width, metadata.display_height, mode=canvas_mode,
+            megapixels=megapixels, explicit_width=width, explicit_height=height)
 
         model, memory_status = memory.arm(
             model, attention=attention, activation=activation
@@ -224,7 +246,12 @@ class MiniMaxH3LongFormRef2V(io.ComfyNode):
             "MiniMax H3 long-form Ref2V",
             "profile   %s" % summary["profile"],
             "carry     %s" % carry,
-            "canvas    %dx%d" % canvas,
+            "canvas    %dx%d (%.2f MP, %.3f:1) from source %dx%d (%.3f:1)%s" % (
+                canvas[0], canvas[1], canvas[0] * canvas[1] / 1e6,
+                canvas[0] / canvas[1], metadata.display_width,
+                metadata.display_height,
+                metadata.display_width / metadata.display_height,
+                " rotated" if metadata.is_rotated_quarter else ""),
             "chunks    %d" % chunk_count,
             "output    %d exact frames (%.3f s at %d fps)" % (
                 summary["frames"], summary["frames"] / geometry.fps, geometry.fps
