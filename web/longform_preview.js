@@ -1,7 +1,10 @@
 import { app } from "/scripts/app.js";
 import { api } from "/scripts/api.js";
 
-const NODE_NAME = "MiniMaxH3LongFormRef2VZi";
+const NODE_NAMES = new Set([
+    "MiniMaxH3LongFormRef2VZi",
+    "MiniMaxH3LongFormReferenceVideoZi",
+]);
 const EVENT_NAME = "h3_longform_preview";
 const states = new Map();
 
@@ -163,7 +166,7 @@ api.addEventListener(EVENT_NAME, (event) => {
 app.registerExtension({
     name: "H3Extended.LongFormDualPreview",
     async beforeRegisterNodeDef(nodeType, nodeData) {
-        if (nodeData.name !== NODE_NAME) return;
+        if (!NODE_NAMES.has(nodeData.name)) return;
         const originalCreated = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function () {
             const result = originalCreated?.apply(this, arguments);
