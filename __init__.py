@@ -5,7 +5,7 @@ from dataclasses import is_dataclass, replace
 from comfy_api.latest import ComfyExtension
 
 from . import nodes_minimax_h3
-from .chunked_ref2v.longform.nodes import MiniMaxH3LongFormExtension
+from .chunked_ref2v.longform.preview_nodes import MiniMaxH3LongFormPreviewExtension
 from .chunked_ref2v.nodes import MiniMaxH3HarnessExtension
 from . import cond_cache_diagnostics
 from .h3_activation_memory.nodes import MiniMaxH3ActivationMemoryExtension
@@ -13,6 +13,11 @@ from .h3_attention.nodes import MiniMaxH3AttentionExtension
 from .h3_masked_cache.nodes import MiniMaxH3MaskedCacheExtension
 from .h3_memory_optimizer.nodes import MiniMaxH3MemoryOptimizerExtension
 from .h3_probe.nodes import MiniMaxH3ProbeExtension
+
+# Comfy's custom-node loader serves JavaScript from this directory.  The
+# long-form node uses it for two independent live preview panes because the
+# standard progress protocol carries only one replaceable preview image.
+WEB_DIRECTORY = "./web"
 
 # Install the diagnostic wrapper at `cond_cache.encode` itself. Rebinding only
 # `nodes_minimax_h3.encode_conditioning` covered the (Zi) nodes but silently
@@ -77,7 +82,7 @@ class H3ExtendedExtension(ComfyExtension):
             MiniMaxH3Extension(),
             MiniMaxH3ProbeExtension(),
             MiniMaxH3HarnessExtension(),
-            MiniMaxH3LongFormExtension(),
+            MiniMaxH3LongFormPreviewExtension(),
             MiniMaxH3MaskedCacheExtension(),
             MiniMaxH3AttentionExtension(),
             MiniMaxH3ActivationMemoryExtension(),
