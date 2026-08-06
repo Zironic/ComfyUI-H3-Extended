@@ -1,8 +1,8 @@
 """Optional chunk-aligned audio references for LongFormReferenceVideo.
 
 The generic long-form reference node normally encodes every audio reference once
-and reuses the complete latent in every model invocation.  This module adds an
-opt-in mode that keeps the same Qwen reference structure but replaces each DiT
+and reuses the complete latent in every model invocation. This module adds an
+opt-in toggle that keeps the same Qwen reference structure but replaces each DiT
 audio reference with the chronological slice matching the current video chunk.
 The slice includes the same leading overlap as the video chunk and never wraps
 to sample zero.
@@ -11,9 +11,10 @@ to sample zero.
 from __future__ import annotations
 
 import contextvars
-from dataclasses import dataclass
+from dataclasses import dataclass, is_dataclass, replace
 
 import torch
+from comfy_api.latest import io
 
 from .. import ref_builder
 from . import audio_runtime, reference_runner
@@ -22,12 +23,15 @@ _ACTIVE = contextvars.ContextVar(
     "h3_longform_chunk_aligned_audio_refs", default=False
 )
 _INSTALLED = False
+_NODE_INSTALLED = False
+_ORIGINAL_PREPARE = None
+_ORIGINAL_AUDIO_RUN = None
 
 
 def slice_audio_reference(audio, *, start_frame, frame_count, fps=24):
     """Return an exact-duration chronological audio slice, padding with silence.
 
-    The returned waveform keeps the source batch/channel layout.  Negative starts
+    The returned waveform keeps the source batch/channel layout. Negative starts
     are rejected and slices beyond the end are zero-padded rather than wrapped.
     """
 
@@ -45,7 +49,7 @@ def slice_audio_reference(audio, *, start_frame, frame_count, fps=24):
     sample_rate = int(audio["sample_rate"])
     start = round(start_frame / float(fps) * sample_rate)
     stop = round((start_frame + frame_count) / float(fps) * sample_rate)
-    wanted = max(0, stop - start)
+    wanted = stop - start
 
     clipped = waveform[..., start:min(stop, waveform.shape[-1])]
     if clipped.shape[-1] < wanted:
@@ -62,12 +66,22 @@ class _AudioSlot:
     paired_video: bool
 
 
+@dataclass
+class _Inputs:
+    ref_images: object = None
+
+
+_CURRENT_INPUTS = contextvars.ContextVar(
+    "h3_longform_chunk_aligned_audio_inputs", default=_Inputs()
+)
+
+
 class _ChunkReferenceBlocks:
     """Sequence whose single iteration yields refs for the next chunk.
 
-    The installed sampler calls ``list(self.static_blocks)`` exactly once per
-    chunk.  Advancing here avoids replacing the sampler implementation and keeps
-    preview/audio-carry behavior owned by ``audio_runtime``.
+    The audiovisual sampler calls ``list(self.static_blocks)`` exactly once per
+    chunk. Advancing here keeps preview and generated-audio carry behavior owned
+    by ``audio_runtime`` instead of duplicating the sampler.
     """
 
     def __init__(self, run_obj, base_blocks, slots, audio_vae, cond_cache):
@@ -105,12 +119,9 @@ class _ChunkReferenceBlocks:
         return len(self.base_blocks)
 
 
-def _audio_slots(blocks, ref_videos, ref_video_audios, ref_audios):
+def _audio_slots(ref_videos, ref_video_audios, ref_audios):
     slots = []
-    block_index = 0
-
-    # Image-reference blocks come first.
-    block_index += sum(
+    block_index = sum(
         1 for _ in reference_runner._ordered_values(
             getattr(_CURRENT_INPUTS.get(), "ref_images", None)
         )
@@ -129,26 +140,15 @@ def _audio_slots(blocks, ref_videos, ref_video_audios, ref_audios):
     return slots
 
 
-@dataclass
-class _Inputs:
-    ref_images: object = None
-
-
-_CURRENT_INPUTS = contextvars.ContextVar(
-    "h3_longform_chunk_aligned_audio_inputs", default=_Inputs()
-)
-
-
 def _prepare_references(self, *args, **kwargs):
     conditioning, notes = _ORIGINAL_PREPARE(self, *args, **kwargs)
     if not _ACTIVE.get():
         return conditioning, notes
 
-    ref_videos = kwargs.get("ref_videos")
-    ref_video_audios = kwargs.get("ref_video_audios")
-    ref_audios = kwargs.get("ref_audios")
     slots = _audio_slots(
-        self.static_blocks, ref_videos, ref_video_audios, ref_audios
+        kwargs.get("ref_videos"),
+        kwargs.get("ref_video_audios"),
+        kwargs.get("ref_audios"),
     )
     if not slots:
         return conditioning, notes
@@ -165,17 +165,89 @@ def _prepare_references(self, *args, **kwargs):
     ]
 
 
+def _run_with_identity(**kwargs):
+    runtime = dict(kwargs.get("runtime_config") or {})
+    runtime["audio_reference_mode"] = (
+        "chunk_aligned" if _ACTIVE.get() else "full_track"
+    )
+    kwargs["runtime_config"] = runtime
+    return _ORIGINAL_AUDIO_RUN(**kwargs)
+
+
 def install():
-    global _INSTALLED, _ORIGINAL_PREPARE
+    global _INSTALLED, _ORIGINAL_PREPARE, _ORIGINAL_AUDIO_RUN
     if _INSTALLED:
         return
     _ORIGINAL_PREPARE = reference_runner.LongFormReferenceRun.prepare_references
     reference_runner.LongFormReferenceRun.prepare_references = _prepare_references
+    _ORIGINAL_AUDIO_RUN = audio_runtime.run
+    audio_runtime.run = _run_with_identity
     _INSTALLED = True
 
 
+def _replace_inputs(schema, inputs):
+    if is_dataclass(schema):
+        return replace(schema, inputs=inputs)
+    if hasattr(schema, "model_copy"):
+        return schema.model_copy(update={"inputs": inputs})
+    schema.inputs = inputs
+    return schema
+
+
+def install_node(node_cls):
+    """Add the toggle to the registered preview node without duplicating it."""
+
+    global _NODE_INSTALLED
+    install()
+    if _NODE_INSTALLED:
+        return
+
+    original_schema = node_cls.define_schema.__func__
+    original_execute = node_cls.execute.__func__
+
+    @classmethod
+    def define_schema(cls):
+        schema = original_schema(cls)
+        inputs = list(schema.inputs)
+        toggle = io.Boolean.Input(
+            "chunk_align_audio_references",
+            default=False,
+            tooltip=(
+                "Off: reuse every complete audio reference in every chunk. "
+                "On: encode only the chronological audio interval matching "
+                "each video chunk, including the video overlap. This affects "
+                "reference conditioning only, not generated-audio assembly."
+            ),
+        )
+        insert_at = next(
+            (
+                index for index, item in enumerate(inputs)
+                if getattr(item, "name", None) == "ref_images"
+            ),
+            len(inputs),
+        )
+        inputs.insert(insert_at, toggle)
+        return _replace_inputs(schema, inputs)
+
+    @classmethod
+    def execute(cls, *args, chunk_align_audio_references=False, **kwargs):
+        active_token = _ACTIVE.set(bool(chunk_align_audio_references))
+        input_token = _CURRENT_INPUTS.set(
+            _Inputs(ref_images=kwargs.get("ref_images"))
+        )
+        try:
+            return original_execute(cls, *args, **kwargs)
+        finally:
+            _CURRENT_INPUTS.reset(input_token)
+            _ACTIVE.reset(active_token)
+
+    node_cls.define_schema = define_schema
+    node_cls.execute = execute
+    _NODE_INSTALLED = True
+
+
 def run(*, chunk_align_audio_references=False, **kwargs):
-    """Run LongFormReferenceVideo with optional chronological audio slicing."""
+    """Programmatic entry point with optional chronological audio slicing."""
 
     install()
     active_token = _ACTIVE.set(bool(chunk_align_audio_references))
@@ -189,8 +261,12 @@ def run(*, chunk_align_audio_references=False, **kwargs):
         _ACTIVE.reset(active_token)
 
 
-_ORIGINAL_PREPARE = None
 install()
 
 
-__all__ = ["install", "run", "slice_audio_reference"]
+__all__ = [
+    "install",
+    "install_node",
+    "run",
+    "slice_audio_reference",
+]
