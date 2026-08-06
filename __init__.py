@@ -11,7 +11,10 @@ from .chunked_ref2v.longform.preview_nodes import (
 from .chunked_ref2v.longform.reference_preview_nodes import (
     MiniMaxH3LongFormReferencePreviewExtension,
 )
-from .chunked_ref2v.longform import v2v_audio_runtime
+from .chunked_ref2v.longform import (
+    completed_preview_runtime,
+    v2v_audio_runtime,
+)
 from .chunked_ref2v.nodes import MiniMaxH3HarnessExtension
 from . import cond_cache_diagnostics
 from .h3_activation_memory.nodes import MiniMaxH3ActivationMemoryExtension
@@ -30,6 +33,10 @@ WEB_DIRECTORY = "./web"
 # replacing the duplicated video-only sampler with synchronized video+audio
 # carry, source-audio conditioning, and dual-track output.
 v2v_audio_runtime.install()
+
+# Keep finalized MP4 segments as the primary completed-output preview, but make
+# that channel failure-safe: GIF fallback first, explicit browser error second.
+completed_preview_runtime.install()
 
 # Install the diagnostic wrapper at `cond_cache.encode` itself. Rebinding only
 # `nodes_minimax_h3.encode_conditioning` covered the (Zi) nodes but silently
