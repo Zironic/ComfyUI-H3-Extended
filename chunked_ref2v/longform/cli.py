@@ -284,8 +284,25 @@ def main(argv=None):
     metadata = probe(args.video)
     available = (metadata.estimated_frames or 0) - args.start_frame
     if available < needed:
-        raise SystemExit("source has ~%d frames after start_frame %d; %d chunks "
-                         "need %d" % (available, args.start_frame, chunk_count, needed))
+        # Clamp rather than refuse, matching the node. A run consumes the full
+        # span of its chunks, so `needed` exceeds the frames actually kept and a
+        # source can be long enough for the requested output yet still short of
+        # the span. Only too short for a single chunk is fatal.
+        if available < geometry.chunk_frames:
+            raise SystemExit(
+                "source has ~%d frames after start_frame %d, which cannot fill "
+                "even one %d-frame chunk"
+                % (available, args.start_frame, geometry.chunk_frames))
+        chunk_count = (available - geometry.chunk_frames) // geometry.stride_frames + 1
+        clamped = frames_needed_for(chunk_count, geometry.chunk_frames,
+                                    geometry.stride_frames)
+        logging.warning(
+            "source offers ~%d frames after start_frame %d; clamping %.2f s -> "
+            "%.2f s (%d frames, %d chunks)",
+            available, args.start_frame, target_frames / geometry.fps,
+            clamped / geometry.fps, clamped, chunk_count)
+        target_frames = clamped
+        needed = clamped
 
     # One canvas for the whole run, at the requested pixel budget.
     ratio = metadata.source_width / metadata.source_height

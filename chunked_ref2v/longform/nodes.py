@@ -52,7 +52,13 @@ class MiniMaxH3LongFormRef2V(io.ComfyNode):
                              control_after_generate=True),
                 io.Int.Input("start_frame", default=0, min=0, max=10_000_000),
                 io.Int.Input("output_seconds", default=180, min=1, max=3600,
-                             tooltip="Exact output duration at 24 fps."),
+                             tooltip=("Exact output duration at 24 fps. Clamped "
+                                      "down to what the source can supply from "
+                                      "start_frame - a run consumes the full span "
+                                      "of its chunks, which overruns the kept "
+                                      "frames by up to chunk_frames-1. The clamp "
+                                      "is logged and reported. Only a source too "
+                                      "short for a single chunk is an error.")),
                 io.Int.Input("chunk_frames", default=90, min=22, max=362, step=17),
                 io.Int.Input("overlap_frames", default=4, min=4, max=180,
                              tooltip=("Source overlap, and the only compute knob: "
@@ -135,24 +141,31 @@ class MiniMaxH3LongFormRef2V(io.ComfyNode):
         )
         metadata = probe(video_path)
         available = None if metadata.estimated_frames is None else metadata.estimated_frames - start_frame
+
+        clamp_note = None
         if available is not None and available < needed:
-            if available >= geometry.chunk_frames:
-                fits = (available - geometry.chunk_frames) // geometry.stride_frames + 1
-                best = frames_needed_for(
-                    fits, geometry.chunk_frames, geometry.stride_frames
+            # One chunk is the floor - below that there is nothing to generate,
+            # so this is the only case that can still refuse.
+            if available < geometry.chunk_frames:
+                raise ValueError(
+                    "source has about %d normalized frames after start_frame %d, "
+                    "which cannot fill even one %d-frame chunk"
+                    % (max(0, available), start_frame, geometry.chunk_frames)
                 )
-                hint = ("the most this source supports from here is %d frames "
-                        "(%.2f s, %d chunks)"
-                        % (best, best / geometry.fps, fits))
-            else:
-                hint = ("this source cannot fill even one %d-frame chunk from "
-                        "that start_frame" % geometry.chunk_frames)
-            raise ValueError(
-                "source has about %d normalized frames after start_frame %d, but "
-                "%d exact output frames need %d source frames across %d chunks; %s"
-                % (max(0, available), start_frame, target_frames, needed,
-                   chunk_count, hint)
+            requested_frames, requested_chunks = target_frames, chunk_count
+            chunk_count = (available - geometry.chunk_frames) // geometry.stride_frames + 1
+            target_frames = frames_needed_for(
+                chunk_count, geometry.chunk_frames, geometry.stride_frames
             )
+            clamp_note = (
+                "requested %.2f s (%d frames, %d chunks) but the source only "
+                "offers about %d frames after start_frame %d; clamped to %.2f s "
+                "(%d frames, %d chunks)"
+                % (requested_frames / geometry.fps, requested_frames,
+                   requested_chunks, max(0, available), start_frame,
+                   target_frames / geometry.fps, target_frames, chunk_count)
+            )
+            logging.warning("%s %s", LOG, clamp_note)
 
         if width and height:
             canvas = (max(32, width // 32 * 32), max(32, height // 32 * 32))
@@ -222,7 +235,7 @@ class MiniMaxH3LongFormRef2V(io.ComfyNode):
             # Both of these accept a blank widget and resolve themselves, so echo
             # what was actually used rather than leaving the user to guess.
             "ffmpeg    %s" % _describe_ffmpeg(ffmpeg_location.strip() or None),
-        ])
+        ] + (["clamped   %s" % clamp_note] if clamp_note else []))
         preview = None
         if save_frames:
             preview = _preview(os.path.join(root, "frames"))
