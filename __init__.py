@@ -6,6 +6,7 @@ from comfy_api.latest import ComfyExtension
 
 from . import nodes_minimax_h3
 from .chunked_ref2v.longform.nodes import MiniMaxH3LongFormExtension
+from .chunked_ref2v.longform.reference_nodes import MiniMaxH3LongFormReferenceExtension
 from .chunked_ref2v.nodes import MiniMaxH3HarnessExtension
 from . import cond_cache_diagnostics
 from .h3_activation_memory.nodes import MiniMaxH3ActivationMemoryExtension
@@ -28,6 +29,7 @@ NODE_CATEGORIES = {
     "EmptyMiniMaxH3LatentAVZi": "H3-Extender/Generation",
     "MiniMaxH3ImageToVideoZi": "H3-Extender/Generation",
     "MiniMaxH3ReferenceToVideoZi": "H3-Extender/Generation",
+    "MiniMaxH3LongFormReferenceVideoZi": "H3-Extender/Generation",
     "MiniMaxH3SigmaShiftZi": "H3-Extender/Model Patches",
     "MiniMaxH3EfficientSagePatchZi": "H3-Extender/Model Patches",
     "MiniMaxH3ActivationMemoryZi": "H3-Extender/Model Patches",
@@ -78,6 +80,7 @@ class H3ExtendedExtension(ComfyExtension):
             MiniMaxH3ProbeExtension(),
             MiniMaxH3HarnessExtension(),
             MiniMaxH3LongFormExtension(),
+            MiniMaxH3LongFormReferenceExtension(),
             MiniMaxH3MaskedCacheExtension(),
             MiniMaxH3AttentionExtension(),
             MiniMaxH3ActivationMemoryExtension(),
