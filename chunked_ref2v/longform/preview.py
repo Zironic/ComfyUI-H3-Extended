@@ -177,6 +177,24 @@ class PreviewOptions:
     width: int = 512
 
 
+def resolve_unique_id(cls, fallback=None):
+    """Return the executing node id for a V3 node.
+
+    Hidden inputs declared in the schema are never passed to ``execute`` as
+    keyword arguments. Comfy binds them onto a per-execution class clone
+    (``execution.get_input_data`` fills ``v3_data["hidden_inputs"]``, and
+    ``ComfyNode.PREPARE_CLASS_CLONE`` turns that into ``cls.hidden``). Reading
+    the ``unique_id=None`` signature default therefore published every preview
+    event under the literal node id ``"None"``, which no browser node matches.
+    """
+
+    hidden = getattr(cls, "hidden", None)
+    resolved = getattr(hidden, "unique_id", None) if hidden is not None else None
+    if resolved is None:
+        resolved = fallback
+    return resolved
+
+
 class LongFormPreviewPublisher:
     """Persist and announce both live-preview channels.
 

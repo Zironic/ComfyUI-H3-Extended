@@ -23,6 +23,7 @@ from .preview import (
     PreviewOptions,
     activate,
     deactivate,
+    resolve_unique_id,
 )
 from .reference_nodes import (
     MiniMaxH3LongFormReferenceVideo,
@@ -198,6 +199,10 @@ class MiniMaxH3LongFormReferenceVideoPreview(
         logging.info("%s %s", LOG, memory.describe(memory_status))
 
         root = _resolve_root(run_directory, carry, chunk_frames)
+        # See resolve_unique_id: hidden inputs reach V3 nodes through the class
+        # clone, not through execute() kwargs. Reading the signature default
+        # addressed every preview event to node id "None".
+        unique_id = resolve_unique_id(cls, unique_id)
         publisher = LongFormPreviewPublisher(
             node_id=unique_id,
             model=model,

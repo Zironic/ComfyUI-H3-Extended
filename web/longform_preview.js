@@ -6,7 +6,34 @@ const NODE_NAMES = new Set([
     "MiniMaxH3LongFormReferenceVideoZi",
 ]);
 const EVENT_NAME = "h3_longform_preview";
-const states = new Map();
+const STATE_KEY = "__h3LongFormPreviewState";
+
+// The state is attached to the node object, never keyed by id. `onNodeCreated`
+// fires inside `LiteGraph.createNode`, and `LGraph.configure` only assigns
+// `node.id` *after* that call returns — so at widget-build time every node
+// still reports the unassigned id -1. Keying a Map there registered all state
+// under "-1" and no incoming event could ever match it.
+function graphNodes() {
+    const graph = app.graph;
+    return graph?.nodes || graph?._nodes || [];
+}
+
+function findState(detail) {
+    const candidates = graphNodes().filter((node) => {
+        const name = node.comfyClass || node.type || node.constructor?.comfyClass;
+        return NODE_NAMES.has(name) && node[STATE_KEY];
+    });
+
+    const raw = detail?.node_id;
+    if (raw !== undefined && raw !== null && raw !== "None") {
+        const match = candidates.find((node) => String(node.id) === String(raw));
+        if (match) return match[STATE_KEY];
+    }
+
+    // A single long-form node in the graph is unambiguous; keep the panes alive
+    // rather than dropping the event when the id does not line up.
+    return candidates.length === 1 ? candidates[0][STATE_KEY] : null;
+}
 
 function assetUrl(asset, revision) {
     const params = new URLSearchParams({
@@ -98,7 +125,7 @@ function buildPreviewWidget(node) {
         }
     });
 
-    states.set(String(node.id), state);
+    node[STATE_KEY] = state;
     return state;
 }
 
@@ -164,7 +191,7 @@ function onCompleted(state, detail) {
 
 api.addEventListener(EVENT_NAME, (event) => {
     const detail = event.detail || {};
-    const state = states.get(String(detail.node_id));
+    const state = findState(detail);
     if (!state) return;
     if (detail.kind === "reset") {
         resetState(state);
@@ -194,7 +221,7 @@ app.registerExtension({
         };
         const originalRemoved = nodeType.prototype.onRemoved;
         nodeType.prototype.onRemoved = function () {
-            states.delete(String(this.id));
+            delete this[STATE_KEY];
             return originalRemoved?.apply(this, arguments);
         };
     },

@@ -13,6 +13,7 @@ from .preview import (
     PreviewOptions,
     activate,
     deactivate,
+    resolve_unique_id,
 )
 
 LOG = "[H3 Extended] longform preview"
@@ -147,6 +148,9 @@ class MiniMaxH3LongFormRef2VPreview(MiniMaxH3LongFormRef2V):
         ref_images=None,
         unique_id=None,
     ) -> io.NodeOutput:
+        # See resolve_unique_id: hidden inputs reach V3 nodes through the class
+        # clone, not through execute() kwargs.
+        unique_id = resolve_unique_id(cls, unique_id)
         publisher = LongFormPreviewPublisher(
             node_id=unique_id,
             model=model,
