@@ -13,6 +13,7 @@ from .chunked_ref2v.longform.reference_preview_nodes import (
 )
 from .chunked_ref2v.longform import (
     completed_preview_runtime,
+    dual_prompt_runtime,
     v2v_audio_runtime,
 )
 from .chunked_ref2v.nodes import MiniMaxH3HarnessExtension
@@ -33,6 +34,11 @@ WEB_DIRECTORY = "./web"
 # replacing the duplicated video-only sampler with synchronized video+audio
 # carry, source-audio conditioning, and dual-track output.
 v2v_audio_runtime.install()
+
+# Add separate first-sample and continuation prompts after the preview and AV
+# node variants have been imported. The runtime preserves the existing prompt
+# socket and uses a blank continuation prompt as an explicit fallback.
+dual_prompt_runtime.install()
 
 # Keep finalized MP4 segments as the primary completed-output preview, but make
 # that channel failure-safe: GIF fallback first, explicit browser error second.
