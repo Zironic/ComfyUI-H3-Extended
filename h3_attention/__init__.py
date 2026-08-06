@@ -1,4 +1,4 @@
-"""H3-owned attention observation, forward patching, and Sage backends."""
+"""H3-owned attention observation and dense/sparse prepared backends."""
 
 from .observer import (
     OBSERVER_KEY,
@@ -16,6 +16,13 @@ from .sage_arch import (
     SageSM90MemoryEfficientBackend,
     SageSM12xMemoryEfficientBackend,
 )
+from .sol import (
+    DenseBF16SDPABackend,
+    SolAttentionBackend,
+    SolAttentionConfig,
+    SolAttentionError,
+    preflight_sol_attention,
+)
 
 SM89SageMemoryEfficientBackend = _sage_mem_eff.SM89SageMemoryEfficientBackend
 
@@ -30,4 +37,9 @@ __all__ = [
     "SM89SageMemoryEfficientBackend",
     "SageSM90MemoryEfficientBackend",
     "SageSM12xMemoryEfficientBackend",
+    "DenseBF16SDPABackend",
+    "SolAttentionBackend",
+    "SolAttentionConfig",
+    "SolAttentionError",
+    "preflight_sol_attention",
 ]

@@ -1,4 +1,4 @@
-"""Configure H3-specific prepared-QKV attention backends."""
+"""Configure H3-specific consuming attention backends."""
 
 import logging
 
@@ -22,14 +22,16 @@ def _pin_token_refiner_to_sage(transformer_options):
     def override(_original, *args, **kwargs):
         return sage_impl(*args, **kwargs)
 
+    override._h3_backend = "sage"
     transformer_options["optimized_attention_override"] = override
 
 
 def configure_backend(model_patcher, backend):
-    """Install one already-preflighted prepared-QKV backend.
+    """Install one already-preflighted consuming backend.
 
-    Keeping construction separate from installation lets a capability resolver
-    fall back before any model options or object patches are mutated.
+    Prepared Sage backends pin the small token refiner to registered Sage.  Sol
+    can use its own BF16 SDPA dense fallback and therefore preserves the incoming
+    token-refiner attention selection instead of making Sage a hidden dependency.
     """
     if backend is None:
         raise TypeError("backend must not be None")
@@ -37,7 +39,8 @@ def configure_backend(model_patcher, backend):
     transformer_options = model_patcher.model_options["transformer_options"] = (
         model_patcher.model_options.get("transformer_options", {}).copy()
     )
-    _pin_token_refiner_to_sage(transformer_options)
+    if bool(getattr(backend, "requires_registered_sage", True)):
+        _pin_token_refiner_to_sage(transformer_options)
     count = install(model_patcher, backend=backend)
     transformer_options["minimax_h3_attention_backend"] = backend_name
     logging.info("[H3 attention] configured %s on %d blocks", backend_name, count)
@@ -45,5 +48,4 @@ def configure_backend(model_patcher, backend):
 
 
 def configure(model_patcher):
-    """Backward-compatible standalone SM89 node configuration."""
     return configure_backend(model_patcher, SM89SageMemoryEfficientBackend())
