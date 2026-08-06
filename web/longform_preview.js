@@ -104,6 +104,7 @@ function buildPreviewWidget(node) {
 
 function resetState(state) {
     state.currentTitle.textContent = "Current chunk — waiting";
+    state.currentTitle.removeAttribute("title");
     state.currentImage.removeAttribute("src");
     state.completedTitle.textContent = "Completed output — waiting";
     state.completedVideo.pause();
@@ -128,9 +129,20 @@ function playSegment(state, index, autoplay) {
 }
 
 function onCurrent(state, detail) {
+    const mode = detail.mode === "vae" ? "VAE" : "latent approx";
     state.currentTitle.textContent =
-        `Current chunk ${detail.chunk_index + 1} — step ${detail.step}/${detail.total_steps}`;
+        `Current chunk ${detail.chunk_index + 1} — step ${detail.step}/${detail.total_steps} — ${mode}`;
+    state.currentTitle.title = detail.fallback_reason || "";
     state.currentImage.src = assetUrl(detail.asset, detail.revision);
+}
+
+function onCurrentError(state, detail) {
+    const message = detail.message || "unknown preview error";
+    state.currentTitle.textContent =
+        `Current chunk ${detail.chunk_index + 1} — preview failed`;
+    state.currentTitle.title = message;
+    state.currentImage.removeAttribute("src");
+    console.warn("[H3 Extended] current chunk preview failed:", message);
 }
 
 function onCompleted(state, detail) {
@@ -156,6 +168,10 @@ api.addEventListener(EVENT_NAME, (event) => {
     if (!state) return;
     if (detail.kind === "reset") {
         resetState(state);
+        return;
+    }
+    if (detail.kind === "current_chunk_error") {
+        onCurrentError(state, detail);
         return;
     }
     if (!detail.asset) return;
