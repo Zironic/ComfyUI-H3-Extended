@@ -6,7 +6,7 @@ import os
 import torch
 
 import nodes
-from comfy_api.latest import ComfyExtension, io
+from comfy_api.latest import ComfyExtension, io, ui
 
 try:
     from .. import memory
@@ -122,11 +122,13 @@ class MiniMaxH3LongFormRef2V(io.ComfyNode):
                                       input=io.Image.Input("ref_image"),
                                       prefix="ref_image_", min=0, max=9)),
             ],
+            is_output_node=True,
             outputs=[
                 io.Image.Output(display_name="preview"),
                 io.String.Output(display_name="run_directory"),
                 io.String.Output(display_name="video_path"),
                 io.String.Output(display_name="report"),
+                io.Video.Output(display_name="video"),
             ],
             hidden=[io.Hidden.unique_id],
         )
@@ -271,7 +273,42 @@ class MiniMaxH3LongFormRef2V(io.ComfyNode):
                 summary["output_path"], ffmpeg_location=ffmpeg_location.strip() or None)
         if preview is None:
             preview = torch.zeros(1, 64, 64, 3)
-        return io.NodeOutput(preview, root, summary["output_path"], report)
+
+        # Show the stitched result itself, with its audio, rather than only a
+        # strip of sampled frames. The writer already put the file under the
+        # output directory, so the player can reference it in place - no second
+        # copy of a file that can run to gigabytes.
+        video, video_ui = _video_result(summary["output_path"])
+        return io.NodeOutput(preview, root, summary["output_path"], report, video,
+                             ui=video_ui)
+
+
+def _video_result(output_path):
+    """The written file as a VIDEO output plus an in-graph player.
+
+    `ui.PreviewVideo` addresses files relative to the output directory, so a run
+    written anywhere else - a custom `run_directory` on another drive - can still
+    be returned as VIDEO but cannot be played inline. That is a display
+    limitation only; the file on disk is unaffected either way.
+    """
+    if not output_path or not os.path.isfile(output_path):
+        return None, None
+
+    import folder_paths
+    from comfy_api.latest import _input_impl
+
+    video = _input_impl.VideoFromFile(output_path)
+    try:
+        relative = os.path.relpath(output_path, folder_paths.get_output_directory())
+    except ValueError:  # different drive on Windows
+        return video, None
+    if relative.startswith(os.pardir):
+        logging.info("%s output is outside the output directory; no inline "
+                     "player for %s", LOG, output_path)
+        return video, None
+    subfolder, filename = os.path.split(relative)
+    return video, ui.PreviewVideo(
+        [ui.SavedResult(filename, subfolder, io.FolderType.output)])
 
 
 def _describe_ffmpeg(explicit):
@@ -292,24 +329,34 @@ def _preview_from_video(video_path, limit=48, ffmpeg_location=None):
     is a black square. Reads a bounded, evenly spaced sample straight from the
     file rather than the whole thing, which is the point of the node.
     """
-    from .frame_source import probe as probe_video, read_window
+    from .frame_source import FFmpegFrameSource, probe as probe_video
 
     try:
         meta = probe_video(video_path)
         total = meta.estimated_frames or 0
         if total <= 0:
             return None
+
+        # One decode pass, downscaled, keeping every Nth frame. Seeking per
+        # frame would spawn `limit` ffmpeg processes, and reading everything
+        # would hold the whole run in memory - 4320 frames of a 3 minute job.
+        scale = width / max(1, meta.display_width)
+        canvas = (max(16, int(meta.display_width * scale) // 2 * 2),
+                  max(16, int(meta.display_height * scale) // 2 * 2))
         step = max(1, total // limit)
-        out = []
-        for index in range(0, min(total, step * limit), step):
-            try:
-                out.append(read_window(video_path, index, 1,
-                                       ffmpeg_location=ffmpeg_location)[0])
-            except Exception:
-                break
-        if not out:
+        kept = []
+        with FFmpegFrameSource(video_path, canvas=canvas,
+                               ffmpeg_location=ffmpeg_location) as source:
+            while len(kept) < limit:
+                batch = source.read_frames(step)
+                if batch.shape[0] == 0:
+                    break
+                kept.append(batch[0])
+        if not kept:
             return None
-        return torch.stack(out)
+        # read_frames yields uint8 0-255; a Comfy IMAGE is float 0-1, and
+        # handing over the raw bytes renders every frame pure white.
+        return torch.stack(kept).to(torch.float32).div_(255.0)
     except Exception as exc:
         logging.warning("%s preview unavailable: %s", LOG, exc)
         return None
