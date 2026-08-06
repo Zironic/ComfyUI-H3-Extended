@@ -10,19 +10,14 @@ from .chunked_ref2v.nodes import MiniMaxH3HarnessExtension
 from . import cond_cache_diagnostics
 from .h3_activation_memory.nodes import MiniMaxH3ActivationMemoryExtension
 from .h3_attention.nodes import MiniMaxH3AttentionExtension
+from .h3_block_cache.nodes import MiniMaxH3BlockCacheExtension
 from .h3_masked_cache.nodes import MiniMaxH3MaskedCacheExtension
 from .h3_memory_optimizer.nodes import MiniMaxH3MemoryOptimizerExtension
 from .h3_probe.nodes import MiniMaxH3ProbeExtension
 
-# Install the diagnostic wrapper at `cond_cache.encode` itself. Rebinding only
-# `nodes_minimax_h3.encode_conditioning` covered the (Zi) nodes but silently
-# missed the harness, which resolves the function inside a function body — so
-# the diagnostics never once ran on the path that most needed them.
 encode_conditioning_diagnostic = cond_cache_diagnostics.install()
-# ...and the conditioning nodes bound the name at import, before the patch.
 nodes_minimax_h3.encode_conditioning = encode_conditioning_diagnostic
 MiniMaxH3Extension = nodes_minimax_h3.MiniMaxH3Extension
-
 
 NODE_CATEGORIES = {
     "EmptyMiniMaxH3LatentAVZi": "H3-Extender/Generation",
@@ -31,6 +26,7 @@ NODE_CATEGORIES = {
     "MiniMaxH3SigmaShiftZi": "H3-Extender/Model Patches",
     "MiniMaxH3EfficientSagePatchZi": "H3-Extender/Model Patches",
     "MiniMaxH3ActivationMemoryZi": "H3-Extender/Model Patches",
+    "MiniMaxH3BlockRangeCacheZi": "H3-Extender/Model Patches",
     "MiniMaxH3MaskedRef2VCacheZi": "H3-Extender/Model Patches",
     "MiniMaxH3MemoryOptimizerZi": "H3-Extender/Model Patches",
     "MiniMaxH3AttentionProbeZi": "H3-Extender/Diagnostics",
@@ -40,7 +36,6 @@ NODE_CATEGORIES = {
 
 
 def _replace_schema_category(schema, category):
-    """Return the schema with a new category across supported schema models."""
     if is_dataclass(schema):
         return replace(schema, category=category)
     if hasattr(schema, "model_copy"):
@@ -50,7 +45,6 @@ def _replace_schema_category(schema, category):
 
 
 def _categorized_node(node):
-    """Wrap a node class so its existing schema is exposed under our menu."""
     schema = node.define_schema()
     category = NODE_CATEGORIES.get(schema.node_id)
     if category is None:
@@ -59,10 +53,7 @@ def _categorized_node(node):
     class CategorizedNode(node):
         @classmethod
         def define_schema(cls):
-            return _replace_schema_category(
-                super().define_schema(),
-                category,
-            )
+            return _replace_schema_category(super().define_schema(), category)
 
     CategorizedNode.__name__ = node.__name__
     CategorizedNode.__qualname__ = node.__qualname__
@@ -79,6 +70,7 @@ class H3ExtendedExtension(ComfyExtension):
             MiniMaxH3HarnessExtension(),
             MiniMaxH3LongFormExtension(),
             MiniMaxH3MaskedCacheExtension(),
+            MiniMaxH3BlockCacheExtension(),
             MiniMaxH3AttentionExtension(),
             MiniMaxH3ActivationMemoryExtension(),
             MiniMaxH3MemoryOptimizerExtension(),
