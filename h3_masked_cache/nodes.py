@@ -7,6 +7,7 @@ import comfy.patcher_extension
 import folder_paths
 from comfy_api.latest import ComfyExtension, io
 
+from .compat import approximation_contamination_reason
 from .config import IMPLEMENTED_MODES, MODES, MaskedCacheConfig
 from .session import MaskedCacheSession
 from .wrappers import (
@@ -17,10 +18,37 @@ from .wrappers import (
 )
 
 WRAPPER_KEY = "h3_masked_cache"
+GUARD_WRAPPER_KEY = "h3_masked_cache_approximation_guard"
 
 
 def _output_dir():
     return os.path.join(folder_paths.get_output_directory(), "h3_masked_cache")
+
+
+def _make_approximation_guard(session):
+    """Disable or reject Stage-0 measurement before approximate execution."""
+    def wrapper(executor, *args, **kwargs):
+        run = session.run
+        if run is None or run.disabled_reason is not None:
+            return executor(*args, **kwargs)
+        transformer_options = (
+            args[3]
+            if len(args) > 3
+            else kwargs.get("transformer_options", {})
+        ) or {}
+        reason = approximation_contamination_reason(transformer_options)
+        if reason is None:
+            return executor(*args, **kwargs)
+        if session.config.strict:
+            raise RuntimeError(
+                "%s refusing to sample: %s. Disable approximate acceleration "
+                "or set strict=False to sample without a Stage-0 measurement."
+                % (LOG_PREFIX, reason)
+            )
+        logging.warning("%s disabled for this run: %s", LOG_PREFIX, reason)
+        run.disable(reason)
+        return executor(*args, **kwargs)
+    return wrapper
 
 
 class MiniMaxH3MaskedRef2VCache(io.ComfyNode):
@@ -62,7 +90,8 @@ class MiniMaxH3MaskedRef2VCache(io.ComfyNode):
                     tooltip="Recorded for later policy simulation; 0 means no refresh."),
                 io.Float.Input("dense_fallback_fraction", default=0.8, min=0.0, max=1.0, step=0.01),
                 io.Boolean.Input("strict", default=True,
-                    tooltip="Refuse invalid measurement, including EasyCache contamination."),
+                    tooltip=("Refuse invalid measurement, including EasyCache, Sol-Attn, "
+                             "or FirstBlockCache contamination.")),
                 io.String.Input("run_tag", default="h3mask"),
             ],
             outputs=[io.Model.Output()],
@@ -106,9 +135,10 @@ class MiniMaxH3MaskedRef2VCache(io.ComfyNode):
         comfy.patcher_extension.add_wrapper_with_key(
             comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, WRAPPER_KEY,
             make_diffusion_wrapper(session), m.model_options, is_model_options=True)
+        comfy.patcher_extension.add_wrapper_with_key(
+            comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, GUARD_WRAPPER_KEY,
+            _make_approximation_guard(session), m.model_options, is_model_options=True)
 
-        # Comfy invokes these after CFG and all earlier post-CFG hooks. Preserve
-        # existing callbacks and append an observer that returns denoised unchanged.
         post = list(m.model_options.get("sampler_post_cfg_function", []))
         post.append(make_post_cfg_observer(session))
         m.model_options["sampler_post_cfg_function"] = post

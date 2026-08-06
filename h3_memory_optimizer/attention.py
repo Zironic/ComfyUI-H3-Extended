@@ -1,17 +1,14 @@
-"""Capability-driven attention selection for the unified H3 memory patch.
+"""Capability-driven attention selection for the unified H3 optimizer.
 
-The registry mirrors SageAttention 2.2's public architecture dispatch:
-
-- SM80: CUDA FP16-V path
-- SM86: Triton per-block FP16-V path
-- SM89: CUDA FP8-V path
-- SM90: Hopper FP8-V path
-- SM120/121: SM89-family FP8 kernel with per-warp Q/K
-
-Unknown architectures or incomplete wheels fall back before model mutation.
+Dense ``auto`` remains lossless relative to the already selected Sage path.
+Sol-Attn is an explicit approximate sibling backend and is never selected by
+``auto``.  Every adapter is preflight-built before model mutation.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass
+import inspect
 import logging
 
 import torch
@@ -22,6 +19,7 @@ ATTENTION_SM86 = "efficient_sage_sm86"
 ATTENTION_SM89 = "efficient_sage_sm89"
 ATTENTION_SM90 = "efficient_sage_sm90"
 ATTENTION_SM12X = "efficient_sage_sm12x"
+ATTENTION_SOL = "sol_attn"
 ATTENTION_EXISTING = "existing"
 ATTENTION_MODES = (
     ATTENTION_AUTO,
@@ -30,18 +28,18 @@ ATTENTION_MODES = (
     ATTENTION_SM89,
     ATTENTION_SM90,
     ATTENTION_SM12X,
+    ATTENTION_SOL,
     ATTENTION_EXISTING,
 )
 
 FALLBACK_ALLOW = "allow"
 FALLBACK_ERROR = "error"
 FALLBACK_MODES = (FALLBACK_ALLOW, FALLBACK_ERROR)
-
 LOG_PREFIX = "[H3 memory optimizer]"
 
 
 class AttentionResolutionError(RuntimeError):
-    """No requested optimized adapter could be selected safely."""
+    pass
 
 
 @dataclass(frozen=True)
@@ -63,36 +61,16 @@ class RuntimeEnvironment:
             except Exception:
                 device = torch.device("cuda", torch.cuda.current_device())
             if device.type != "cuda":
-                return cls(
-                    False,
-                    None,
-                    None,
-                    "ComfyUI model device is %s" % device,
-                )
-            index = int(
-                device.index
-                if device.index is not None
-                else torch.cuda.current_device()
-            )
-            capability = tuple(
-                int(v) for v in torch.cuda.get_device_capability(index)
-            )
-            name = str(torch.cuda.get_device_name(index))
-            return cls(True, index, capability, name)
+                return cls(False, None, None, "ComfyUI model device is %s" % device)
+            index = int(device.index if device.index is not None else torch.cuda.current_device())
+            capability = tuple(int(v) for v in torch.cuda.get_device_capability(index))
+            return cls(True, index, capability, str(torch.cuda.get_device_name(index)))
         except Exception as exc:
-            return cls(
-                False,
-                None,
-                None,
-                "CUDA probe failed: %s: %s"
-                % (type(exc).__name__, exc),
-            )
+            return cls(False, None, None, "CUDA probe failed: %s: %s" % (type(exc).__name__, exc))
 
     @property
     def architecture(self):
-        if self.capability is None:
-            return "none"
-        return "sm%d%d" % self.capability
+        return "none" if self.capability is None else "sm%d%d" % self.capability
 
 
 @dataclass(frozen=True)
@@ -113,9 +91,7 @@ def _require_registered_sage():
     from comfy.ldm.modules.attention import get_attention_function
 
     if get_attention_function("sage", default=None) is None:
-        raise RuntimeError(
-            "ComfyUI has no registered 'sage' attention backend"
-        )
+        raise RuntimeError("ComfyUI has no registered 'sage' attention backend")
 
 
 def _require_local_triton():
@@ -123,7 +99,6 @@ def _require_local_triton():
         from ..h3_attention.triton_i64 import TRITON_AVAILABLE
     except ImportError:
         from h3_attention.triton_i64 import TRITON_AVAILABLE
-
     if not TRITON_AVAILABLE:
         raise RuntimeError("Triton is unavailable")
 
@@ -139,18 +114,11 @@ class _ExactCapabilityAdapter:
         if not environment.cuda_available:
             return False, environment.device_name
         if environment.capability not in cls.capabilities:
-            supported = ", ".join(
-                "SM%d%d" % capability
-                for capability in sorted(cls.capabilities)
-            )
-            return (
-                False,
-                "requires %s, detected %s (%s)"
-                % (
-                    supported,
-                    environment.architecture,
-                    environment.device_name,
-                ),
+            supported = ", ".join("SM%d%d" % x for x in sorted(cls.capabilities))
+            return False, "requires %s, detected %s (%s)" % (
+                supported,
+                environment.architecture,
+                environment.device_name,
             )
         return True, "%s detected" % environment.architecture.upper()
 
@@ -163,7 +131,7 @@ class _ExactCapabilityAdapter:
         return getattr(h3_attention, cls.backend_name)
 
     @classmethod
-    def build(cls):
+    def build(cls, environment=None, options=None):
         _require_registered_sage()
         if cls.requires_local_triton:
             _require_local_triton()
@@ -202,33 +170,81 @@ class SM12xAdapter(_ExactCapabilityAdapter):
     name = ATTENTION_SM12X
     capabilities = frozenset({(12, 0), (12, 1)})
     backend_name = "SageSM12xMemoryEfficientBackend"
-    # Upstream intentionally uses CUDA per-warp quantization on Blackwell.
-    requires_local_triton = False
 
 
-ADAPTERS = (
-    SM80Adapter,
-    SM86Adapter,
-    SM89Adapter,
-    SM90Adapter,
-    SM12xAdapter,
-)
-ADAPTER_BY_NAME = {
-    adapter.name: adapter
-    for adapter in ADAPTERS
-}
+DENSE_ADAPTERS = (SM80Adapter, SM86Adapter, SM89Adapter, SM90Adapter, SM12xAdapter)
+
+
+def _dense_adapter_for(environment):
+    return next(
+        (adapter for adapter in DENSE_ADAPTERS if environment.capability in adapter.capabilities),
+        None,
+    )
+
+
+class SolAdapter:
+    name = ATTENTION_SOL
+    capabilities = frozenset().union(*(x.capabilities for x in DENSE_ADAPTERS))
+
+    @classmethod
+    def probe(cls, environment):
+        if not environment.cuda_available:
+            return False, environment.device_name
+        if environment.capability is None or environment.capability[0] < 8:
+            return False, "Sol-Attn requires SM80 or newer; detected %s" % environment.architecture
+        return True, "%s detected; explicit approximate Sol mode" % environment.architecture.upper()
+
+    @classmethod
+    def build(cls, environment=None, options=None):
+        if environment is None:
+            environment = RuntimeEnvironment.detect()
+        try:
+            from ..h3_attention.sol import (
+                DenseBF16SDPABackend,
+                SolAttentionBackend,
+                SolAttentionConfig,
+                preflight_sol_attention,
+            )
+        except ImportError:
+            from h3_attention.sol import (
+                DenseBF16SDPABackend,
+                SolAttentionBackend,
+                SolAttentionConfig,
+                preflight_sol_attention,
+            )
+
+        dense_backend = None
+        dense_adapter = _dense_adapter_for(environment)
+        if dense_adapter is not None:
+            try:
+                dense_backend = dense_adapter.build(environment=environment)
+            except Exception as exc:
+                logging.warning(
+                    "%s Sol dense prepared-Sage fallback unavailable; using BF16 SDPA: %s: %s",
+                    LOG_PREFIX,
+                    type(exc).__name__,
+                    exc,
+                )
+        if dense_backend is None:
+            dense_backend = DenseBF16SDPABackend()
+
+        config = SolAttentionConfig(**(options or {}))
+        preflight_sol_attention(
+            environment, run_probe=True, kv_splits=config.kv_splits
+        )
+        return SolAttentionBackend(dense_backend, config=config)
+
+
+ADAPTERS = DENSE_ADAPTERS + (SolAdapter,)
+AUTO_ADAPTERS = DENSE_ADAPTERS
+ADAPTER_BY_NAME = {adapter.name: adapter for adapter in ADAPTERS}
 
 
 def _fallback(requested, environment, fallback, reasons):
-    reason = (
-        "; ".join(reasons)
-        if reasons
-        else "existing attention requested"
-    )
+    reason = "; ".join(reasons) if reasons else "existing attention requested"
     if fallback == FALLBACK_ERROR and requested != ATTENTION_EXISTING:
         raise AttentionResolutionError(
-            "cannot select %s on %s: %s"
-            % (requested, environment.device_name, reason)
+            "cannot select %s on %s: %s" % (requested, environment.device_name, reason)
         )
     return AttentionDecision(
         requested=requested,
@@ -240,41 +256,38 @@ def _fallback(requested, environment, fallback, reasons):
     )
 
 
+def _build_adapter(adapter, environment, options):
+    signature = inspect.signature(adapter.build)
+    kwargs = {}
+    if "environment" in signature.parameters:
+        kwargs["environment"] = environment
+    if "options" in signature.parameters:
+        kwargs["options"] = options
+    return adapter.build(**kwargs)
+
+
 def resolve_attention(
     requested=ATTENTION_AUTO,
     fallback=FALLBACK_ALLOW,
     environment=None,
     adapters=None,
+    adapter_options=None,
 ):
-    """Resolve an attention strategy without mutating the model.
-
-    Expected compatibility failures are converted to an ``existing`` decision
-    when fallback is allowed. Once an optimized adapter has been installed,
-    runtime kernel failures remain hard errors because a CUDA fault may poison
-    the context and a silent backend switch would invalidate results.
-    """
     if requested not in ATTENTION_MODES:
         raise ValueError("unknown attention mode %r" % requested)
     if fallback not in FALLBACK_MODES:
         raise ValueError("unknown attention fallback %r" % fallback)
-
     environment = environment or RuntimeEnvironment.detect()
     if requested == ATTENTION_EXISTING:
-        return _fallback(
-            requested,
-            environment,
-            FALLBACK_ALLOW,
-            [],
-        )
+        return _fallback(requested, environment, FALLBACK_ALLOW, [])
 
-    registry = tuple(adapters or ADAPTERS)
+    registry = tuple(adapters or (AUTO_ADAPTERS if requested == ATTENTION_AUTO else ADAPTERS))
     if requested == ATTENTION_AUTO:
         candidates = registry
     else:
-        adapter = next(
-            (item for item in registry if item.name == requested),
-            None,
-        )
+        adapter = next((item for item in registry if item.name == requested), None)
+        if adapter is None:
+            adapter = ADAPTER_BY_NAME.get(requested)
         if adapter is None:
             return _fallback(
                 requested,
@@ -291,15 +304,10 @@ def resolve_attention(
             reasons.append("%s: %s" % (adapter.name, probe_reason))
             continue
         try:
-            backend = adapter.build()
+            backend = _build_adapter(adapter, environment, adapter_options or {})
         except Exception as exc:
             reasons.append(
-                "%s preflight failed: %s: %s"
-                % (
-                    adapter.name,
-                    type(exc).__name__,
-                    exc,
-                )
+                "%s preflight failed: %s: %s" % (adapter.name, type(exc).__name__, exc)
             )
             continue
         return AttentionDecision(
@@ -311,15 +319,9 @@ def resolve_attention(
             environment=environment,
         )
 
-    decision = _fallback(
-        requested,
-        environment,
-        fallback,
-        reasons,
-    )
+    decision = _fallback(requested, environment, fallback, reasons)
     logging.warning(
-        "%s attention fallback: requested=%s selected=%s "
-        "device=%s arch=%s reason=%s",
+        "%s attention fallback: requested=%s selected=%s device=%s arch=%s reason=%s",
         LOG_PREFIX,
         requested,
         decision.selected,
