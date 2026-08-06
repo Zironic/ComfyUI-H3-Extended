@@ -5,11 +5,16 @@ from __future__ import annotations
 import os
 import subprocess
 
-from .frame_source import FrameSourceError, resolve_ffmpeg
+from .frame_source import resolve_ffmpeg
 
 
 class VideoWriterError(RuntimeError):
     pass
+
+
+def _partial_path(path, marker="partial"):
+    root, ext = os.path.splitext(path)
+    return "%s.%s%s" % (root, marker, ext or ".mkv")
 
 
 class FFmpegVideoWriter:
@@ -27,7 +32,7 @@ class FFmpegVideoWriter:
         self.preset = preset
         self.frames_written = 0
         self._process = None
-        self._partial = path + ".partial.mkv"
+        self._partial = _partial_path(path)
 
     def open(self):
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
@@ -66,6 +71,11 @@ class FFmpegVideoWriter:
             raise VideoWriterError("ffmpeg encoder exited with %d: %s" % (code, stderr[-2000:]))
         if commit:
             os.replace(self._partial, self.path)
+        else:
+            try:
+                os.remove(self._partial)
+            except FileNotFoundError:
+                pass
 
     def __enter__(self):
         return self.open()
@@ -81,7 +91,7 @@ def mux_source_audio(video_path, source_path, output_path, *, start_frame,
     ffmpeg = resolve_ffmpeg(ffmpeg_location)
     start = start_frame / float(fps)
     duration = frame_count / float(fps)
-    partial = output_path + ".partial"
+    partial = _partial_path(output_path)
     args = [
         ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error",
         "-i", video_path, "-ss", f"{start:.9f}", "-t", f"{duration:.9f}",
@@ -90,6 +100,10 @@ def mux_source_audio(video_path, source_path, output_path, *, start_frame,
     ]
     proc = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if proc.returncode != 0:
+        try:
+            os.remove(partial)
+        except FileNotFoundError:
+            pass
         raise VideoWriterError(
             "audio mux failed: %s" % proc.stderr.decode("utf-8", "replace")[-2000:]
         )
