@@ -22,18 +22,6 @@ const OVERLAP_FRAMES = Array.from(
     (_, index) => index + 4,
 ).filter((frames) => OVERLAP_RESIDUES.has(frames % 17));
 
-function replaceInputWithCombo(nodeData, name, values) {
-    const required = nodeData?.input?.required;
-    const current = required?.[name];
-    if (!current) return;
-
-    const options = { ...(current[1] || {}) };
-    delete options.min;
-    delete options.max;
-    delete options.step;
-    required[name] = [values, options];
-}
-
 function nearestAllowed(value, allowed) {
     if (!allowed.length) return undefined;
     const numeric = Number(value);
@@ -48,6 +36,38 @@ function nearestAllowed(value, allowed) {
     }, allowed[0]);
 }
 
+function makeComboWidget(widget, values) {
+    if (!widget) return;
+
+    // Change only the visible widget. Do not rewrite nodeData.input.required:
+    // doing that changes the socket type from INT to COMBO and makes the
+    // timeline node's INT passthrough outputs impossible to connect.
+    widget.type = "combo";
+    widget.options = {
+        ...(widget.options || {}),
+        values,
+    };
+    delete widget.options.min;
+    delete widget.options.max;
+    delete widget.options.step;
+}
+
+function setWidgetValue(node, widget, value) {
+    if (!widget || value === undefined || Number(widget.value) === Number(value)) {
+        return;
+    }
+
+    const previous = widget.value;
+    widget.value = value;
+    widget.callback?.(value);
+    node.onWidgetChanged?.(
+        widget.name,
+        value,
+        previous,
+        widget,
+    );
+}
+
 function syncOverlapChoices(node) {
     const chunkWidget = node.widgets?.find((widget) => widget.name === "chunk_frames");
     const overlapWidget = node.widgets?.find((widget) => widget.name === "overlap_frames");
@@ -56,40 +76,54 @@ function syncOverlapChoices(node) {
     const allowed = OVERLAP_FRAMES.filter(
         (frames) => frames < Number(chunkWidget.value),
     );
-    overlapWidget.options = {
-        ...(overlapWidget.options || {}),
-        values: allowed,
-    };
+    makeComboWidget(overlapWidget, allowed);
 
-    const current = Number(overlapWidget.value);
-    if (allowed.includes(current)) return;
-
-    const previous = overlapWidget.value;
-    const replacement = nearestAllowed(current, allowed);
-    if (replacement === undefined) return;
-
-    overlapWidget.value = replacement;
-    overlapWidget.callback?.(replacement);
-    node.onWidgetChanged?.(
-        overlapWidget.name,
-        replacement,
-        previous,
-        overlapWidget,
-    );
+    if (!allowed.includes(Number(overlapWidget.value))) {
+        setWidgetValue(
+            node,
+            overlapWidget,
+            nearestAllowed(overlapWidget.value, allowed),
+        );
+    }
 }
 
-function installDynamicOverlap(node) {
+function installLegalSelectors(node) {
     const chunkWidget = node.widgets?.find((widget) => widget.name === "chunk_frames");
-    if (!chunkWidget) return;
+    const overlapWidget = node.widgets?.find((widget) => widget.name === "overlap_frames");
+    if (!chunkWidget || !overlapWidget) return;
+
+    makeComboWidget(chunkWidget, CHUNK_FRAMES);
+    if (!CHUNK_FRAMES.includes(Number(chunkWidget.value))) {
+        setWidgetValue(
+            node,
+            chunkWidget,
+            nearestAllowed(chunkWidget.value, CHUNK_FRAMES),
+        );
+    }
 
     if (!chunkWidget.__h3LegalFramesWrapped) {
         const originalCallback = chunkWidget.callback;
         chunkWidget.callback = function (value, ...args) {
-            const result = originalCallback?.call(this, value, ...args);
+            const legal = nearestAllowed(value, CHUNK_FRAMES);
+            if (legal !== undefined) this.value = legal;
+            const result = originalCallback?.call(this, legal, ...args);
             syncOverlapChoices(node);
             return result;
         };
         chunkWidget.__h3LegalFramesWrapped = true;
+    }
+
+    if (!overlapWidget.__h3LegalFramesWrapped) {
+        const originalCallback = overlapWidget.callback;
+        overlapWidget.callback = function (value, ...args) {
+            const allowed = OVERLAP_FRAMES.filter(
+                (frames) => frames < Number(chunkWidget.value),
+            );
+            const legal = nearestAllowed(value, allowed);
+            if (legal !== undefined) this.value = legal;
+            return originalCallback?.call(this, legal, ...args);
+        };
+        overlapWidget.__h3LegalFramesWrapped = true;
     }
 
     syncOverlapChoices(node);
@@ -100,20 +134,19 @@ app.registerExtension({
     async beforeRegisterNodeDef(nodeType, nodeData) {
         if (!NODE_NAMES.has(nodeData.name)) return;
 
-        replaceInputWithCombo(nodeData, "chunk_frames", CHUNK_FRAMES);
-        replaceInputWithCombo(nodeData, "overlap_frames", OVERLAP_FRAMES);
-
+        // Keep the backend schema as INT so primitive outputs remain compatible.
+        // Only the instantiated widgets are converted to legal-value dropdowns.
         const originalCreated = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function () {
             const result = originalCreated?.apply(this, arguments);
-            installDynamicOverlap(this);
+            installLegalSelectors(this);
             return result;
         };
 
         const originalConfigure = nodeType.prototype.onConfigure;
         nodeType.prototype.onConfigure = function () {
             const result = originalConfigure?.apply(this, arguments);
-            installDynamicOverlap(this);
+            installLegalSelectors(this);
             return result;
         };
     },
