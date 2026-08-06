@@ -77,6 +77,7 @@ def _atomic_json(path, payload):
     os.replace(tmp, path)
 
 
+@torch.no_grad()
 def decode_chunk(video_vae, latent):
     images = video_vae.decode(latent)
     if images.ndim == 5:
