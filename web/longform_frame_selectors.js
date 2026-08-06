@@ -3,6 +3,7 @@ import { app } from "/scripts/app.js";
 const NODE_NAMES = new Set([
     "MiniMaxH3LongFormRef2VZi",
     "MiniMaxH3LongFormReferenceVideoZi",
+    "MiniMaxH3ChunkPromptTimelineZi",
 ]);
 
 // H3 video generation lengths are 17k+5. The long-form nodes deliberately
