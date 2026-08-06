@@ -20,7 +20,7 @@ except ImportError:  # pragma: no cover
     COND_CACHE_MODES = ["auto", "off", "refresh"]
 
 from . import runner
-from .chunk_stream import chunk_count_for
+from .chunk_stream import chunk_count_for, frames_needed_for
 from .frame_source import probe
 
 LOG = "[H3 Extended] longform"
@@ -115,13 +115,32 @@ class MiniMaxH3LongFormRef2V(io.ComfyNode):
             target_frames, geometry.chunk_frames, geometry.stride_frames
         )
 
+        # A run consumes the full span of its chunks, not just the frames it
+        # keeps: the last chunk always overhangs the target by up to C-1 frames.
+        # Checking `target_frames` here let a source land in that gap, pass
+        # validation, and then die inside pass A with the DiT already staged.
+        needed = frames_needed_for(
+            chunk_count, geometry.chunk_frames, geometry.stride_frames
+        )
         metadata = probe(video_path)
         available = None if metadata.estimated_frames is None else metadata.estimated_frames - start_frame
-        if available is not None and available < target_frames:
+        if available is not None and available < needed:
+            if available >= geometry.chunk_frames:
+                fits = (available - geometry.chunk_frames) // geometry.stride_frames + 1
+                best = frames_needed_for(
+                    fits, geometry.chunk_frames, geometry.stride_frames
+                )
+                hint = ("the most this source supports from here is %d frames "
+                        "(%.2f s, %d chunks)"
+                        % (best, best / geometry.fps, fits))
+            else:
+                hint = ("this source cannot fill even one %d-frame chunk from "
+                        "that start_frame" % geometry.chunk_frames)
             raise ValueError(
-                "source has about %d normalized frames after start_frame %d, but %d "
-                "exact output frames were requested"
-                % (max(0, available), start_frame, target_frames)
+                "source has about %d normalized frames after start_frame %d, but "
+                "%d exact output frames need %d source frames across %d chunks; %s"
+                % (max(0, available), start_frame, target_frames, needed,
+                   chunk_count, hint)
             )
 
         if width and height:
