@@ -5,7 +5,12 @@ from dataclasses import is_dataclass, replace
 from comfy_api.latest import ComfyExtension
 
 from . import nodes_minimax_h3
-from .chunked_ref2v.longform.nodes import MiniMaxH3LongFormExtension
+from .chunked_ref2v.longform.preview_nodes import (
+    MiniMaxH3LongFormPreviewExtension,
+)
+from .chunked_ref2v.longform.reference_preview_nodes import (
+    MiniMaxH3LongFormReferencePreviewExtension,
+)
 from .chunked_ref2v.nodes import MiniMaxH3HarnessExtension
 from . import cond_cache_diagnostics
 from .h3_activation_memory.nodes import MiniMaxH3ActivationMemoryExtension
@@ -13,6 +18,11 @@ from .h3_attention.nodes import MiniMaxH3AttentionExtension
 from .h3_masked_cache.nodes import MiniMaxH3MaskedCacheExtension
 from .h3_memory_optimizer.nodes import MiniMaxH3MemoryOptimizerExtension
 from .h3_probe.nodes import MiniMaxH3ProbeExtension
+
+# Comfy serves JavaScript from this directory. The long-form nodes use it for
+# two independent live preview panes because the standard progress protocol
+# carries only one replaceable preview image.
+WEB_DIRECTORY = "./web"
 
 # Install the diagnostic wrapper at `cond_cache.encode` itself. Rebinding only
 # `nodes_minimax_h3.encode_conditioning` covered the (Zi) nodes but silently
@@ -28,6 +38,7 @@ NODE_CATEGORIES = {
     "EmptyMiniMaxH3LatentAVZi": "H3-Extender/Generation",
     "MiniMaxH3ImageToVideoZi": "H3-Extender/Generation",
     "MiniMaxH3ReferenceToVideoZi": "H3-Extender/Generation",
+    "MiniMaxH3LongFormReferenceVideoZi": "H3-Extender/Generation",
     "MiniMaxH3SigmaShiftZi": "H3-Extender/Model Patches",
     "MiniMaxH3EfficientSagePatchZi": "H3-Extender/Model Patches",
     "MiniMaxH3ActivationMemoryZi": "H3-Extender/Model Patches",
@@ -41,6 +52,7 @@ NODE_CATEGORIES = {
 
 def _replace_schema_category(schema, category):
     """Return the schema with a new category across supported schema models."""
+
     if is_dataclass(schema):
         return replace(schema, category=category)
     if hasattr(schema, "model_copy"):
@@ -51,6 +63,7 @@ def _replace_schema_category(schema, category):
 
 def _categorized_node(node):
     """Wrap a node class so its existing schema is exposed under our menu."""
+
     schema = node.define_schema()
     category = NODE_CATEGORIES.get(schema.node_id)
     if category is None:
@@ -77,13 +90,17 @@ class H3ExtendedExtension(ComfyExtension):
             MiniMaxH3Extension(),
             MiniMaxH3ProbeExtension(),
             MiniMaxH3HarnessExtension(),
-            MiniMaxH3LongFormExtension(),
+            MiniMaxH3LongFormPreviewExtension(),
+            MiniMaxH3LongFormReferencePreviewExtension(),
             MiniMaxH3MaskedCacheExtension(),
             MiniMaxH3AttentionExtension(),
             MiniMaxH3ActivationMemoryExtension(),
             MiniMaxH3MemoryOptimizerExtension(),
         ):
-            nodes.extend(_categorized_node(node) for node in await ext.get_node_list())
+            nodes.extend(
+                _categorized_node(node)
+                for node in await ext.get_node_list()
+            )
         return nodes
 
 

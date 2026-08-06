@@ -12,6 +12,12 @@ from chunked_ref2v.longform.chunk_stream import (
     plan_chunks,
 )
 from chunked_ref2v.longform.manifest import RunManifest, identity_hash
+from chunked_ref2v.longform.reference_runner import (
+    _pack_blocks,
+    _paired_audio,
+    _reference_identity,
+    _unpack_blocks,
+)
 from chunked_ref2v.longform.runner import (
     _pack_conditioning,
     _unpack_conditioning,
@@ -76,6 +82,55 @@ class ConditioningPersistenceTests(unittest.TestCase):
         self.assertIsNone(rebuilt[0][1]["mask"])
         self.assertEqual(rebuilt[0][1]["strength"], 0.5)
         self.assertEqual(rebuilt[0][1]["labels"], ["a", "b"])
+
+
+class ReferencePersistenceTests(unittest.TestCase):
+    def test_reference_blocks_round_trip_without_interpreting_kinds(self):
+        blocks = [
+            {
+                "kind": "image",
+                "latent_h": 4,
+                "latent_w": 5,
+                "latent": torch.arange(20).reshape(1, 1, 4, 5),
+            },
+            {
+                "kind": "audio",
+                "ref_audio_t": 7,
+                "audio_latent": torch.ones(1, 2, 3),
+            },
+        ]
+        tensors, metadata = _pack_blocks(blocks)
+        rebuilt = _unpack_blocks(tensors, metadata)
+        self.assertEqual(rebuilt[0]["kind"], "image")
+        self.assertEqual(rebuilt[1]["kind"], "audio")
+        self.assertTrue(torch.equal(rebuilt[0]["latent"], blocks[0]["latent"]))
+        self.assertTrue(torch.equal(
+            rebuilt[1]["audio_latent"], blocks[1]["audio_latent"]
+        ))
+
+    def test_reference_identity_is_order_independent_and_content_sensitive(self):
+        a = torch.zeros(1, 2, 2, 3)
+        b = torch.ones(1, 2, 2, 3)
+        first = _reference_identity(
+            {"ref_image_1": b, "ref_image_0": a}, {}, {}, {}
+        )
+        reordered = _reference_identity(
+            {"ref_image_0": a, "ref_image_1": b}, {}, {}, {}
+        )
+        changed = _reference_identity(
+            {"ref_image_0": a, "ref_image_1": b + 1}, {}, {}, {}
+        )
+        self.assertEqual(first, reordered)
+        self.assertNotEqual(first, changed)
+
+    def test_reference_video_audio_pairs_by_autogrow_suffix(self):
+        audio = {"waveform": torch.zeros(1, 1, 8), "sample_rate": 32000}
+        self.assertIs(
+            _paired_audio({"ref_video_audio_2": audio}, "ref_video_2"), audio
+        )
+        self.assertIsNone(
+            _paired_audio({"ref_video_audio_1": audio}, "ref_video_2")
+        )
 
 
 class DecodeTests(unittest.TestCase):
