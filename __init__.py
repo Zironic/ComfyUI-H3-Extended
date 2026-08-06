@@ -13,6 +13,7 @@ from .chunked_ref2v.longform.reference_preview_nodes import (
 )
 from .chunked_ref2v.longform import (
     completed_preview_runtime,
+    dual_prompt_audio_compat,
     dual_prompt_runtime,
     v2v_audio_runtime,
 )
@@ -39,6 +40,9 @@ v2v_audio_runtime.install()
 # node variants have been imported. The runtime preserves the existing prompt
 # socket and uses a blank continuation prompt as an explicit fallback.
 dual_prompt_runtime.install()
+# Preserve the prompt selection at the audiovisual replacement methods, which
+# retain source-audio references, generated-audio carry, previews, and output.
+dual_prompt_audio_compat.install()
 
 # Keep finalized MP4 segments as the primary completed-output preview, but make
 # that channel failure-safe: GIF fallback first, explicit browser error second.
