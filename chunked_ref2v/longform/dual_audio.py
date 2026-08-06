@@ -23,8 +23,10 @@ def build_dual_audio_mux_args(
     """Build an FFmpeg command with generated audio first and source second.
 
     Track 0 is generated and marked default. Track 1 is the synchronized source
-    audio and remains selectable. Both tracks are trimmed to the exact normalized
-    video interval.
+    audio and remains selectable. Both tracks are bounded by the exact normalized
+    video duration. The command deliberately does not use ``-shortest``: a source
+    soundtrack that ends early must not truncate the complete generated video and
+    generated-audio track.
     """
 
     start = int(start_frame) / float(fps)
@@ -68,7 +70,6 @@ def build_dual_audio_mux_args(
         "0",
         "-t",
         "%.9f" % duration,
-        "-shortest",
         "-movflags",
         "+faststart",
         "-y",
