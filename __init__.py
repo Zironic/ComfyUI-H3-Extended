@@ -10,10 +10,8 @@ from .chunked_ref2v.longform.preview_nodes import (
 )
 from .chunked_ref2v.longform.reference_preview_nodes import (
     MiniMaxH3LongFormReferencePreviewExtension,
-    MiniMaxH3LongFormReferenceVideoPreview,
 )
 from .chunked_ref2v.longform import (
-    chunk_aligned_audio_refs,
     completed_preview_runtime,
     v2v_audio_runtime,
 )
@@ -35,10 +33,6 @@ WEB_DIRECTORY = "./web"
 # replacing the duplicated video-only sampler with synchronized video+audio
 # carry, source-audio conditioning, and dual-track output.
 v2v_audio_runtime.install()
-
-# Add an opt-in chronological audio-reference mode to the generic long-form
-# reference node. The default remains full-track reuse for compatibility.
-chunk_aligned_audio_refs.install_node(MiniMaxH3LongFormReferenceVideoPreview)
 
 # Keep finalized MP4 segments as the primary completed-output preview, but make
 # that channel failure-safe: GIF fallback first, explicit browser error second.
