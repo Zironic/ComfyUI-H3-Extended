@@ -90,10 +90,6 @@ def _stable_fraction(rel, threshold):
     return float((rel <= threshold).float().mean().item()) if rel.numel() else 0.0
 
 
-def _threshold_key(threshold):
-    return "%g%%" % (100.0 * float(threshold))
-
-
 def _stream_update(previous, current, thresholds=STABLE_THRESHOLDS):
     """Measure one video stream update at 1x2x2 DiT-patch granularity.
 
@@ -186,6 +182,10 @@ def _stream_update(previous, current, thresholds=STABLE_THRESHOLDS):
     }
 
 
+def _threshold_key(threshold):
+    return "%g%%" % (100.0 * float(threshold))
+
+
 def _region_metrics(stream, layout, start, stop, thresholds=STABLE_THRESHOLDS):
     """Reduce an update over the same target-video rows sampled by MoBA."""
     if stream is None or layout is None:
@@ -213,8 +213,14 @@ def _region_metrics(stream, layout, start, stop, thresholds=STABLE_THRESHOLDS):
     }
 
 
-def _strip_global(stream):
-    return stream.get("global") if stream else None
+def _strip_transient(stream):
+    if stream is None:
+        return None
+    return {
+        "frames": stream["frames"],
+        "global": stream["global"],
+        "patch_shape": list(stream["patch_shape"]),
+    }
 
 
 def _pearson(xs, ys):
@@ -259,18 +265,17 @@ def summarize_dynamics(dynamics, moba_records=()):
         frame_rows = rec.get("frames", [])
         row = {
             "anchor_frames": list(rec.get("anchor_frames", [])),
-            "sample_update_rel_l2": rec.get("global", {})
-            .get("sample", {})
-            .get("update_rel_l2"),
-            "prediction_update_rel_l2": rec.get("global", {})
-            .get("prediction", {})
-            .get("update_rel_l2"),
+            "sample_update_rel_l2": (
+                rec.get("global", {}).get("sample") or {}
+            ).get("update_rel_l2"),
+            "prediction_update_rel_l2": (
+                rec.get("global", {}).get("prediction") or {}
+            ).get("update_rel_l2"),
         }
         for stream_name in ("sample", "prediction"):
             distances, updates = [], []
             for fr in frame_rows:
-                stream = fr.get(stream_name) or {}
-                value = stream.get("update_rel_l2")
+                value = (fr.get(stream_name) or {}).get("update_rel_l2")
                 distance = fr.get("anchor_distance")
                 if value is not None and distance is not None:
                     distances.append(distance)
@@ -424,8 +429,12 @@ class LatentDynamicsTracker:
             "frames": frame_rows,
             "query_regions": region_rows,
             "global": {
-                "sample": _strip_global(sample_update),
-                "prediction": _strip_global(prediction_update),
+                "sample": _strip_transient(sample_update).get("global")
+                if sample_update
+                else None,
+                "prediction": _strip_transient(prediction_update).get("global")
+                if prediction_update
+                else None,
             },
             "patch_shape": list(patch_shape),
         }
