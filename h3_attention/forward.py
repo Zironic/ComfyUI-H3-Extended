@@ -89,7 +89,7 @@ def make_forward(module, layer_index, backend=None, attention=None):
 
         with torch.no_grad():
             notify_attention(
-                q, k,
+                q, k, v,
                 layer_index=layer_index,
                 transformer_options=transformer_options,
             )

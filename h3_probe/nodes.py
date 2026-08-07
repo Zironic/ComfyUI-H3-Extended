@@ -80,9 +80,10 @@ class MiniMaxH3AttentionProbe(io.ComfyNode):
 class MiniMaxH3Moba3DProbe(io.ComfyNode):
     """Simulate the H3 team's publicly described MoBA-style 3D routing.
 
-    This is measurement only: non-video context remains dense, target-video keys
-    are grouped in 3D blocks and represented by mean-pooled post-RoPE keys, and
-    the resulting content router is scored against exact dense attention mass.
+    Measurement only: non-video context remains dense, target-video keys are
+    grouped in 3D blocks and represented by mean-pooled post-RoPE keys. Each
+    query token routes independently, and Q/K/V are used to compare the exact
+    masked-and-renormalized sparse output with dense attention.
     """
 
     @classmethod
@@ -91,7 +92,7 @@ class MiniMaxH3Moba3DProbe(io.ComfyNode):
             node_id="MiniMaxH3Moba3DProbeZi",
             display_name="MiniMax H3 MoBA 3D Probe (Zi)",
             category="model/patch/minimax",
-            description="Probe-only simulation of MiniMax's disclosed H3 sparse-attention idea: video-only 3D candidate blocks, mean-pooled routing, dense non-video context. Does not alter inference.",
+            description="Probe-only simulation of MiniMax's disclosed H3 sparse-attention idea: video-only 3D candidate blocks, per-query-token mean-pooled routing, dense non-video context, and exact sparse-vs-dense output error. Does not alter inference and is intentionally expensive on probed steps.",
             inputs=[
                 io.Model.Input("model"),
                 io.Boolean.Input("enabled", default=True),
@@ -100,11 +101,11 @@ class MiniMaxH3Moba3DProbe(io.ComfyNode):
                 io.String.Input("steps", default="auto", tooltip="Denoising steps: auto or comma-separated indices."),
                 io.Int.Input("query_time_positions", default=3, min=1, max=16, tooltip="Video query-frame positions sampled across the clip."),
                 io.Int.Input("query_spatial_positions", default=2, min=1, max=8, tooltip="Query regions sampled within each selected latent frame."),
-                io.Int.Input("query_block", default=64, min=16, max=512, step=16, tooltip="Number of query tokens averaged into one routing probe. This is independent of the 3D KV block geometry."),
+                io.Int.Input("query_block", default=64, min=16, max=512, step=16, tooltip="Number of query tokens evaluated in each sampled region. Every token routes independently; larger values make the probe substantially slower."),
                 io.Int.Input("block_t", default=1, min=1, max=16, tooltip="3D candidate block extent in latent time."),
                 io.Int.Input("block_h", default=4, min=1, max=32, tooltip="3D candidate block extent in video patch rows."),
                 io.Int.Input("block_w", default=4, min=1, max=32, tooltip="3D candidate block extent in video patch columns."),
-                io.String.Input("video_budgets", default="10,20,30,40", tooltip="Percent of video blocks retained by the router, e.g. 10,20,30,40."),
+                io.String.Input("video_budgets", default="10,20,30,40", tooltip="Percent of video blocks retained independently per query token and head, e.g. 10,20,30,40."),
                 io.Boolean.Input("include_audio_query", default=True, tooltip="Also test audio queries routing into video blocks."),
                 io.Boolean.Input("include_text_query", default=False),
                 io.Boolean.Input("capture_uncond", default=False),
