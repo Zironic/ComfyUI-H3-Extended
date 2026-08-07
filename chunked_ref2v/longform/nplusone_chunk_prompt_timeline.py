@@ -322,6 +322,7 @@ class MiniMaxH3NPlusOneChunkPromptTimeline(io.ComfyNode):
                 io.Int.Output("chunk_frames", display_name="chunk frames"),
                 io.String.Output("report", display_name="report"),
                 io.Int.Output("reference_frames", display_name="reference frames"),
+                io.Int.Output("seed", display_name="seed"),
             ],
         )
 
@@ -333,6 +334,7 @@ class MiniMaxH3NPlusOneChunkPromptTimeline(io.ComfyNode):
         global_prompt="",
         chunk_prompts_json="",
         reference_frames=90,
+        seed=0,
     ) -> io.NodeOutput:
         plan = build_nplusone_chunk_prompt_plan(
             output_seconds=output_seconds,
@@ -340,6 +342,7 @@ class MiniMaxH3NPlusOneChunkPromptTimeline(io.ComfyNode):
             reference_frames=reference_frames,
             global_prompt=global_prompt,
             chunk_prompts_json=chunk_prompts_json,
+            seed=seed,
         )
         lines = [
             "MiniMax H3 N+1 Chunk Prompt Timeline",
@@ -353,6 +356,8 @@ class MiniMaxH3NPlusOneChunkPromptTimeline(io.ComfyNode):
                 plan["reference_frames"],
             ),
             "chunks    %d" % plan["chunk_count"],
+            "seed      %d (per-chunk seeds derived; keep fixed to resume)"
+            % plan["seed"],
         ]
         for index, prompt in enumerate(plan["chunk_prompts"]):
             start = index * plan["chunk_frames"]
@@ -379,6 +384,7 @@ class MiniMaxH3NPlusOneChunkPromptTimeline(io.ComfyNode):
             int(chunk_frames),
             "\n".join(lines),
             int(plan["reference_frames"]),
+            int(plan["seed"]),
         )
 
 
