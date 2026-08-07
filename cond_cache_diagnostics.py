@@ -172,12 +172,6 @@ def _log_bypass_context(clip, mode):
         logging.info("%s diagnostic: bypass %s is enabled", LOG,
                      cond_cache._ENV_DISABLE)
         return True
-    patches = getattr(clip.patcher, "patches", None)
-    if patches:
-        names = sorted(str(k) for k in patches)
-        logging.info("%s diagnostic: bypass weight patches count=%d first=%s",
-                     LOG, len(names), names[:5])
-        return True
     forced_hooks = getattr(clip.patcher, "forced_hooks", None)
     if forced_hooks is not None and getattr(clip, "use_clip_schedule", False):
         logging.info("%s diagnostic: bypass hook schedule type=%s",

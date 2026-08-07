@@ -4,15 +4,10 @@ Run from the ComfyUI root:
 
     python custom_nodes/ComfyUI-H3-Extended/tests/test_cond_cache_diagnostics.py
 
-The diagnostics were written, imported and installed, and still never produced a
-single line in `comfyui.log` — because they were installed by rebinding
-`nodes_minimax_h3.encode_conditioning`, which cannot reach a caller that does
-`from ..cond_cache import encode` inside a function body. The harness does
-exactly that, and the harness is the thing whose misses needed explaining.
-
-So the assertions here are mostly about *reachability*: that installing routes
-every calling style, that it does not recurse, and that it still reports which
-component moved.
+The assertions are mostly about reachability: installing must route every calling
+style, must not recurse, and must report which key component moved. Runtime
+weight patches are now keyable via ``patches_uuid`` rather than a diagnostics
+bypass, so that path is covered here as well.
 """
 
 import logging
@@ -45,6 +40,8 @@ def check(cond, msg):
 class FakePatcher:
     def __init__(self):
         self.patches = {}
+        self.weight_wrapper_patches = {}
+        self.patches_uuid = "base-process-uuid"
         self.forced_hooks = None
         self.cached_patcher_init = (
             None, ([_TE_FILE], None, "MINIMAX_H3", {"dtype": torch.float16}))
@@ -83,7 +80,7 @@ class Capture(logging.Handler):
         self.lines = []
 
     def emit(self, record):
-        self.lines.append(record.getMessage())  # already applies record.args
+        self.lines.append(record.getMessage())
 
     def __enter__(self):
         self.lines = []
@@ -126,7 +123,7 @@ def test_no_recursion(clip, image):
 def test_reports_the_component_that_moved(clip, image):
     print("a repeat under the same label names what changed")
     tokens = make_tokens([7, 8, 9], image)
-    harness_style_call(clip, tokens)  # first observation
+    harness_style_call(clip, tokens)
 
     nudged = image.clone()
     nudged[0, 0, 0, 0] += 0.5
@@ -160,22 +157,50 @@ def test_cache_behaviour_is_unchanged(clip, image):
 
 
 def test_bypass_paths_are_explained(clip, image):
-    print("a bypass says which bypass it was")
+    print("true bypasses say which bypass they were")
     tokens = make_tokens([12, 13], image)
     with Capture() as cap:
-        harness_style_call.__globals__  # no-op, keeps the import style honest
         from cond_cache import encode as e
         e(clip, tokens, mode="off", label="x")
     check(any("bypass mode=off" in ln for ln in cap.diagnostics()), "mode=off is named")
 
-    clip.patcher.patches = {"model.layers.0.weight": [1]}
+    clip.patcher.forced_hooks = object()
+    clip.use_clip_schedule = True
     try:
         with Capture() as cap:
             harness_style_call(clip, tokens)
-        check(any("bypass weight patches" in ln for ln in cap.diagnostics()),
-              "a LoRA-patched text encoder is named")
+        check(any("bypass hook schedule" in ln for ln in cap.diagnostics()),
+              "hook-scheduled encoder bypass is named")
+    finally:
+        clip.patcher.forced_hooks = None
+        clip.use_clip_schedule = False
+
+
+def test_runtime_patches_are_keyed_not_bypassed(clip, image):
+    print("runtime weight patches participate in the diagnostic model key")
+    cond_cache.purge()
+    tokens = make_tokens([14, 15], image)
+    clip.patcher.patches = {"model.layers.0.weight": [1]}
+    clip.patcher.patches_uuid = "patch-a"
+    try:
+        before = clip.calls
+        with Capture() as cap:
+            harness_style_call(clip, tokens)
+            harness_style_call(clip, tokens)
+        check(clip.calls == before + 1, "same patched state caches through diagnostics")
+        check(not any("bypass weight patches" in ln for ln in cap.diagnostics()),
+              "weight patches are not reported as a bypass")
+
+        with Capture() as cap:
+            clip.patcher.patches_uuid = "patch-b"
+            harness_style_call(clip, tokens)
+        check(clip.calls == before + 2, "new patches_uuid re-encodes")
+        summary = " ".join(ln for ln in cap.diagnostics() if "changes=" in ln)
+        check("model" in summary.split("changes=")[-1],
+              "diagnostics attribute patches_uuid change to the model component")
     finally:
         clip.patcher.patches = {}
+        clip.patcher.patches_uuid = "base-process-uuid"
 
 
 def main():
@@ -198,6 +223,7 @@ def main():
     test_reports_the_component_that_moved(clip, image)
     test_cache_behaviour_is_unchanged(clip, image)
     test_bypass_paths_are_explained(clip, image)
+    test_runtime_patches_are_keyed_not_bypassed(clip, image)
     print("\nall cond cache diagnostics tests passed")
 
 
