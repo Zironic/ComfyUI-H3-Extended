@@ -11,6 +11,9 @@ from .chunked_ref2v.longform.preview_nodes import (
 from .chunked_ref2v.longform.reference_preview_nodes import (
     MiniMaxH3LongFormReferencePreviewExtension,
 )
+from .chunked_ref2v.longform.av_continuation_nodes import (
+    MiniMaxH3LongFormAVContinuationExtension,
+)
 from .chunked_ref2v.longform.video_output_contract import adapt_longform_node
 from .chunked_ref2v.longform.chunk_prompt_timeline import (
     MiniMaxH3ChunkPromptTimelineExtension,
@@ -57,6 +60,7 @@ NODE_CATEGORIES = {
     "MiniMaxH3ImageToVideoZi": "H3-Extender/Generation",
     "MiniMaxH3ReferenceToVideoZi": "H3-Extender/Generation",
     "MiniMaxH3LongFormReferenceVideoZi": "H3-Extender/Generation",
+    "MiniMaxH3LongFormAVContinuationZi": "H3-Extender/Generation",
     "MiniMaxH3ChunkPromptTimelineZi": "H3-Extender/Generation",
     "MiniMaxH3SigmaShiftZi": "H3-Extender/Model Patches",
     "MiniMaxH3EfficientSagePatchZi": "H3-Extender/Model Patches",
@@ -113,6 +117,7 @@ class H3ExtendedExtension(ComfyExtension):
             MiniMaxH3ChunkPromptTimelineExtension(),
             MiniMaxH3LongFormPreviewExtension(),
             MiniMaxH3LongFormReferencePreviewExtension(),
+            MiniMaxH3LongFormAVContinuationExtension(),
             MiniMaxH3MaskedCacheExtension(),
             MiniMaxH3AttentionExtension(),
             MiniMaxH3ActivationMemoryExtension(),
