@@ -1,14 +1,21 @@
 """Probe-only 3D MoBA-style routing simulation for MiniMax H3.
 
 This module does not change inference. It evaluates a parameter-free content
-router against exact dense attention on selected H3 query blocks. Only target-
+router against exact dense attention on selected H3 query tokens. Only target-
 video KV tokens are sparsification candidates; non-video context stays dense.
+
+The public H3 description says block importance is probed with mean pooling and
+3D sparsification is applied to video tokens. This probe intentionally stops
+there: it does not claim to reproduce MiniMax's unreleased training-aware
+backend, block geometry, or kernel implementation.
 """
 
 from __future__ import annotations
 
 import math
+
 import torch
+
 
 DEFAULT_BUDGETS = (0.10, 0.20, 0.30, 0.40)
 
@@ -67,20 +74,25 @@ def _video_block_map(layout, bt, bh, bw, device):
 
 
 def prepare_video_router(k, layout, *, block_t=1, block_h=4, block_w=4):
-    """Build the mean-pooled video-block index once for one attention call."""
+    """Build the mean-pooled video-block key index once per attention call."""
     if k.ndim != 4 or k.shape[0] != 1 or k.shape[2] != layout.seq_len:
         raise ValueError("expected k shaped [1, heads, seq, dim]")
     ids, counts, grid, n_blocks = _video_block_map(
-        layout, block_t, block_h, block_w, k.device)
+        layout, block_t, block_h, block_w, k.device
+    )
     v0, v1 = layout.video_range
     if v1 - v0 != ids.numel():
         raise ValueError("video token count does not match the resolved 3D lattice")
+
     kv = k[0, :, v0:v1, :].float()
     heads, _tokens, dim = kv.shape
-    pooled = torch.zeros(heads, n_blocks, dim, device=k.device, dtype=torch.float32)
+    pooled = torch.zeros(
+        heads, n_blocks, dim, device=k.device, dtype=torch.float32
+    )
     index = ids.view(1, -1, 1).expand(heads, -1, dim)
     pooled.scatter_add_(1, index, kv)
     pooled /= counts.clamp_min(1).float().view(1, -1, 1)
+
     return {
         "block_ids": ids,
         "counts": counts,
@@ -91,87 +103,299 @@ def prepare_video_router(k, layout, *, block_t=1, block_h=4, block_w=4):
     }
 
 
-def _mean_dense_mass(q_sel, k_all, layout, block_ids, n_blocks, head_chunk):
-    heads = q_sel.shape[0]
-    scale = q_sel.shape[-1] ** -0.5
-    v0, v1 = layout.video_range
-    nonvideo, video_blocks = [], []
-    for h0 in range(0, heads, head_chunk):
-        h1 = min(heads, h0 + head_chunk)
-        scores = torch.matmul(
-            q_sel[h0:h1].float(), k_all[h0:h1].float().transpose(-1, -2)
-        ) * scale
-        probs = torch.softmax(scores, dim=-1).mean(dim=1)
-        nv = probs[:, :v0].sum(-1) + probs[:, v1:].sum(-1)
-        vb = torch.zeros(h1 - h0, n_blocks, device=probs.device, dtype=torch.float32)
-        vb.scatter_add_(1, block_ids.view(1, -1).expand(h1 - h0, -1), probs[:, v0:v1])
-        nonvideo.append(nv)
-        video_blocks.append(vb)
-    return torch.cat(nonvideo), torch.cat(video_blocks)
+def _block_mass(video_probs, block_ids, n_blocks):
+    """Reduce exact dense video probabilities to [head, query, 3D-block]."""
+    heads, queries, _video_tokens = video_probs.shape
+    out = torch.zeros(
+        heads, queries, n_blocks,
+        device=video_probs.device, dtype=torch.float32,
+    )
+    index = block_ids.view(1, 1, -1).expand(heads, queries, -1)
+    out.scatter_add_(2, index, video_probs)
+    return out
 
 
-def analyze_routing(q, k, layout, qs, qe, *, block_t=1, block_h=4, block_w=4,
-                    budgets=DEFAULT_BUDGETS, head_chunk=4, prepared=None):
-    """Compare mean-pooled 3D routing with exact dense attention."""
-    if q.ndim != 4 or k.ndim != 4 or q.shape != k.shape or q.shape[0] != 1:
-        raise ValueError("expected matching q/k tensors shaped [1, heads, seq, dim]")
+def _renormalized_sparse_output(probs, values, video_keep, video_range):
+    """Exact masked-attention output from dense probabilities.
+
+    If logits are unchanged, masking keys and applying softmax again is exactly
+    equivalent to taking the original dense probabilities on retained keys and
+    renormalizing them by their retained mass. Doing that here avoids allocating
+    another full masked-logit tensor for every budget.
+    """
+    v0, v1 = video_range
+    video_probs = probs[:, :, v0:v1]
+    selected_video = video_probs * video_keep.to(video_probs.dtype)
+
+    retained = selected_video.sum(-1)
+    numerator = torch.matmul(selected_video, values[:, v0:v1, :])
+
+    if v0:
+        retained = retained + probs[:, :, :v0].sum(-1)
+        numerator = numerator + torch.matmul(
+            probs[:, :, :v0], values[:, :v0, :]
+        )
+    if v1 < probs.shape[-1]:
+        retained = retained + probs[:, :, v1:].sum(-1)
+        numerator = numerator + torch.matmul(
+            probs[:, :, v1:], values[:, v1:, :]
+        )
+
+    retained = retained.clamp_min(1e-12)
+    return retained, numerator / retained.unsqueeze(-1)
+
+
+def _per_head_error(got, want):
+    """Return per-head relative-L2, mean-absolute, and max-absolute errors."""
+    diff = got - want
+    heads = diff.shape[0]
+    flat_diff = diff.reshape(heads, -1)
+    flat_want = want.reshape(heads, -1)
+    rel_l2 = torch.linalg.vector_norm(flat_diff, dim=-1) / torch.linalg.vector_norm(
+        flat_want, dim=-1
+    ).clamp_min(1e-12)
+    mean_abs = flat_diff.abs().mean(-1)
+    max_abs = flat_diff.abs().amax(-1)
+    return rel_l2, mean_abs, max_abs
+
+
+def _threshold_heads(rel_l2):
+    values = rel_l2.tolist()
+    return {
+        "heads_rel_l2_gt_1pct": [i for i, x in enumerate(values) if x > 0.01],
+        "heads_rel_l2_gt_2pct": [i for i, x in enumerate(values) if x > 0.02],
+        "heads_rel_l2_gt_5pct": [i for i, x in enumerate(values) if x > 0.05],
+    }
+
+
+def _worst_heads(rel_l2, limit=5):
+    order = torch.argsort(rel_l2, descending=True)[: min(limit, rel_l2.numel())]
+    return [
+        {"head": int(i), "rel_l2": float(rel_l2[i])}
+        for i in order.tolist()
+    ]
+
+
+def analyze_routing(
+    q,
+    k,
+    v,
+    layout,
+    qs,
+    qe,
+    *,
+    block_t=1,
+    block_h=4,
+    block_w=4,
+    budgets=DEFAULT_BUDGETS,
+    head_chunk=4,
+    prepared=None,
+):
+    """Evaluate per-query-token 3D routing and exact sparse-output error.
+
+    q/k/v are H3 attention tensors in [1, heads, seq, dim]. Routing is performed
+    independently for every query token and head, as in MoBA-style top-k block
+    selection. For every budget we compare the routed block set with an oracle
+    that selects blocks using exact dense attention mass, then compute both
+    routed and oracle sparse outputs after proper softmax renormalization.
+    """
+    if (
+        q.ndim != 4
+        or k.ndim != 4
+        or v.ndim != 4
+        or q.shape != k.shape
+        or q.shape != v.shape
+        or q.shape[0] != 1
+    ):
+        raise ValueError(
+            "expected matching q/k/v tensors shaped [1, heads, seq, dim]"
+        )
+    if q.shape[2] != layout.seq_len:
+        raise ValueError("q/k/v sequence length does not match the packed layout")
     if not (0 <= qs < qe <= layout.seq_len):
         raise ValueError("query range is outside the packed sequence")
+
     budgets = parse_budgets(budgets)
     prepared = prepared or prepare_video_router(
-        k, layout, block_t=block_t, block_h=block_h, block_w=block_w)
-    if tuple(prepared["block_shape"]) != (int(block_t), int(block_h), int(block_w)):
-        raise ValueError("prepared router block geometry does not match requested geometry")
+        k,
+        layout,
+        block_t=block_t,
+        block_h=block_h,
+        block_w=block_w,
+    )
+    requested_shape = (int(block_t), int(block_h), int(block_w))
+    if tuple(prepared["block_shape"]) != requested_shape:
+        raise ValueError(
+            "prepared router block geometry does not match requested geometry"
+        )
 
     ids = prepared["block_ids"]
     counts = prepared["counts"]
     grid = prepared["grid"]
-    n_blocks = prepared["n_blocks"]
+    n_blocks = int(prepared["n_blocks"])
     pooled = prepared["pooled_keys"]
     v0, v1 = layout.video_range
+    scale = q.shape[-1] ** -0.5
+    heads = q.shape[1]
+    head_chunk = max(1, int(head_chunk))
+    q_sel_all = q[0, :, qs:qe, :]
 
-    q_sel = q[0, :, qs:qe, :]
-    q_probe = q_sel.float().mean(dim=1)
-    route_scores = torch.einsum("hd,hbd->hb", q_probe, pooled) * (q.shape[-1] ** -0.5)
-    dense_nonvideo, dense_video_blocks = _mean_dense_mass(
-        q_sel, k[0], layout, ids, n_blocks, max(1, int(head_chunk)))
-    total = dense_nonvideo + dense_video_blocks.sum(-1)
-    if not torch.allclose(total, torch.ones_like(total), atol=2e-4, rtol=2e-4):
-        raise RuntimeError("dense attention mass did not sum to one")
+    accum = {
+        frac: {
+            "routed_mass": [],
+            "oracle_mass": [],
+            "overlap": [],
+            "density": [],
+            "rel_l2": [],
+            "mean_abs": [],
+            "max_abs": [],
+            "oracle_rel_l2": [],
+            "oracle_mean_abs": [],
+            "oracle_max_abs": [],
+        }
+        for frac in budgets
+    }
+    dense_nonvideo = []
+    dense_video = []
+
+    for h0 in range(0, heads, head_chunk):
+        h1 = min(heads, h0 + head_chunk)
+        qh = q_sel_all[h0:h1].float()
+        kh = k[0, h0:h1].float()
+        vh = v[0, h0:h1].float()
+
+        scores = torch.matmul(qh, kh.transpose(-1, -2)) * scale
+        probs = torch.softmax(scores, dim=-1)
+        del scores
+
+        dense_out = torch.matmul(probs, vh)
+        video_probs = probs[:, :, v0:v1]
+        exact_blocks = _block_mass(video_probs, ids, n_blocks)
+        nonvideo_mass = probs[:, :, :v0].sum(-1)
+        if v1 < probs.shape[-1]:
+            nonvideo_mass = nonvideo_mass + probs[:, :, v1:].sum(-1)
+        dense_nonvideo.append(nonvideo_mass.detach().cpu())
+        dense_video.append(video_probs.sum(-1).detach().cpu())
+
+        route_scores = torch.einsum(
+            "hqd,hbd->hqb", qh, pooled[h0:h1]
+        ) * scale
+
+        for frac in budgets:
+            keep = max(1, min(n_blocks, int(math.ceil(float(frac) * n_blocks))))
+            routed_idx = torch.topk(route_scores, k=keep, dim=-1).indices
+            oracle_idx = torch.topk(exact_blocks, k=keep, dim=-1).indices
+
+            routed_blocks = torch.zeros_like(exact_blocks, dtype=torch.bool)
+            oracle_blocks = torch.zeros_like(exact_blocks, dtype=torch.bool)
+            routed_blocks.scatter_(2, routed_idx, True)
+            oracle_blocks.scatter_(2, oracle_idx, True)
+
+            routed_keep = routed_blocks.index_select(2, ids)
+            oracle_keep = oracle_blocks.index_select(2, ids)
+
+            routed_mass, routed_out = _renormalized_sparse_output(
+                probs, vh, routed_keep, (v0, v1)
+            )
+            oracle_mass, oracle_out = _renormalized_sparse_output(
+                probs, vh, oracle_keep, (v0, v1)
+            )
+
+            rel_l2, mean_abs, max_abs = _per_head_error(routed_out, dense_out)
+            oracle_rel_l2, oracle_mean_abs, oracle_max_abs = _per_head_error(
+                oracle_out, dense_out
+            )
+
+            overlap = (routed_blocks & oracle_blocks).sum(-1).float() / keep
+            selected_tokens = counts[routed_idx].sum(-1).float()
+            effective_density = (
+                layout.seq_len - (v1 - v0) + selected_tokens
+            ) / layout.seq_len
+
+            bucket = accum[frac]
+            bucket["routed_mass"].append(routed_mass.detach().cpu())
+            bucket["oracle_mass"].append(oracle_mass.detach().cpu())
+            bucket["overlap"].append(overlap.detach().cpu())
+            bucket["density"].append(effective_density.detach().cpu())
+            bucket["rel_l2"].append(rel_l2.detach().cpu())
+            bucket["mean_abs"].append(mean_abs.detach().cpu())
+            bucket["max_abs"].append(max_abs.detach().cpu())
+            bucket["oracle_rel_l2"].append(oracle_rel_l2.detach().cpu())
+            bucket["oracle_mean_abs"].append(oracle_mean_abs.detach().cpu())
+            bucket["oracle_max_abs"].append(oracle_max_abs.detach().cpu())
+
+            del (
+                routed_blocks,
+                oracle_blocks,
+                routed_keep,
+                oracle_keep,
+                routed_mass,
+                routed_out,
+                oracle_mass,
+                oracle_out,
+            )
+
+        del probs, dense_out, video_probs, exact_blocks, route_scores
+
+    dense_nonvideo = torch.cat(dense_nonvideo, dim=0)
+    dense_video = torch.cat(dense_video, dim=0)
 
     rows = []
     for frac in budgets:
+        bucket = accum[frac]
+        routed_mass = torch.cat(bucket["routed_mass"], dim=0)
+        oracle_mass = torch.cat(bucket["oracle_mass"], dim=0)
+        overlap = torch.cat(bucket["overlap"], dim=0)
+        density = torch.cat(bucket["density"], dim=0)
+        rel_l2 = torch.cat(bucket["rel_l2"], dim=0)
+        mean_abs = torch.cat(bucket["mean_abs"], dim=0)
+        max_abs = torch.cat(bucket["max_abs"], dim=0)
+        oracle_rel_l2 = torch.cat(bucket["oracle_rel_l2"], dim=0)
+        oracle_mean_abs = torch.cat(bucket["oracle_mean_abs"], dim=0)
+        oracle_max_abs = torch.cat(bucket["oracle_max_abs"], dim=0)
+
+        regret = oracle_mass - routed_mass
         keep = max(1, min(n_blocks, int(math.ceil(float(frac) * n_blocks))))
-        routed_idx = torch.topk(route_scores, k=keep, dim=-1).indices
-        oracle_idx = torch.topk(dense_video_blocks, k=keep, dim=-1).indices
-        routed_mask = torch.zeros_like(dense_video_blocks, dtype=torch.bool)
-        oracle_mask = torch.zeros_like(dense_video_blocks, dtype=torch.bool)
-        routed_mask.scatter_(1, routed_idx, True)
-        oracle_mask.scatter_(1, oracle_idx, True)
-        routed_mass = dense_nonvideo + (dense_video_blocks * routed_mask).sum(-1)
-        oracle_mass = dense_nonvideo + (dense_video_blocks * oracle_mask).sum(-1)
-        overlap = (routed_mask & oracle_mask).sum(-1).float() / keep
-        selected_tokens = counts[routed_idx].sum(-1).float()
-        effective_density = (layout.seq_len - (v1 - v0) + selected_tokens) / layout.seq_len
-        rows.append({
-            "budget": float(frac), "keep_blocks": int(keep), "video_blocks": int(n_blocks),
+
+        row = {
+            "budget": float(frac),
+            "keep_blocks": int(keep),
+            "video_blocks": int(n_blocks),
             "video_block_density": float(keep / n_blocks),
-            "routed_mass_mean": float(routed_mass.mean().item()),
-            "routed_mass_min_head": float(routed_mass.min().item()),
-            "oracle_mass_mean": float(oracle_mass.mean().item()),
-            "oracle_mass_min_head": float(oracle_mass.min().item()),
-            "routing_regret_mean": float((oracle_mass - routed_mass).mean().item()),
-            "routing_regret_max_head": float((oracle_mass - routed_mass).max().item()),
-            "oracle_block_overlap_mean": float(overlap.mean().item()),
-            "effective_token_density_mean": float(effective_density.mean().item()),
-        })
+            "routed_mass_mean": float(routed_mass.mean()),
+            "routed_mass_min": float(routed_mass.min()),
+            "oracle_mass_mean": float(oracle_mass.mean()),
+            "oracle_mass_min": float(oracle_mass.min()),
+            "routing_regret_mean": float(regret.mean()),
+            "routing_regret_max": float(regret.max()),
+            "oracle_block_overlap_mean": float(overlap.mean()),
+            "oracle_block_overlap_min": float(overlap.min()),
+            "effective_token_density_mean": float(density.mean()),
+            "effective_token_density_max": float(density.max()),
+            "sparse_output_rel_l2_mean_head": float(rel_l2.mean()),
+            "sparse_output_rel_l2_median_head": float(rel_l2.median()),
+            "sparse_output_rel_l2_max_head": float(rel_l2.max()),
+            "sparse_output_mean_abs_mean_head": float(mean_abs.mean()),
+            "sparse_output_max_abs": float(max_abs.max()),
+            "oracle_output_rel_l2_mean_head": float(oracle_rel_l2.mean()),
+            "oracle_output_rel_l2_max_head": float(oracle_rel_l2.max()),
+            "oracle_output_mean_abs_mean_head": float(oracle_mean_abs.mean()),
+            "oracle_output_max_abs": float(oracle_max_abs.max()),
+            "head_rel_l2": [float(x) for x in rel_l2.tolist()],
+            "oracle_head_rel_l2": [float(x) for x in oracle_rel_l2.tolist()],
+            "worst_heads": _worst_heads(rel_l2),
+        }
+        row.update(_threshold_heads(rel_l2))
+        rows.append(row)
 
     return {
+        "routing_granularity": "per-query-token",
         "block_shape": list(prepared["block_shape"]),
         "block_grid": [int(x) for x in grid],
-        "video_blocks": int(n_blocks), "video_tokens": int(v1 - v0),
+        "video_blocks": int(n_blocks),
+        "video_tokens": int(v1 - v0),
         "nonvideo_tokens": int(layout.seq_len - (v1 - v0)),
-        "dense_nonvideo_mass_mean": float(dense_nonvideo.mean().item()),
-        "dense_video_mass_mean": float(dense_video_blocks.sum(-1).mean().item()),
+        "dense_nonvideo_mass_mean": float(dense_nonvideo.mean()),
+        "dense_video_mass_mean": float(dense_video.mean()),
         "budgets": rows,
     }
