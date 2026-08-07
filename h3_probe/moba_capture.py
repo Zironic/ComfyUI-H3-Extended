@@ -37,9 +37,23 @@ class MobaProbeRun:
 
 
 class MobaProbeSession:
-    def __init__(self, tag, layers_spec, steps_spec, n_time, n_spatial, query_block,
-                 include_audio, include_text, capture_uncond, block_t, block_h,
-                 block_w, budgets, base_dir):
+    def __init__(
+        self,
+        tag,
+        layers_spec,
+        steps_spec,
+        n_time,
+        n_spatial,
+        query_block,
+        include_audio,
+        include_text,
+        capture_uncond,
+        block_t,
+        block_h,
+        block_w,
+        budgets,
+        base_dir,
+    ):
         self.tag = tag
         self.layers_spec = layers_spec
         self.steps_spec = steps_spec
@@ -58,6 +72,7 @@ class MobaProbeSession:
 
     def begin(self):
         import time
+
         stamp = time.strftime("%Y%m%d-%H%M%S")
         name = "%s_%s" % (self.tag, stamp)
         self.run = MobaProbeRun(self, name, os.path.join(self.base_dir, name))
@@ -70,6 +85,7 @@ class MobaProbeSession:
             logging.warning("[H3 MoBA3D probe] run finished with no captures")
             return None
         from .moba_report import write_run
+
         path = write_run(run)
         logging.info("[H3 MoBA3D probe] %d records -> %s", len(run.records), path)
         return path
@@ -88,9 +104,15 @@ class ForwardMobaProbe:
         self.queries = None
         self.explicit = False
 
-    def observe(self, q, k, layer_index=None):
+    def observe(self, q, k, v, layer_index=None):
         if q.shape[2] != self.layout.seq_len:
             return
+        if v is None:
+            raise RuntimeError(
+                "MoBA3D output-error probe requires V, but the attention "
+                "observation seam did not provide it"
+            )
+
         if layer_index is None:
             if self.explicit:
                 return
@@ -104,22 +126,47 @@ class ForwardMobaProbe:
 
         if self.queries is None:
             self.queries = capture.select_query_blocks(
-                self.layout, self.run.n_time, self.run.n_spatial, self.run.query_block,
-                include_audio=self.run.include_audio, include_text=self.run.include_text)
+                self.layout,
+                self.run.n_time,
+                self.run.n_spatial,
+                self.run.query_block,
+                include_audio=self.run.include_audio,
+                include_text=self.run.include_text,
+            )
 
+        # Mean-pooled keys are query-independent, so build the 3D index only
+        # once for this attention layer and reuse it for every sampled query.
         prepared = moba3d.prepare_video_router(
-            k, self.layout,
-            block_t=self.run.block_t, block_h=self.run.block_h, block_w=self.run.block_w)
+            k,
+            self.layout,
+            block_t=self.run.block_t,
+            block_h=self.run.block_h,
+            block_w=self.run.block_w,
+        )
         for spec in self.queries:
             result = moba3d.analyze_routing(
-                q, k, self.layout, spec["start"], spec["stop"],
-                block_t=self.run.block_t, block_h=self.run.block_h,
-                block_w=self.run.block_w, budgets=self.run.budgets, prepared=prepared)
+                q,
+                k,
+                v,
+                self.layout,
+                spec["start"],
+                spec["stop"],
+                block_t=self.run.block_t,
+                block_h=self.run.block_h,
+                block_w=self.run.block_w,
+                budgets=self.run.budgets,
+                prepared=prepared,
+            )
             rec = dict(spec)
-            rec.update({
-                "layer": layer, "step": self.step, "sigma": self.sigma,
-                "cond_or_uncond": self.cond_or_uncond, "moba3d": result,
-            })
+            rec.update(
+                {
+                    "layer": layer,
+                    "step": self.step,
+                    "sigma": self.sigma,
+                    "cond_or_uncond": self.cond_or_uncond,
+                    "moba3d": result,
+                }
+            )
             self.run.records.append(rec)
 
 
@@ -133,13 +180,16 @@ def make_outer_wrapper(session):
                 session.end()
             except Exception:
                 logging.exception("[H3 MoBA3D probe] final report write failed")
+
     return wrapper
 
 
 def make_wrapper(session):
     def wrapper(executor, *args, **kwargs):
         run = session.run
-        transformer_options = args[3] if len(args) > 3 else kwargs.get("transformer_options", {})
+        transformer_options = (
+            args[3] if len(args) > 3 else kwargs.get("transformer_options", {})
+        )
         x = args[0]
         context = args[2]
         payload = kwargs.get("minimax_payload") or {}
@@ -162,19 +212,34 @@ def make_wrapper(session):
             num_layers = len(getattr(model, "blocks", [])) or 50
             run.layers = set(capture.resolve_indices(run.layers_spec, num_layers))
             run.steps = set(capture.resolve_indices(run.steps_spec, total_steps))
-            run.notes.update({
-                "total_steps": int(total_steps), "num_layers": int(num_layers),
-                "mode": "probe-only parameter-free 3D mean-pooled routing",
-            })
+            run.notes.update(
+                {
+                    "total_steps": int(total_steps),
+                    "num_layers": int(num_layers),
+                    "mode": (
+                        "probe-only per-query-token 3D mean-pooled routing "
+                        "with exact sparse-output comparison"
+                    ),
+                }
+            )
             logging.info(
-                "[H3 MoBA3D probe] layout=%s layers=%s steps=%s block=%dx%dx%d budgets=%s",
-                layout.describe(), sorted(run.layers), sorted(run.steps),
-                run.block_t, run.block_h, run.block_w, run.budgets)
+                "[H3 MoBA3D probe] layout=%s layers=%s steps=%s "
+                "block=%dx%dx%d budgets=%s per-query-token routing",
+                layout.describe(),
+                sorted(run.layers),
+                sorted(run.steps),
+                run.block_t,
+                run.block_h,
+                run.block_w,
+                run.budgets,
+            )
 
         step, sigma = capture._step_index(transformer_options)
         cu = transformer_options.get("cond_or_uncond") or [0]
         cond_or_uncond = int(cu[0])
-        if step not in run.steps or (not run.capture_uncond and cond_or_uncond != 0):
+        if step not in run.steps or (
+            not run.capture_uncond and cond_or_uncond != 0
+        ):
             return executor(*args, **kwargs)
 
         probe = ForwardMobaProbe(run, layout, step, sigma, cond_or_uncond)
@@ -184,7 +249,9 @@ def make_wrapper(session):
         finally:
             try:
                 from .moba_report import write_run
+
                 write_run(run)
             except Exception:
                 logging.exception("[H3 MoBA3D probe] report write failed")
+
     return wrapper
