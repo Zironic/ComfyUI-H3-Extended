@@ -124,7 +124,7 @@ class LongFormAVContinuationTests(unittest.TestCase):
             141, 64, 96, 3,
         )
         video = torch.arange(
-            141 * 24 * 42 * 4 * 6,
+            24 * 42 * 4 * 6,
             dtype=torch.float32,
         ).reshape(1, 24, 42, 4, 6)
         audio = torch.arange(1 * 32 * 2 * 235, dtype=torch.float32).reshape(

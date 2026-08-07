@@ -43,7 +43,10 @@ LOG_PREFIX = "[H3 Extended] harness"
 
 # Re-exported: the definition moved to `geometry` so the prompt planner and the
 # resume scan can derive chunk seeds without importing torch.
-from .geometry import splitmix64  # noqa: E402,F401  (kept importable from here)
+try:
+    from .geometry import splitmix64  # noqa: F401  (kept importable from here)
+except ImportError:  # the self-tests import this file as a top-level module
+    from geometry import splitmix64  # noqa: F401
 
 
 class SeedSet:

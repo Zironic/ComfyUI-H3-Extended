@@ -33,7 +33,10 @@ from ..audio_boundary_profile import (
     validate_av_continuation_chunk_frames,
 )
 from ..geometry import AUDIO_LATENT_FPS, HarnessGeometry
-from ...cond_cache import MODES as COND_CACHE_MODES
+try:
+    from ...cond_cache import MODES as COND_CACHE_MODES
+except ImportError:  # the self-tests import this file as a top-level module
+    from cond_cache import MODES as COND_CACHE_MODES
 from .audio_output import (
     FFmpegAudioWriter,
     audio_sample_rate,

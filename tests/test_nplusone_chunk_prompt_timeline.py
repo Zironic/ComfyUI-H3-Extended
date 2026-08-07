@@ -167,6 +167,8 @@ class NPlusOneChunkPromptTimelineTests(unittest.TestCase):
         self.assertEqual(prompts, ["fallback", "fallback", "fallback"])
 
     def test_schema_orders_reference_widget_after_chunk_prompts_json(self):
+        # Order is pinned because widget positions are stored positionally in
+        # saved workflows. New widgets append; they never insert.
         schema = MiniMaxH3NPlusOneChunkPromptTimeline.define_schema()
         names = [getattr(item, "id", getattr(item, "name", None)) for item in schema.inputs]
         self.assertEqual(
@@ -177,6 +179,7 @@ class NPlusOneChunkPromptTimelineTests(unittest.TestCase):
                 "global_prompt",
                 "chunk_prompts_json",
                 "reference_frames",
+                "seed",
             ],
         )
 
@@ -191,6 +194,7 @@ class NPlusOneChunkPromptTimelineTests(unittest.TestCase):
                 "chunk_frames",
                 "report",
                 "reference_frames",
+                "seed",
             ],
         )
 
