@@ -21,6 +21,7 @@ from .chunked_ref2v.longform import (
 )
 from .chunked_ref2v.nodes import MiniMaxH3HarnessExtension
 from . import cond_cache_diagnostics
+from .diagnostics.nodes import MiniMaxH3DiagnosticsExtension
 from .h3_activation_memory.nodes import MiniMaxH3ActivationMemoryExtension
 from .h3_attention.nodes import MiniMaxH3AttentionExtension
 from .h3_masked_cache.nodes import MiniMaxH3MaskedCacheExtension
@@ -117,6 +118,7 @@ class H3ExtendedExtension(ComfyExtension):
             MiniMaxH3AttentionExtension(),
             MiniMaxH3ActivationMemoryExtension(),
             MiniMaxH3MemoryOptimizerExtension(),
+            MiniMaxH3DiagnosticsExtension(),
         ):
             nodes.extend(
                 _categorized_node(node)
