@@ -14,16 +14,32 @@ DEFAULT_BUDGETS = (0.10, 0.20, 0.30, 0.40)
 
 
 def parse_budgets(spec):
+    """Normalize a budget string or numeric iterable to sorted fractions.
+
+    The node passes a string (``"10,20,30"``), while the probe session stores
+    the normalized tuple and may pass that tuple back through this function.
+    Accepting both makes normalization idempotent.
+    """
     if spec is None:
         return DEFAULT_BUDGETS
-    text = str(spec).strip()
-    if not text or text.lower() == "auto":
-        return DEFAULT_BUDGETS
+
+    if isinstance(spec, str):
+        text = spec.strip()
+        if not text or text.lower() == "auto":
+            return DEFAULT_BUDGETS
+        parts = text.split(",")
+    else:
+        try:
+            parts = list(spec)
+        except TypeError:
+            parts = [spec]
+
     values = []
-    for part in text.split(","):
-        part = part.strip()
-        if not part:
-            continue
+    for part in parts:
+        if isinstance(part, str):
+            part = part.strip()
+            if not part:
+                continue
         value = float(part)
         if value > 1.0:
             value /= 100.0
