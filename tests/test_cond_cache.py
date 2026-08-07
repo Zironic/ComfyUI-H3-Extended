@@ -4,12 +4,9 @@ Run from the ComfyUI root:
 
     python custom_nodes/ComfyUI-H3-Extended/tests/test_cond_cache.py
 
-No model or checkpoint required. The text encoder is the one thing that cannot
-be exercised here — loading Qwen3-VL-32B to test a cache would defeat the point —
-so it is stubbed with a counter, and what gets tested is everything around it:
-that a hit returns bit-identical tensors, that every input which genuinely
-changes the embeddings also changes the key, that the bypasses fire, and that a
-hit does not leave the entry mmap-locked against eviction.
+No model or checkpoint required. The text encoder is stubbed with a counter;
+the tests cover cache identity, persistence semantics, token/reference hashing,
+bypass paths, storage, eviction and cleanup.
 """
 
 import glob
@@ -34,15 +31,10 @@ import torch  # noqa: E402
 import cond_cache  # noqa: E402
 
 VISION_START, VISION_END = 151652, 151653
+PINNED_DIGEST = "e34800f7c0293c1fdd74fcf3f95faf8db756c78bdd9c88d20b9994e51ec0aa12"
 
-# The key for a fixed input, pinned so it cannot drift. Verified equal across
-# the implementation before and after the diagnostics work by loading both
-# modules side by side; see test_key_is_pinned for why it matters.
-PINNED_DIGEST = "e8af1cdbd4ff2fd1e29b8a688199e7f058501d581d7b42b2931fc1b160e014a8"
-
-# deliberately outside the cache directory: the sweep must never be able to
-# reach a checkpoint, and a test that stored one inside would not notice
 _TE_FILE = os.path.join(_TMPROOT, "fake_te.safetensors")
+_ALT_TE_FILE = os.path.join(_TMPROOT, "fake_te_v2.safetensors")
 
 
 def check(cond, msg):
@@ -52,18 +44,18 @@ def check(cond, msg):
 
 
 class FakePatcher:
-    """Stands in for the CLIP's ModelPatcher: provenance, LoRAs and hooks."""
+    """Stands in for the CLIP's ModelPatcher provenance and patch state."""
 
     def __init__(self):
         self.patches = {}
+        self.weight_wrapper_patches = {}
+        self.patches_uuid = "base-process-uuid"
         self.forced_hooks = None
         self.cached_patcher_init = (
             None, ([_TE_FILE], None, "MINIMAX_H3", {"dtype": torch.float16}))
 
 
 class FakeCLIP:
-    """Counts encoder invocations; the count is what every assertion reads."""
-
     layer_idx = None
     use_clip_schedule = False
 
@@ -82,7 +74,6 @@ class FakeCLIP:
 
 
 def make_tokens(text_ids, image=None, video_pair=None, video_block=True):
-    """Mimic MiniMaxH3Tokenizer's output: ids interleaved with vision blocks."""
     entries = [(t, 1.0) for t in text_ids]
     if image is not None:
         entries += [(VISION_START, 1.0),
@@ -96,11 +87,16 @@ def make_tokens(text_ids, image=None, video_pair=None, video_block=True):
     return {"qwen3vl_32b": [entries]}
 
 
-def write_te(payload):
-    with open(_TE_FILE, "wb") as f:
+def write_te(path, payload):
+    with open(path, "wb") as f:
         f.write(payload)
-    # size and mtime are the fingerprint; make sure mtime actually moves
-    os.utime(_TE_FILE, (time.time() + 10, time.time() + 10))
+
+
+def set_checkpoint(clip, path):
+    init = clip.patcher.cached_patcher_init
+    args = list(init[1])
+    args[0] = [path]
+    clip.patcher.cached_patcher_init = (init[0], tuple(args))
 
 
 def test_hit_is_bit_identical(clip, tokens):
@@ -117,8 +113,8 @@ def test_hit_is_bit_identical(clip, tokens):
     check(set(first[0][1]) == set(second[0][1]), "no keys gained or lost")
 
 
-def test_key_covers_every_input(clip, image, video):
-    print("everything that changes the embeddings changes the key")
+def test_key_covers_token_inputs(clip, image, video):
+    print("everything in the token presentation that changes embeddings changes the key")
 
     def misses(label, tokens):
         before = clip.calls
@@ -131,8 +127,6 @@ def test_key_covers_every_input(clip, image, video):
     nudged[0, 0, 0, 0] += 0.01
     misses("one changed pixel in a reference image", make_tokens([1, 2, 3], nudged, video[2:4]))
 
-    # frames[i:i+2] is a contiguous view over the whole video, so a naive
-    # storage-level hash would read identical bytes for every pair
     misses("different video frame pair, same shape", make_tokens([1, 2, 3], image, video[4:6]))
     before = clip.calls
     cond_cache.encode(clip, make_tokens([1, 2, 3], image, video[4:6]))
@@ -141,8 +135,77 @@ def test_key_covers_every_input(clip, image, video):
     misses("minimax_video_block flag cleared",
            make_tokens([1, 2, 3], image, video[4:6], video_block=False))
 
-    write_te(b"y" * 4096)
-    misses("text encoder file replaced", make_tokens([1, 2, 3], image, video[2:4]))
+
+def test_checkpoint_identity_policy(clip, tokens):
+    print("checkpoint identity is persistent by filename, not filesystem metadata")
+    cond_cache.purge()
+    set_checkpoint(clip, _TE_FILE)
+    write_te(_TE_FILE, b"x" * 1024)
+    base = cond_cache.tokens_digest(clip, tokens)
+
+    # Replacing/touching the file under the same name is intentionally assumed to
+    # mean the same checkpoint. This is a short-lived optimization cache, not a
+    # cryptographic model registry.
+    write_te(_TE_FILE, b"different bytes and different size" * 200)
+    os.utime(_TE_FILE, (time.time() + 123, time.time() + 123))
+    check(cond_cache.tokens_digest(clip, tokens) == base,
+          "same checkpoint filename survives size/content/mtime changes")
+
+    # The process-local ModelPatcher UUID also must not poison persistence for an
+    # ordinary unpatched checkpoint.
+    clip.patcher.patches_uuid = "another-process-uuid"
+    check(cond_cache.tokens_digest(clip, tokens) == base,
+          "unpatched identity ignores process-local patches_uuid")
+
+    write_te(_ALT_TE_FILE, b"anything")
+    set_checkpoint(clip, _ALT_TE_FILE)
+    check(cond_cache.tokens_digest(clip, tokens) != base,
+          "different checkpoint filename gets a different key")
+    set_checkpoint(clip, _TE_FILE)
+
+
+def test_runtime_patch_identity(clip, tokens):
+    print("runtime-patched encoders cache by patches_uuid within one process")
+    cond_cache.purge()
+    clip.patcher.patches = {"model.layers.0.weight": [1]}
+    clip.patcher.patches_uuid = "patch-state-a"
+    try:
+        before = clip.calls
+        first_digest = cond_cache.tokens_digest(clip, tokens)
+        cond_cache.encode(clip, tokens)
+        cond_cache.encode(clip, tokens)
+        check(clip.calls == before + 1, "same patched state hits on repeat")
+
+        clip.patcher.patches_uuid = "patch-state-b"
+        second_digest = cond_cache.tokens_digest(clip, tokens)
+        check(second_digest != first_digest, "changed patches_uuid changes the key")
+        cond_cache.encode(clip, tokens)
+        check(clip.calls == before + 2, "changed patch state re-encodes")
+
+        clip.patcher.patches_uuid = None
+        check(cond_cache.tokens_digest(clip, tokens) is None,
+              "patched encoder without patches_uuid is not cacheable")
+        cond_cache.encode(clip, tokens)
+        cond_cache.encode(clip, tokens)
+        check(clip.calls == before + 4, "unknown patched state bypasses safely")
+    finally:
+        clip.patcher.patches = {}
+        clip.patcher.patches_uuid = "base-process-uuid"
+
+
+def test_weight_wrapper_patch_identity(clip, tokens):
+    print("weight-wrapper patches use the same ephemeral identity policy")
+    cond_cache.purge()
+    clip.patcher.weight_wrapper_patches = {"model.layers.0.weight": object()}
+    clip.patcher.patches_uuid = "wrapper-a"
+    try:
+        a = cond_cache.tokens_digest(clip, tokens)
+        clip.patcher.patches_uuid = "wrapper-b"
+        b = cond_cache.tokens_digest(clip, tokens)
+        check(a != b, "weight-wrapper patch UUID participates in the key")
+    finally:
+        clip.patcher.weight_wrapper_patches = {}
+        clip.patcher.patches_uuid = "base-process-uuid"
 
 
 def test_bypasses(clip, tokens):
@@ -153,10 +216,6 @@ def test_bypasses(clip, tokens):
         cond_cache.encode(clip, tokens)
         cond_cache.encode(clip, tokens)
         check(clip.calls == before + 2, label)
-
-    clip.patcher.patches = {"model.layers.0.weight": [1]}
-    always_encodes("LoRA-patched text encoder")
-    clip.patcher.patches = {}
 
     clip.patcher.forced_hooks = object()
     clip.use_clip_schedule = True
@@ -181,7 +240,7 @@ def test_bypasses(clip, tokens):
 
 def test_modes(clip, tokens):
     print("refresh re-encodes and overwrites")
-    cond_cache.encode(clip, tokens)  # ensure stored
+    cond_cache.encode(clip, tokens)
     before = clip.calls
     cond_cache.encode(clip, tokens, mode="refresh")
     check(clip.calls == before + 1, "refresh ignored the stored entry")
@@ -191,7 +250,7 @@ def test_modes(clip, tokens):
 
 def test_entry_not_mmap_locked(clip, tokens):
     print("a hit must not leave the file locked (Windows)")
-    cond_cache.encode(clip, tokens)  # warm hit; holds mmap views unless cloned
+    cond_cache.encode(clip, tokens)
     path = os.path.join(CACHE, cond_cache.tokens_digest(clip, tokens)[:32] + ".safetensors")
     check(os.path.exists(path), "entry is on disk")
     try:
@@ -226,18 +285,17 @@ def test_eviction(clip, image, video):
         del os.environ["H3_COND_CACHE_GB"]
 
 
-def test_evicts_least_recently_used(clip, image, video):
-    print("eviction drops the least recently *used*, not the oldest stored")
+def test_evicts_least_recently_used(clip, image):
+    print("eviction drops the least recently used, not the oldest stored")
     cond_cache.purge()
     keep = make_tokens([70, 1], image)
     drop = make_tokens([71, 1], image)
     cond_cache.encode(clip, keep)
     cond_cache.encode(clip, drop)
-    cond_cache.encode(clip, keep)  # hit: refreshes keep's mtime above drop's
+    cond_cache.encode(clip, keep)
 
     keep_path = os.path.join(CACHE, cond_cache.tokens_digest(clip, keep)[:32] + ".safetensors")
     drop_path = os.path.join(CACHE, cond_cache.tokens_digest(clip, drop)[:32] + ".safetensors")
-    # a cap that fits exactly one of the two
     os.environ["H3_COND_CACHE_GB"] = "%.10f" % (os.path.getsize(keep_path) * 1.5 / 1024 ** 3)
     try:
         cond_cache.sweep()
@@ -247,9 +305,8 @@ def test_evicts_least_recently_used(clip, image, video):
         del os.environ["H3_COND_CACHE_GB"]
 
 
-def test_orphaned_temp_files(clip, tokens):
+def test_orphaned_temp_files(clip):
     print("orphaned temp files are collected")
-    # exactly what a store in flight writes: <digest>.safetensors.<pid>.tmp
     fresh = os.path.join(CACHE, "a" * 32 + ".safetensors.12345.tmp")
     stale = os.path.join(CACHE, "b" * 32 + ".safetensors.12345.tmp")
     for p in (fresh, stale):
@@ -268,7 +325,7 @@ def test_orphaned_temp_files(clip, tokens):
     real_save = cond_cache.comfy.utils.save_torch_file
 
     def exploding_save(sd, path, metadata=None):
-        real_save(sd, path, metadata=metadata)  # write it, then fail
+        real_save(sd, path, metadata=metadata)
         raise RuntimeError("disk full")
 
     cond_cache.comfy.utils.save_torch_file = exploding_save
@@ -307,17 +364,11 @@ def test_age_expiry(clip, image):
 
 
 def with_cache_dir(directory):
-    """Repoint the cache and reset the once-per-process ownership decision."""
     os.environ["H3_COND_CACHE_DIR"] = directory
     cond_cache._claimed = cond_cache._UNSET
 
 
 def test_refuses_a_folder_it_does_not_own(clip, image):
-    """Ownership is decided per *folder*, once, not per file at delete time.
-
-    The scenario that matters is H3_COND_CACHE_DIR aimed somewhere real. The
-    right outcome is not 'sweep it carefully' — it is 'do not touch it'.
-    """
     print("a folder holding anything else is refused outright")
     models = os.path.join(_TMPROOT, "text_encoders")
     os.makedirs(models, exist_ok=True)
@@ -328,7 +379,7 @@ def test_refuses_a_folder_it_does_not_own(clip, image):
             f.write(b"a real model, as far as this cache knows")
     old = time.time() - 400 * 86400
     for p in victims:
-        os.utime(p, (old, old))  # ancient and over any cap: maximally tempting
+        os.utime(p, (old, old))
 
     with_cache_dir(models)
     os.environ["H3_COND_CACHE_GB"] = "0"
@@ -337,12 +388,10 @@ def test_refuses_a_folder_it_does_not_own(clip, image):
         check(cond_cache._cache_dir() is None, "the folder is refused")
         check(not os.path.exists(os.path.join(models, cond_cache.MARKER)),
               "and not claimed by dropping a marker into it")
-
         before = clip.calls
         cond_cache.encode(clip, make_tokens([120, 1], image))
         cond_cache.encode(clip, make_tokens([120, 1], image))
         check(clip.calls == before + 2, "the cache disables itself rather than storing there")
-
         cond_cache.sweep()
         cond_cache.purge()
         for p in victims:
@@ -365,7 +414,6 @@ def test_claims_folders_it_may_have(clip, image):
     with_cache_dir(empty)
     check(cond_cache._cache_dir() == empty, "claims an existing empty folder")
 
-    # a cache directory from before the marker existed
     legacy = os.path.join(_TMPROOT, "legacy")
     os.makedirs(legacy, exist_ok=True)
     with open(os.path.join(legacy, "b" * 32 + ".safetensors"), "wb") as f:
@@ -392,27 +440,18 @@ def test_purge(clip, image):
 
 
 def test_key_is_pinned(clip, image, video):
-    """The key must never move without someone deciding it should.
-
-    Changing how tokens_digest hashes invalidates every entry on disk at once,
-    and the symptom — everything suddenly missing, then slowly re-storing — looks
-    exactly like the cache being broken rather than re-keyed. A refactor that
-    trips this needs a deliberate answer, not a surprise.
-    """
-    print("the cache key has not drifted")
-    write_te(b"x" * 1024)
-    os.utime(_TE_FILE, (1700000000, 1700000000))  # mtime is part of the fingerprint
-    try:
-        tokens = make_tokens([1, 2, 3], image, video[2:4])
-        check(cond_cache.tokens_digest(clip, tokens) == PINNED_DIGEST,
-              "tokens_digest still produces the pinned key")
-    finally:
-        write_te(b"x" * 1024)
+    print("the cache key has not drifted unexpectedly")
+    set_checkpoint(clip, _TE_FILE)
+    clip.patcher.patches = {}
+    clip.patcher.weight_wrapper_patches = {}
+    tokens = make_tokens([1, 2, 3], image, video[2:4])
+    check(cond_cache.tokens_digest(clip, tokens) == PINNED_DIGEST,
+          "tokens_digest produces the deliberately re-pinned key")
 
 
 def test_hash_cost(clip):
     print("hashing cost stays negligible next to the encode it avoids")
-    big = torch.rand(1, 2048, 2048, 3)  # a 'max' ref image, 50 MB fp32
+    big = torch.rand(1, 2048, 2048, 3)
     t0 = time.perf_counter()
     cond_cache.tokens_digest(clip, make_tokens([1], big))
     elapsed = time.perf_counter() - t0
@@ -421,7 +460,8 @@ def test_hash_cost(clip):
 
 def main():
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
-    write_te(b"x" * 1024)
+    write_te(_TE_FILE, b"x" * 1024)
+    write_te(_ALT_TE_FILE, b"y" * 1024)
 
     torch.manual_seed(1)
     image = torch.rand(1, 256, 256, 3)
@@ -430,14 +470,17 @@ def main():
     tokens = make_tokens([1, 2, 3], image, video[2:4])
 
     test_hit_is_bit_identical(clip, tokens)
-    test_key_covers_every_input(clip, image, video)
+    test_key_covers_token_inputs(clip, image, video)
+    test_checkpoint_identity_policy(clip, tokens)
+    test_runtime_patch_identity(clip, tokens)
+    test_weight_wrapper_patch_identity(clip, tokens)
     test_bypasses(clip, tokens)
     test_modes(clip, tokens)
     test_entry_not_mmap_locked(clip, tokens)
     test_corrupt_entry(clip, tokens)
     test_eviction(clip, image, video)
-    test_evicts_least_recently_used(clip, image, video)
-    test_orphaned_temp_files(clip, tokens)
+    test_evicts_least_recently_used(clip, image)
+    test_orphaned_temp_files(clip)
     test_age_expiry(clip, image)
     test_refuses_a_folder_it_does_not_own(clip, image)
     test_claims_folders_it_may_have(clip, image)

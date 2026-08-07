@@ -14,8 +14,13 @@ entirely. Keying on the token stream itself instead means:
 - restarting the server reuses the embeds
 - a hit avoids staging the 14.6 GB text encoder onto the 12 GB card at all
 
-Anything the cache cannot identify with certainty — a LoRA-patched TE, a hook
-schedule, an unrecognised token or conditioning payload, an unknown checkpoint
+Unpatched text encoders are identified by the checkpoint filenames recorded by
+Comfy's loader plus the output-affecting loader options. That deliberately
+ignores mtimes and file sizes so a code-driven Comfy restart keeps using the
+same conditioning entry. Runtime weight patches add Comfy's process-local
+`patches_uuid`; they can hit repeatedly in one process but intentionally miss
+after restart. Anything the cache still cannot identify with certainty — a hook
+schedule, an unrecognised token or conditioning payload, or unknown checkpoint
 provenance — falls back to a plain encode. A wrong hit is much worse than a miss.
 
 Entries are safetensors files under the user directory, so they land on D: with
@@ -182,20 +187,44 @@ def _stable_repr(obj, depth=0):
     return "<%s>" % type(obj).__name__
 
 
-def _model_fingerprint(clip):
-    """Identify the TE weights, or None if provenance is unknown.
+def _runtime_weight_patch_id(patcher):
+    """Return an ephemeral identity for runtime weight changes.
 
-    Core's loaders record how to rebuild a patcher in `cached_patcher_init`,
-    which for a CLIP is `(load_clip_model_patcher, (ckpt_paths, embedding_dir,
-    clip_type, model_options))` and survives `clone()`. That gives the actual
-    checkpoint files without hashing 14.6 GB of weights.
+    Plain checkpoints deliberately ignore ``patches_uuid`` so their cache keys
+    survive a Comfy restart. Weight patches and weight-wrapper patches are
+    different: their effective weights are no longer described by the checkpoint
+    filename, so Comfy's UUID becomes part of the key for the lifetime of this
+    process. If a patched patcher does not expose a UUID, the safe answer is to
+    bypass caching rather than guess.
     """
-    init = getattr(clip.patcher, "cached_patcher_init", None)
+    has_runtime_weight_changes = bool(getattr(patcher, "patches", None)) or bool(
+        getattr(patcher, "weight_wrapper_patches", None))
+    if not has_runtime_weight_changes:
+        return ""
+    patch_uuid = getattr(patcher, "patches_uuid", None)
+    if patch_uuid is None:
+        return None
+    return str(patch_uuid)
+
+
+def _model_fingerprint(clip):
+    """Identify the TE state cheaply, or None if provenance is unknown.
+
+    Core's loaders record how to rebuild a patcher in ``cached_patcher_init``,
+    which for a CLIP is ``(load_clip_model_patcher, (ckpt_paths, embedding_dir,
+    clip_type, model_options))`` and survives ``clone()``. For an unpatched
+    encoder the checkpoint *filenames* are the persistent identity: filesystem
+    timestamps and sizes are intentionally irrelevant. Runtime weight patches
+    add the process-local ``patches_uuid`` so back-to-back patched runs still hit
+    without pretending that identity survives a restart.
+    """
+    patcher = clip.patcher
+    init = getattr(patcher, "cached_patcher_init", None)
     if not init or len(init) < 2 or not init[1]:
         return None
     args = init[1]
     paths = args[0]
-    if isinstance(paths, str):
+    if isinstance(paths, (str, os.PathLike)):
         paths = [paths]
     if not isinstance(paths, (list, tuple)) or not paths:
         return None
@@ -203,11 +232,19 @@ def _model_fingerprint(clip):
     parts = [CACHE_FORMAT, type(clip.cond_stage_model).__name__, "layer=%s" % (clip.layer_idx,)]
     for p in paths:
         try:
-            st = os.stat(p)
-        except OSError:
+            filename = os.path.basename(os.fspath(p))
+        except TypeError:
             return None
-        parts.append("%s|%d|%d" % (os.path.basename(p), st.st_size, int(st.st_mtime)))
+        if not filename:
+            return None
+        parts.append("checkpoint=%s" % filename)
     parts.append(_stable_repr(list(args[2:])))  # clip_type, model_options (dtype, quantization, ...)
+
+    patch_id = _runtime_weight_patch_id(patcher)
+    if patch_id is None:
+        return None
+    if patch_id:
+        parts.append("patches_uuid=%s" % patch_id)
     return "\n".join(parts)
 
 
@@ -441,11 +478,8 @@ def encode(clip, tokens, mode="auto", label=None):
 
     if mode == "off" or _env_disabled():
         return plain()
-    # LoRA-patched or hook-scheduled text encoders change the output without
-    # changing the tokens; a content hash cannot see that.
-    if getattr(clip.patcher, "patches", None):
-        logging.info("%s: bypassed, text encoder has weight patches", LOG)
-        return plain()
+    # A scheduled hook can change the output without a stable persistent identity.
+    # Ordinary weight patches are handled by _model_fingerprint via patches_uuid.
     if getattr(clip.patcher, "forced_hooks", None) is not None and getattr(clip, "use_clip_schedule", False):
         logging.info("%s: bypassed, hook schedule in use", LOG)
         return plain()
