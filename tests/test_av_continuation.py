@@ -7,9 +7,14 @@ import unittest
 import torch
 
 from chunked_ref2v.longform.av_continuation_nodes import (
+    MiniMaxH3LongFormAVContinuation,
     _chunk_count,
     _dynamic_av_reference,
     continuation_prompt,
+)
+from chunked_ref2v.longform.nplusone_chunk_prompt_timeline import (
+    build_nplusone_chunk_prompt_plan,
+    prompts_for_av_continuation_plan,
 )
 
 
@@ -49,6 +54,50 @@ class LongFormAVContinuationTests(unittest.TestCase):
         video = torch.zeros(1, 24, 42, 4, 6)
         with self.assertRaises(ValueError):
             _dynamic_av_reference(pixels, video, None, (96, 64))
+
+    def test_node_exposes_nplusone_plan_input(self):
+        schema = MiniMaxH3LongFormAVContinuation.define_schema()
+        names = [getattr(item, "id", getattr(item, "name", None)) for item in schema.inputs]
+        self.assertIn("n_plus_one_prompt_plan", names)
+
+    def test_plan_resolves_different_base_prompt_for_each_chunk(self):
+        plan = build_nplusone_chunk_prompt_plan(
+            output_seconds=12,
+            chunk_frames=141,
+            global_prompt="same subject",
+            chunk_prompts_json='{"prompts":["first action","second action","third action"]}',
+        )
+        prompts = prompts_for_av_continuation_plan(
+            plan,
+            "fallback",
+            output_seconds=12,
+            chunk_frames=141,
+        )
+        self.assertEqual(
+            prompts,
+            [
+                "same subject\n\nfirst action",
+                "same subject\n\nsecond action",
+                "same subject\n\nthird action",
+            ],
+        )
+        for prompt in prompts:
+            self.assertNotIn("<Video", prompt)
+            self.assertNotIn("<Audio", prompt)
+            self.assertNotIn("video continuation", prompt)
+
+    def test_plan_geometry_mismatch_fails_before_sampling(self):
+        plan = build_nplusone_chunk_prompt_plan(
+            output_seconds=12,
+            chunk_frames=141,
+        )
+        with self.assertRaises(ValueError):
+            prompts_for_av_continuation_plan(
+                plan,
+                "fallback",
+                output_seconds=12,
+                chunk_frames=90,
+            )
 
 
 if __name__ == "__main__":

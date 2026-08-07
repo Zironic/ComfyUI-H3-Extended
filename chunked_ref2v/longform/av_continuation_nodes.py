@@ -1,16 +1,18 @@
 """Experimental native AV-continuation long-form generation for MiniMax H3.
 
-Unlike the overlap-based long-form runner, every continuation chunk starts from
-fresh target latents.  The immediately preceding generated audiovisual chunk is
-fed back as a dynamic <Video N+1>/<Audio M+1> reference pair:
+Every continuation chunk starts from fresh target latents. The immediately
+preceding generated audiovisual chunk is fed back as a dynamic
+<Video N+1>/<Audio M+1> reference pair:
 
 * Qwen sees decoded previous-chunk video frames plus one audio reference item.
 * The DiT reuses the already-generated video/audio latents directly as the
   matching reference block, avoiding a redundant VAE encode.
 
-Every generated chunk contributes all of its frames to the final output.  There
-is no overlap window, no latent transplantation, and no supported interrupted-
-run resume contract.
+Every generated chunk contributes all of its frames to the final output. There
+is no overlap window or target-latent transplantation. An optional N+1 prompt
+plan supplies one user-authored base instruction per generated chunk; the
+runtime continuation relationship is injected only after the previous chunk
+exists.
 """
 
 from __future__ import annotations
@@ -21,8 +23,8 @@ import math
 import os
 import time
 
-import torch
 import nodes
+import torch
 from comfy_api.latest import ComfyExtension, InputImpl, io
 
 from .. import harness, memory, ref_builder
@@ -34,6 +36,10 @@ from .audio_output import (
     audio_samples_for_frames,
     decode_audio_chunk,
     mux_generated_audio,
+)
+from .nplusone_chunk_prompt_timeline import (
+    NPlusOneChunkPromptPlan,
+    prompts_for_av_continuation_plan,
 )
 from .preview import (
     LongFormPreviewPublisher,
@@ -92,8 +98,16 @@ def continuation_prompt(prompt, video_number, audio_number):
 
 
 def _encode_static_references(
-    *, video_vae, audio_vae, canvas, ref_images, ref_videos,
-    ref_video_audios, ref_audios, ref_image_size, cond_cache,
+    *,
+    video_vae,
+    audio_vae,
+    canvas,
+    ref_images,
+    ref_videos,
+    ref_video_audios,
+    ref_audios,
+    ref_image_size,
+    cond_cache,
 ):
     items, blocks, notes = [], [], []
 
@@ -167,6 +181,7 @@ def _resolve_root(run_directory, chunk_frames):
         return root
 
     import folder_paths
+
     return os.path.join(
         folder_paths.get_output_directory(),
         "h3_longform_av_continuation",
@@ -187,8 +202,8 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
             description=(
                 "Generates long video as sequential native H3 audiovisual continuations. "
                 "Each chunk after the first receives the complete preceding generated "
-                "chunk as dynamic <Video N+1> and <Audio M+1> references. No target "
-                "latent overlap is copied between chunks."
+                "chunk as dynamic <Video N+1> and <Audio M+1> references. Connect the "
+                "N+1 prompt timeline for per-chunk action instructions."
             ),
             inputs=[
                 io.Model.Input("model"),
@@ -196,98 +211,160 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
                 io.Vae.Input("video_vae"),
                 io.Vae.Input("audio_vae"),
                 io.String.Input("prompt", multiline=True, dynamic_prompts=True),
+                NPlusOneChunkPromptPlan.Input(
+                    "n_plus_one_prompt_plan",
+                    optional=True,
+                    tooltip=(
+                        "Optional plan from MiniMax H3 N+1 Chunk Prompt Timeline (Zi). "
+                        "When connected, each generated chunk uses its matching base "
+                        "instruction. The normal prompt is used only as a blank-entry "
+                        "fallback; dynamic <Video N+1>/<Audio M+1> continuation text is "
+                        "added by this node at runtime."
+                    ),
+                ),
                 io.Sampler.Input("sampler"),
                 io.Sigmas.Input("sigmas"),
                 io.Int.Input(
-                    "seed", default=0, min=0, max=0xFFFFFFFFFFFFFFFF,
+                    "seed",
+                    default=0,
+                    min=0,
+                    max=0xFFFFFFFFFFFFFFFF,
                     control_after_generate=True,
                 ),
                 io.Int.Input(
-                    "output_seconds", default=30, min=1, max=3600,
+                    "output_seconds",
+                    default=30,
+                    min=1,
+                    max=3600,
                     tooltip="Exact requested output duration at H3's fixed 24 fps.",
                 ),
                 io.Int.Input(
-                    "width", default=1344, min=32,
-                    max=nodes.MAX_RESOLUTION, step=32,
+                    "width",
+                    default=1344,
+                    min=32,
+                    max=nodes.MAX_RESOLUTION,
+                    step=32,
                 ),
                 io.Int.Input(
-                    "height", default=768, min=32,
-                    max=nodes.MAX_RESOLUTION, step=32,
+                    "height",
+                    default=768,
+                    min=32,
+                    max=nodes.MAX_RESOLUTION,
+                    step=32,
                 ),
                 io.Int.Input(
-                    "chunk_frames", default=141, min=22, max=362, step=17,
+                    "chunk_frames",
+                    default=141,
+                    min=22,
+                    max=362,
+                    step=17,
                     tooltip=(
                         "Generated frames per continuation invocation. Every chunk "
                         "contributes all of its frames; there is no overlap trimming."
                     ),
                 ),
                 io.Combo.Input(
-                    "ref_image_size", options=["native", "match", "max"],
+                    "ref_image_size",
+                    options=["native", "match", "max"],
                     default="native",
                 ),
                 io.Combo.Input(
-                    "cond_cache", options=list(COND_CACHE_MODES), default="auto",
+                    "cond_cache",
+                    options=list(COND_CACHE_MODES),
+                    default="auto",
                 ),
                 io.Combo.Input(
-                    "attention", options=list(memory.ATTENTION_MODES), default="auto",
+                    "attention",
+                    options=list(memory.ATTENTION_MODES),
+                    default="auto",
                 ),
                 io.Combo.Input(
-                    "activation", options=list(memory.ACTIVATION_MODES),
+                    "activation",
+                    options=list(memory.ACTIVATION_MODES),
                     default="mlp_chunked_native",
                 ),
                 io.String.Input(
-                    "run_directory", default="", multiline=False,
+                    "run_directory",
+                    default="",
+                    multiline=False,
                     tooltip=(
                         "Leave blank to create a new output/h3_longform_av_continuation "
                         "directory. Existing non-empty directories are rejected."
                     ),
                 ),
                 io.String.Input(
-                    "ffmpeg_location", default="", multiline=False,
+                    "ffmpeg_location",
+                    default="",
+                    multiline=False,
                     tooltip="Leave blank to use ffmpeg on PATH or the bundled binary.",
                 ),
                 io.Boolean.Input(
-                    "save_frames", default=False,
+                    "save_frames",
+                    default=False,
                     tooltip="Save committed output frames as diagnostic PNGs.",
                 ),
                 io.Boolean.Input("current_chunk_preview", default=True),
                 io.Int.Input(
-                    "preview_every_steps", default=2, min=1, max=100, step=1,
+                    "preview_every_steps",
+                    default=2,
+                    min=1,
+                    max=100,
+                    step=1,
                 ),
                 io.Int.Input(
-                    "current_preview_frames", default=17, min=1, max=17, step=1,
+                    "current_preview_frames",
+                    default=17,
+                    min=1,
+                    max=17,
+                    step=1,
                 ),
                 io.Boolean.Input("completed_chunks_preview", default=True),
                 io.Int.Input(
-                    "live_preview_width", default=512, min=128, max=1024, step=32,
+                    "live_preview_width",
+                    default=512,
+                    min=128,
+                    max=1024,
+                    step=32,
                 ),
                 io.Vae.Input("preview_vae", optional=True),
                 io.Autogrow.Input(
-                    "ref_images", optional=True,
+                    "ref_images",
+                    optional=True,
                     template=io.Autogrow.TemplatePrefix(
                         input=io.Image.Input("ref_image"),
-                        prefix="ref_image_", min=0, max=9,
+                        prefix="ref_image_",
+                        min=0,
+                        max=9,
                     ),
                 ),
                 io.Autogrow.Input(
-                    "ref_videos", optional=True,
+                    "ref_videos",
+                    optional=True,
                     template=io.Autogrow.TemplatePrefix(
                         input=io.Image.Input("ref_video"),
-                        prefix="ref_video_", min=0, max=2,
+                        prefix="ref_video_",
+                        min=0,
+                        max=2,
                     ),
                 ),
                 io.Autogrow.Input(
-                    "ref_video_audios", optional=True,
+                    "ref_video_audios",
+                    optional=True,
                     template=io.Autogrow.TemplatePrefix(
                         input=io.Audio.Input("ref_video_audio"),
-                        prefix="ref_video_audio_", min=0, max=2,
+                        prefix="ref_video_audio_",
+                        min=0,
+                        max=2,
                     ),
                 ),
                 io.Autogrow.Input(
-                    "ref_audios", optional=True,
+                    "ref_audios",
+                    optional=True,
                     template=io.Autogrow.TemplatePrefix(
                         input=io.Audio.Input("ref_audio"),
-                        prefix="ref_audio_", min=0, max=3,
+                        prefix="ref_audio_",
+                        min=0,
+                        max=3,
                     ),
                 ),
             ],
@@ -312,6 +389,7 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
         sampler,
         sigmas,
         seed,
+        n_plus_one_prompt_plan=None,
         output_seconds=30,
         width=1344,
         height=768,
@@ -335,21 +413,36 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
         ref_audios=None,
         unique_id=None,
     ) -> io.NodeOutput:
-        # H3 target construction only needs the legal chunk length.  The geometry
+        # H3 target construction only needs a legal chunk length. The geometry
         # helper requires an overlap value, but this node never consumes its
-        # stride/overlap fields; O=4 is used solely to obtain the target AV shape.
+        # stride/overlap fields; O=4 is used only to obtain the target AV shape.
         geometry = HarnessGeometry(
-            chunk_frames=int(chunk_frames), overlap_frames=4,
+            chunk_frames=int(chunk_frames),
+            overlap_frames=4,
         ).validate()
         canvas = _validate_canvas(width, height)
         target_frames = int(output_seconds * geometry.fps)
+        chunk_prompts = prompts_for_av_continuation_plan(
+            n_plus_one_prompt_plan,
+            prompt,
+            output_seconds=output_seconds,
+            chunk_frames=geometry.chunk_frames,
+        )
         chunk_count = _chunk_count(target_frames, geometry.chunk_frames)
+        if len(chunk_prompts) != chunk_count:
+            raise RuntimeError(
+                "N+1 timeline resolved %d prompts for %d continuation chunks"
+                % (len(chunk_prompts), chunk_count)
+            )
+
         root = _resolve_root(run_directory, geometry.chunk_frames)
         for path in ("frames", "output"):
             os.makedirs(os.path.join(root, path), exist_ok=True)
 
         model, memory_status = memory.arm(
-            model, attention=attention, activation=activation,
+            model,
+            attention=attention,
+            activation=activation,
         )
         logging.info("%s %s", LOG, memory.describe(memory_status))
 
@@ -416,14 +509,17 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
                 dynamic_video_number = _count_items(static_items, "video") + 1
                 dynamic_audio_number = _count_items(static_items, "audio") + 1
 
-                for index in range(chunk_count):
+                for index, base_prompt in enumerate(chunk_prompts):
                     items = list(static_items)
                     blocks = list(static_blocks)
-                    active_prompt = str(prompt or "")
+                    active_prompt = str(base_prompt or "")
 
                     if index > 0:
                         dynamic_items, dynamic_block = _dynamic_av_reference(
-                            previous_pixels, previous_video, previous_audio, canvas,
+                            previous_pixels,
+                            previous_video,
+                            previous_audio,
+                            canvas,
                         )
                         items.extend(dynamic_items)
                         blocks.append(dynamic_block)
@@ -434,14 +530,19 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
                         )
 
                     conditioning = harness._encode(
-                        clip, active_prompt, items, cond_cache,
+                        clip,
+                        active_prompt,
+                        items,
+                        cond_cache,
                     )
                     conditioning = harness.attach_refs(conditioning, blocks)
                     latent = harness.empty_av_latent(canvas, geometry)
-                    callback = None
                     active_publisher = current_publisher()
-                    if active_publisher is not None:
-                        callback = active_publisher.sampler_callback(index)
+                    callback = (
+                        active_publisher.sampler_callback(index)
+                        if active_publisher is not None
+                        else None
+                    )
 
                     sample_kwargs = {
                         "model": model,
@@ -471,11 +572,13 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
 
                     if save_frames:
                         from PIL import Image
+
                         for local_index in range(take_frames):
                             Image.fromarray(frames_u8[local_index].numpy()).save(
                                 os.path.join(
                                     out_dir,
-                                    "frame_%06d.png" % (written_frames + local_index),
+                                    "frame_%06d.png"
+                                    % (written_frames + local_index),
                                 )
                             )
 
@@ -489,7 +592,9 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
                         except Exception as exc:
                             logging.warning(
                                 "%s completed preview failed for chunk %d: %s",
-                                LOG, index, exc,
+                                LOG,
+                                index,
+                                exc,
                             )
 
                     waveform = decode_audio_chunk(audio_vae, audio_latent)
@@ -516,9 +621,8 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
                     written_audio += take_audio
                     written_frames += take_frames
 
-                    # Keep exactly one complete previous chunk in CPU memory.  The
-                    # next Qwen pass consumes pixels, while the next DiT ref block
-                    # consumes the generated latents directly.
+                    # Keep exactly one complete previous chunk on CPU. Qwen uses
+                    # decoded pixels; the DiT uses the generated AV latents directly.
                     previous_video = video_latent
                     previous_audio = audio_latent
                     previous_pixels = pixels
@@ -529,7 +633,9 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
                         index + 1,
                         chunk_count,
                         take_frames,
-                        "none" if index == 0 else "<Video %d>/<Audio %d>"
+                        "none"
+                        if index == 0
+                        else "<Video %d>/<Audio %d>"
                         % (dynamic_video_number, dynamic_audio_number),
                     )
 
@@ -548,7 +654,9 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
                 audio_writer.close(commit=True)
 
         expected_audio = audio_samples_for_frames(
-            target_frames, sample_rate, fps=geometry.fps,
+            target_frames,
+            sample_rate,
+            fps=geometry.fps,
         )
         if written_audio != expected_audio:
             raise RuntimeError(
@@ -565,17 +673,27 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
             ffmpeg_location=ffmpeg,
         )
 
-        preview_image = previous_pixels[-1:].clone() if previous_pixels is not None else torch.zeros(1, 64, 64, 3)
+        preview_image = (
+            previous_pixels[-1:].clone()
+            if previous_pixels is not None
+            else torch.zeros(1, 64, 64, 3)
+        )
         video = InputImpl.VideoFromFile(output_path)
         report_lines = [
             "MiniMax H3 LongForm AV Continuation",
             "mode      native video + audio continuation; no latent overlap carry",
-            "canvas    %dx%d" % canvas,
-            "chunk     %d frames; every chunk contributes all generated frames" % geometry.chunk_frames,
-            "chunks    %d" % chunk_count,
-            "output    %d frames (%.3f s at %d fps)" % (
-                target_frames, target_frames / geometry.fps, geometry.fps,
+            "prompts   %s"
+            % (
+                "N+1 per-chunk timeline"
+                if n_plus_one_prompt_plan is not None
+                else "single prompt repeated per chunk"
             ),
+            "canvas    %dx%d" % canvas,
+            "chunk     %d frames; every chunk contributes all generated frames"
+            % geometry.chunk_frames,
+            "chunks    %d" % chunk_count,
+            "output    %d frames (%.3f s at %d fps)"
+            % (target_frames, target_frames / geometry.fps, geometry.fps),
             "dynamic   <Video %d> + <Audio %d> from previous generated chunk"
             % (dynamic_video_number, dynamic_audio_number),
             "audio     %d samples at %d Hz" % (written_audio, sample_rate),
