@@ -1,0 +1,293 @@
+"""N+1-aware prompt timeline for native long-form continuation nodes.
+
+Unlike the overlap-based ``MiniMax H3 Chunk Prompt Timeline (Zi)``, this plan
+uses full generated chunks with no overlap/stride semantics.  It stores only the
+user-authored global/chunk instructions plus a continuation policy.  The
+consuming long-form node resolves the dynamic <Video N+1>/<Audio M+1> reference
+numbers after the previous chunk has actually been generated.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+
+from comfy_api.latest import ComfyExtension, io
+
+FPS = 24
+PLAN_VERSION = 2
+POLICY_AV_CONTINUATION = "previous_av_continuation"
+NPlusOneChunkPromptPlan = io.Custom("H3_N_PLUS_ONE_CHUNK_PROMPT_PLAN")
+
+
+def _parse_prompt_store(value):
+    if value is None or value == "":
+        return []
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError("N+1 chunk prompt data is not valid JSON") from exc
+    if isinstance(value, dict):
+        value = value.get("prompts", [])
+    if not isinstance(value, list):
+        raise ValueError("N+1 chunk prompt data must contain a prompts list")
+    return [str(item or "") for item in value]
+
+
+def _chunk_count(target_frames, chunk_frames):
+    target_frames = int(target_frames)
+    chunk_frames = int(chunk_frames)
+    if target_frames <= 0 or chunk_frames <= 0:
+        raise ValueError("target_frames and chunk_frames must be positive")
+    return int(math.ceil(target_frames / float(chunk_frames)))
+
+
+def build_nplusone_chunk_prompt_plan(
+    *,
+    output_seconds,
+    chunk_frames,
+    global_prompt="",
+    chunk_prompts_json="",
+    continuation_policy=POLICY_AV_CONTINUATION,
+):
+    output_seconds = int(output_seconds)
+    chunk_frames = int(chunk_frames)
+    if output_seconds <= 0:
+        raise ValueError("output_seconds must be positive")
+    if chunk_frames <= 0:
+        raise ValueError("chunk_frames must be positive")
+    if continuation_policy != POLICY_AV_CONTINUATION:
+        raise ValueError("unsupported N+1 continuation policy %r" % continuation_policy)
+
+    target_frames = output_seconds * FPS
+    chunk_count = _chunk_count(target_frames, chunk_frames)
+    stored = _parse_prompt_store(chunk_prompts_json)
+    prompts = stored[:chunk_count]
+    prompts.extend("" for _ in range(chunk_count - len(prompts)))
+    return {
+        "version": PLAN_VERSION,
+        "schedule": "full_chunks",
+        "continuation_policy": continuation_policy,
+        "fps": FPS,
+        "output_seconds": output_seconds,
+        "target_frames": target_frames,
+        "chunk_frames": chunk_frames,
+        "chunk_count": chunk_count,
+        "global_prompt": str(global_prompt or ""),
+        "chunk_prompts": prompts,
+    }
+
+
+def validate_nplusone_chunk_prompt_plan(
+    plan,
+    *,
+    output_seconds,
+    chunk_frames,
+    continuation_policy=POLICY_AV_CONTINUATION,
+):
+    if not isinstance(plan, dict):
+        raise TypeError(
+            "N+1 chunk prompt plan must come from MiniMax H3 N+1 Chunk Prompt Timeline (Zi)"
+        )
+    if int(plan.get("version", -1)) != PLAN_VERSION:
+        raise ValueError("unsupported N+1 chunk prompt plan version")
+    if plan.get("schedule") != "full_chunks":
+        raise ValueError("N+1 chunk prompt plan must use full_chunks scheduling")
+    if plan.get("continuation_policy") != continuation_policy:
+        raise ValueError(
+            "N+1 plan continuation_policy=%r does not match required policy=%r"
+            % (plan.get("continuation_policy"), continuation_policy)
+        )
+
+    expected = build_nplusone_chunk_prompt_plan(
+        output_seconds=output_seconds,
+        chunk_frames=chunk_frames,
+        continuation_policy=continuation_policy,
+    )
+    for key in ("fps", "output_seconds", "target_frames", "chunk_frames", "chunk_count"):
+        if int(plan.get(key, -1)) != int(expected[key]):
+            raise ValueError(
+                "N+1 chunk prompt plan %s=%r does not match downstream node %s=%r"
+                % (key, plan.get(key), key, expected[key])
+            )
+
+    prompts = plan.get("chunk_prompts")
+    if not isinstance(prompts, list) or len(prompts) != expected["chunk_count"]:
+        raise ValueError(
+            "N+1 chunk prompt plan contains %d prompts; expected exactly %d"
+            % (
+                len(prompts) if isinstance(prompts, list) else 0,
+                expected["chunk_count"],
+            )
+        )
+
+    normalized = dict(plan)
+    normalized["global_prompt"] = str(plan.get("global_prompt") or "")
+    normalized["chunk_prompts"] = [str(item or "") for item in prompts]
+    return normalized
+
+
+def compile_nplusone_chunk_prompts(plan, fallback_prompt=""):
+    global_prompt = str(plan.get("global_prompt") or "").strip()
+    fallback = str(fallback_prompt or "").strip()
+    compiled = []
+    for local in plan["chunk_prompts"]:
+        local = str(local or "").strip()
+        if global_prompt and local:
+            text = global_prompt + "\n\n" + local
+        else:
+            text = global_prompt or local or fallback
+        compiled.append(text)
+    return compiled
+
+
+def prompts_for_av_continuation_plan(
+    plan,
+    fallback_prompt,
+    *,
+    output_seconds,
+    chunk_frames,
+):
+    if plan is None:
+        count = _chunk_count(int(output_seconds) * FPS, int(chunk_frames))
+        return [str(fallback_prompt or "")] * count
+    normalized = validate_nplusone_chunk_prompt_plan(
+        plan,
+        output_seconds=output_seconds,
+        chunk_frames=chunk_frames,
+        continuation_policy=POLICY_AV_CONTINUATION,
+    )
+    return compile_nplusone_chunk_prompts(normalized, fallback_prompt)
+
+
+class MiniMaxH3NPlusOneChunkPromptTimeline(io.ComfyNode):
+    """Build one base instruction per full generated N+1 continuation chunk."""
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="MiniMaxH3NPlusOneChunkPromptTimelineZi",
+            display_name="MiniMax H3 N+1 Chunk Prompt Timeline (Zi)",
+            category="model/video/minimax/testing",
+            description=(
+                "Builds a no-overlap chunk timeline for N+1 continuation. The node "
+                "stores user-authored base prompts only; the downstream continuation "
+                "node injects the generated <Video N+1>/<Audio M+1> relationship at "
+                "runtime after the preceding chunk exists."
+            ),
+            inputs=[
+                io.Int.Input(
+                    "output_seconds",
+                    default=30,
+                    min=1,
+                    max=3600,
+                    tooltip="Desired final duration at MiniMax H3's fixed 24 fps.",
+                ),
+                io.Int.Input(
+                    "chunk_frames",
+                    default=141,
+                    min=22,
+                    max=362,
+                    step=17,
+                    tooltip=(
+                        "Frames generated by each continuation invocation. Every chunk "
+                        "contributes all generated frames; there is no overlap."
+                    ),
+                ),
+                io.String.Input(
+                    "global_prompt",
+                    default="",
+                    multiline=True,
+                    dynamic_prompts=True,
+                    tooltip=(
+                        "Optional text prepended to every chunk's requested action. "
+                        "Do not manually describe <Video N+1>/<Audio M+1>; the "
+                        "continuation node adds those dynamic references at runtime."
+                    ),
+                ),
+                io.String.Input(
+                    "chunk_prompts_json",
+                    default='{"version":2,"prompts":[]}',
+                    multiline=True,
+                    dynamic_prompts=False,
+                    tooltip="Internal timeline storage managed by the node editor.",
+                ),
+            ],
+            outputs=[
+                NPlusOneChunkPromptPlan.Output(
+                    "n_plus_one_prompt_plan",
+                    display_name="N+1 prompt plan",
+                ),
+                io.Int.Output("output_seconds", display_name="output seconds"),
+                io.Int.Output("chunk_frames", display_name="chunk frames"),
+                io.String.Output("report", display_name="report"),
+            ],
+        )
+
+    @classmethod
+    def execute(
+        cls,
+        output_seconds=30,
+        chunk_frames=141,
+        global_prompt="",
+        chunk_prompts_json="",
+    ) -> io.NodeOutput:
+        plan = build_nplusone_chunk_prompt_plan(
+            output_seconds=output_seconds,
+            chunk_frames=chunk_frames,
+            global_prompt=global_prompt,
+            chunk_prompts_json=chunk_prompts_json,
+        )
+        lines = [
+            "MiniMax H3 N+1 Chunk Prompt Timeline",
+            "mode      previous <Video N+1> + <Audio M+1> AV continuation",
+            "output    %d s / %d frames at %d fps"
+            % (plan["output_seconds"], plan["target_frames"], plan["fps"]),
+            "profile   C=%d; no overlap; stride=%d"
+            % (plan["chunk_frames"], plan["chunk_frames"]),
+            "chunks    %d" % plan["chunk_count"],
+        ]
+        for index, prompt in enumerate(plan["chunk_prompts"]):
+            start = index * plan["chunk_frames"]
+            stop = min(start + plan["chunk_frames"], plan["target_frames"])
+            preview = " ".join(str(prompt or "").strip().split())
+            if len(preview) > 72:
+                preview = preview[:69] + "..."
+            dynamic = "static refs only" if index == 0 else "runtime N+1 AV reference"
+            lines.append(
+                "chunk %03d frames %d-%d (%.3f-%.3f s) [%s]: %s"
+                % (
+                    index,
+                    start,
+                    max(start, stop - 1),
+                    start / plan["fps"],
+                    stop / plan["fps"],
+                    dynamic,
+                    preview or "<global/fallback only>",
+                )
+            )
+        return io.NodeOutput(
+            plan,
+            int(output_seconds),
+            int(chunk_frames),
+            "\n".join(lines),
+        )
+
+
+class MiniMaxH3NPlusOneChunkPromptTimelineExtension(ComfyExtension):
+    async def get_node_list(self):
+        return [MiniMaxH3NPlusOneChunkPromptTimeline]
+
+
+__all__ = [
+    "MiniMaxH3NPlusOneChunkPromptTimeline",
+    "MiniMaxH3NPlusOneChunkPromptTimelineExtension",
+    "NPlusOneChunkPromptPlan",
+    "PLAN_VERSION",
+    "POLICY_AV_CONTINUATION",
+    "build_nplusone_chunk_prompt_plan",
+    "compile_nplusone_chunk_prompts",
+    "prompts_for_av_continuation_plan",
+    "validate_nplusone_chunk_prompt_plan",
+]
