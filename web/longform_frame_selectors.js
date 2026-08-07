@@ -13,6 +13,13 @@ const CHUNK_FRAMES = Array.from(
     (_, index) => 22 + index * 17,
 );
 
+// Video is 24 fps and H3 audio latents are 40 Hz. Their time boundaries meet
+// every three video frames (five audio latents), so an exact A/V chunk length
+// must also be divisible by three.
+const AUDIO_ALIGNED_CHUNK_FRAMES = CHUNK_FRAMES.filter(
+    (frames) => frames % 3 === 0,
+);
+
 // A carried overlap must begin on a video-latent boundary. For a legal H3
 // chunk, the possible suffix lengths repeat with residues 0, 4, 5, 9 and 13
 // modulo 17. O=4 is the smallest possible suffix and carries one latent.
@@ -21,8 +28,11 @@ const OVERLAP_FRAMES = Array.from(
     { length: 180 - 4 + 1 },
     (_, index) => index + 4,
 ).filter((frames) => OVERLAP_RESIDUES.has(frames % 17));
+const AUDIO_ALIGNED_OVERLAP_FRAMES = OVERLAP_FRAMES.filter(
+    (frames) => frames % 3 === 0,
+);
 
-function nearestAllowed(value, allowed) {
+function nearestAllowed(value, allowed, preferLargerOnTie = false) {
     if (!allowed.length) return undefined;
     const numeric = Number(value);
     if (!Number.isFinite(numeric)) return allowed[0];
@@ -31,7 +41,11 @@ function nearestAllowed(value, allowed) {
         const candidateDistance = Math.abs(candidate - numeric);
         const bestDistance = Math.abs(best - numeric);
         if (candidateDistance < bestDistance) return candidate;
-        if (candidateDistance === bestDistance && candidate < best) return candidate;
+        if (candidateDistance === bestDistance) {
+            return preferLargerOnTie
+                ? Math.max(best, candidate)
+                : Math.min(best, candidate);
+        }
         return best;
     }, allowed[0]);
 }
@@ -82,15 +96,47 @@ function setWidgetValue(node, widget, value) {
     );
 }
 
-function syncOverlapChoices(node) {
+function audioAlignmentEnabled(node) {
+    const widget = node.widgets?.find(
+        (candidate) => candidate.name === "align_audio_chunks",
+    );
+    // New schemas default this to true. Treat a missing widget as false so old
+    // node definitions still retain their previous selector behavior.
+    return widget ? Boolean(widget.value) : false;
+}
+
+function activeChunkFrames(node) {
+    return audioAlignmentEnabled(node)
+        ? AUDIO_ALIGNED_CHUNK_FRAMES
+        : CHUNK_FRAMES;
+}
+
+function activeOverlapFrames(node) {
+    return audioAlignmentEnabled(node)
+        ? AUDIO_ALIGNED_OVERLAP_FRAMES
+        : OVERLAP_FRAMES;
+}
+
+function syncFrameChoices(node) {
     const chunkWidget = node.widgets?.find((widget) => widget.name === "chunk_frames");
     const overlapWidget = node.widgets?.find((widget) => widget.name === "overlap_frames");
     if (!chunkWidget || !overlapWidget) return;
 
-    const allowed = OVERLAP_FRAMES.filter(
+    const aligned = audioAlignmentEnabled(node);
+    const chunks = activeChunkFrames(node);
+    makeComboWidget(chunkWidget, chunks);
+    setWidgetValue(
+        node,
+        chunkWidget,
+        chunks.includes(Number(chunkWidget.value))
+            ? Number(chunkWidget.value)
+            : nearestAllowed(chunkWidget.value, chunks, aligned),
+    );
+
+    const overlaps = activeOverlapFrames(node).filter(
         (frames) => frames < Number(chunkWidget.value),
     );
-    makeComboWidget(overlapWidget, allowed);
+    makeComboWidget(overlapWidget, overlaps);
 
     // Always run the value back through setWidgetValue, even when it is already
     // legal: a widget loaded as the number 4 has to become the string "4" or the
@@ -98,35 +144,29 @@ function syncOverlapChoices(node) {
     setWidgetValue(
         node,
         overlapWidget,
-        allowed.includes(Number(overlapWidget.value))
+        overlaps.includes(Number(overlapWidget.value))
             ? Number(overlapWidget.value)
-            : nearestAllowed(overlapWidget.value, allowed),
+            : nearestAllowed(overlapWidget.value, overlaps, aligned),
     );
 }
 
 function installLegalSelectors(node) {
     const chunkWidget = node.widgets?.find((widget) => widget.name === "chunk_frames");
     const overlapWidget = node.widgets?.find((widget) => widget.name === "overlap_frames");
+    const alignWidget = node.widgets?.find((widget) => widget.name === "align_audio_chunks");
     if (!chunkWidget || !overlapWidget) return;
-
-    makeComboWidget(chunkWidget, CHUNK_FRAMES);
-    setWidgetValue(
-        node,
-        chunkWidget,
-        CHUNK_FRAMES.includes(Number(chunkWidget.value))
-            ? Number(chunkWidget.value)
-            : nearestAllowed(chunkWidget.value, CHUNK_FRAMES),
-    );
 
     if (!chunkWidget.__h3LegalFramesWrapped) {
         const originalCallback = chunkWidget.callback;
         chunkWidget.callback = function (value, ...args) {
-            const legal = nearestAllowed(value, CHUNK_FRAMES);
+            const aligned = audioAlignmentEnabled(node);
+            const allowed = activeChunkFrames(node);
+            const legal = nearestAllowed(value, allowed, aligned);
             const next = legal === undefined ? value : String(legal);
             this.value = next;
             const result = originalCallback?.call(this, next, ...args);
             this.value = next;
-            syncOverlapChoices(node);
+            syncFrameChoices(node);
             return result;
         };
         chunkWidget.__h3LegalFramesWrapped = true;
@@ -135,10 +175,11 @@ function installLegalSelectors(node) {
     if (!overlapWidget.__h3LegalFramesWrapped) {
         const originalCallback = overlapWidget.callback;
         overlapWidget.callback = function (value, ...args) {
-            const allowed = OVERLAP_FRAMES.filter(
+            const aligned = audioAlignmentEnabled(node);
+            const allowed = activeOverlapFrames(node).filter(
                 (frames) => frames < Number(chunkWidget.value),
             );
-            const legal = nearestAllowed(value, allowed);
+            const legal = nearestAllowed(value, allowed, aligned);
             const next = legal === undefined ? value : String(legal);
             this.value = next;
             const result = originalCallback?.call(this, next, ...args);
@@ -148,7 +189,19 @@ function installLegalSelectors(node) {
         overlapWidget.__h3LegalFramesWrapped = true;
     }
 
-    syncOverlapChoices(node);
+    if (alignWidget && !alignWidget.__h3AudioAlignmentWrapped) {
+        const originalCallback = alignWidget.callback;
+        alignWidget.callback = function (value, ...args) {
+            this.value = value;
+            const result = originalCallback?.call(this, value, ...args);
+            this.value = value;
+            syncFrameChoices(node);
+            return result;
+        };
+        alignWidget.__h3AudioAlignmentWrapped = true;
+    }
+
+    syncFrameChoices(node);
 }
 
 app.registerExtension({
