@@ -7,6 +7,7 @@ import unittest
 from chunked_ref2v.longform.nplusone_chunk_prompt_timeline import (
     POLICY_AV_CONTINUATION,
     build_nplusone_chunk_prompt_plan,
+    MiniMaxH3NPlusOneChunkPromptTimeline,
     compile_nplusone_chunk_prompts,
     prompts_for_av_continuation_plan,
     validate_nplusone_chunk_prompt_plan,
@@ -37,6 +38,40 @@ class NPlusOneChunkPromptTimelineTests(unittest.TestCase):
             reference_frames=80,
         )
         self.assertEqual(plan["reference_frames"], 81)
+
+    def test_reference_frames_respects_reference_input_range(self):
+        plan = build_nplusone_chunk_prompt_plan(
+            output_seconds=10,
+            chunk_frames=141,
+            reference_frames=40,
+        )
+        self.assertEqual(plan["reference_frames"], 51)
+
+    def test_strict_chunk_rejects_illegal_length(self):
+        with self.assertRaises(ValueError):
+            build_nplusone_chunk_prompt_plan(
+                output_seconds=10,
+                chunk_frames=124,
+                reference_frames=60,
+            )
+
+    def test_reference_frames_full_chunk_and_partial_records(self):
+        self.assertEqual(
+            build_nplusone_chunk_prompt_plan(
+                output_seconds=10,
+                chunk_frames=141,
+                reference_frames=60,
+            )["reference_frames"],
+            60,
+        )
+        self.assertEqual(
+            build_nplusone_chunk_prompt_plan(
+                output_seconds=10,
+                chunk_frames=141,
+                reference_frames=141,
+            )["reference_frames"],
+            141,
+        )
 
     def test_global_prompt_is_compiled_with_each_local_instruction(self):
         plan = build_nplusone_chunk_prompt_plan(
@@ -130,6 +165,34 @@ class NPlusOneChunkPromptTimelineTests(unittest.TestCase):
             chunk_frames=141,
         )
         self.assertEqual(prompts, ["fallback", "fallback", "fallback"])
+
+    def test_schema_orders_reference_widget_after_chunk_prompts_json(self):
+        schema = MiniMaxH3NPlusOneChunkPromptTimeline.define_schema()
+        names = [getattr(item, "id", getattr(item, "name", None)) for item in schema.inputs]
+        self.assertEqual(
+            names,
+            [
+                "output_seconds",
+                "chunk_frames",
+                "global_prompt",
+                "chunk_prompts_json",
+                "reference_frames",
+            ],
+        )
+
+    def test_schema_outputs_append_reference_frames(self):
+        schema = MiniMaxH3NPlusOneChunkPromptTimeline.define_schema()
+        names = [getattr(item, "id", getattr(item, "name", None)) for item in schema.outputs]
+        self.assertEqual(
+            names,
+            [
+                "n_plus_one_prompt_plan",
+                "output_seconds",
+                "chunk_frames",
+                "report",
+                "reference_frames",
+            ],
+        )
 
 
 if __name__ == "__main__":

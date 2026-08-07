@@ -13,11 +13,18 @@ import json
 import math
 
 from comfy_api.latest import ComfyExtension, io
-from ..audio_boundary_profile import legal_reference_tail_frames
+from ..audio_boundary_profile import (
+    legal_reference_tail_frames,
+    validate_av_continuation_chunk_frames,
+)
 
 FPS = 24
 PLAN_VERSION = 2
 POLICY_AV_CONTINUATION = "previous_av_continuation"
+REFERENCE_MIN_SECONDS = 2
+REFERENCE_MAX_SECONDS = 15
+REFERENCE_FRAMES_MIN = FPS * REFERENCE_MIN_SECONDS
+REFERENCE_FRAMES_MAX = FPS * REFERENCE_MAX_SECONDS
 
 NPlusOneChunkPromptPlan = io.Custom("H3_N_PLUS_ONE_CHUNK_PROMPT_PLAN")
 
@@ -32,9 +39,16 @@ def _nearest(value, candidates, *, prefer_larger_on_tie=True):
 
 
 def _resolve_reference_frames(chunk_frames, reference_frames):
+    validate_av_continuation_chunk_frames(chunk_frames)
+    candidates = legal_reference_tail_frames(chunk_frames)
+    bounded = [
+        value
+        for value in candidates
+        if REFERENCE_FRAMES_MIN <= value <= REFERENCE_FRAMES_MAX
+    ]
     return _nearest(
         reference_frames,
-        legal_reference_tail_frames(chunk_frames),
+        bounded or candidates,
         prefer_larger_on_tie=True,
     )
 
@@ -243,6 +257,13 @@ class MiniMaxH3NPlusOneChunkPromptTimeline(io.ComfyNode):
                         "continuation node adds those dynamic references at runtime."
                     ),
                 ),
+                io.String.Input(
+                    "chunk_prompts_json",
+                    default='{"version":2,"prompts":[]}',
+                    multiline=True,
+                    dynamic_prompts=False,
+                    tooltip="Internal timeline storage managed by the node editor.",
+                ),
                 io.Int.Input(
                     "reference_frames",
                     default=90,
@@ -250,15 +271,9 @@ class MiniMaxH3NPlusOneChunkPromptTimeline(io.ComfyNode):
                     max=362,
                     tooltip=(
                         "Tail frames from each generated chunk used as dynamic "
-                        "references for the next chunk."
+                        "references for the next chunk. This is resolved to the "
+                        "same AV-aligned set used by continuation execution."
                     ),
-                ),
-                io.String.Input(
-                    "chunk_prompts_json",
-                    default='{"version":2,"prompts":[]}',
-                    multiline=True,
-                    dynamic_prompts=False,
-                    tooltip="Internal timeline storage managed by the node editor.",
                 ),
             ],
             outputs=[
@@ -268,8 +283,8 @@ class MiniMaxH3NPlusOneChunkPromptTimeline(io.ComfyNode):
                 ),
                 io.Int.Output("output_seconds", display_name="output seconds"),
                 io.Int.Output("chunk_frames", display_name="chunk frames"),
-                io.Int.Output("reference_frames", display_name="reference frames"),
                 io.String.Output("report", display_name="report"),
+                io.Int.Output("reference_frames", display_name="reference frames"),
             ],
         )
 
@@ -279,8 +294,8 @@ class MiniMaxH3NPlusOneChunkPromptTimeline(io.ComfyNode):
         output_seconds=30,
         chunk_frames=141,
         global_prompt="",
-        reference_frames=90,
         chunk_prompts_json="",
+        reference_frames=90,
     ) -> io.NodeOutput:
         plan = build_nplusone_chunk_prompt_plan(
             output_seconds=output_seconds,
@@ -325,8 +340,8 @@ class MiniMaxH3NPlusOneChunkPromptTimeline(io.ComfyNode):
             plan,
             int(output_seconds),
             int(chunk_frames),
-            int(plan["reference_frames"]),
             "\n".join(lines),
+            int(plan["reference_frames"]),
         )
 
 

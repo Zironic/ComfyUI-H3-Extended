@@ -28,8 +28,11 @@ import torch
 from comfy_api.latest import ComfyExtension, InputImpl, io
 
 from .. import harness, memory, ref_builder
-from ..audio_boundary_profile import legal_reference_tail_frames
-from ..geometry import HarnessGeometry
+from ..audio_boundary_profile import (
+    legal_reference_tail_frames,
+    validate_av_continuation_chunk_frames,
+)
+from ..geometry import AUDIO_LATENT_FPS, HarnessGeometry
 from ...cond_cache import MODES as COND_CACHE_MODES
 from .audio_output import (
     FFmpegAudioWriter,
@@ -61,6 +64,10 @@ from .runner import decode_chunk
 from .writer import FFmpegVideoWriter
 
 LOG = "[H3 Extended] longform AV continuation"
+REFERENCE_SECONDS_MIN = 2
+REFERENCE_SECONDS_MAX = 15
+REFERENCE_FRAMES_MIN = 24 * REFERENCE_SECONDS_MIN
+REFERENCE_FRAMES_MAX = 24 * REFERENCE_SECONDS_MAX
 
 
 def _chunk_count(target_frames, chunk_frames):
@@ -81,9 +88,16 @@ def _nearest(value, candidates, *, prefer_larger_on_tie=True):
 
 
 def _resolve_reference_frames(chunk_frames, reference_frames):
+    validate_av_continuation_chunk_frames(chunk_frames)
+    candidates = legal_reference_tail_frames(chunk_frames)
+    bounded_candidates = [
+        value
+        for value in candidates
+        if REFERENCE_FRAMES_MIN <= value <= REFERENCE_FRAMES_MAX
+    ]
     return _nearest(
         reference_frames,
-        legal_reference_tail_frames(chunk_frames),
+        bounded_candidates or candidates,
         prefer_larger_on_tie=True,
     )
 
@@ -211,6 +225,12 @@ def _slice_dynamic_av_reference(
             "reference_frames=%d exceeds previous decoded chunk length=%d"
             % (reference_frames, int(previous_pixels.shape[0]))
         )
+    if int(reference_frames) == int(previous_pixels.shape[0]):
+        return (
+            previous_pixels,
+            previous_video,
+            previous_audio,
+        )
     if geometry.overlap_frames != int(reference_frames):
         raise ValueError(
             "reference frames mismatch: geometry overlap=%d reference=%d"
@@ -218,6 +238,25 @@ def _slice_dynamic_av_reference(
         )
     video_overlap_start, video_overlap_count = geometry.overlap_slice()
     audio_overlap_start, audio_overlap_count = audio_runtime.audio_overlap_slice(geometry)
+    expected_audio_latents = (
+        int(reference_frames) * AUDIO_LATENT_FPS // geometry.fps
+    )
+    if int(reference_frames) * AUDIO_LATENT_FPS % geometry.fps:
+        raise RuntimeError(
+            "reference duration is not audio exact: R=%d fps=%d latent_fps=%d"
+            % (reference_frames, geometry.fps, AUDIO_LATENT_FPS)
+        )
+    if audio_overlap_count != expected_audio_latents:
+        raise RuntimeError(
+            "reference audio latent mismatch: expected %d from %d frames at %d fps, "
+            "but geometry overlap gives %d"
+            % (
+                expected_audio_latents,
+                int(reference_frames),
+                geometry.fps,
+                audio_overlap_count,
+            )
+        )
     return (
         previous_pixels[-int(reference_frames):],
         previous_video[
@@ -541,10 +580,14 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
             chunk_frames=geometry.chunk_frames,
             reference_frames=resolved_reference_frames,
         )
-        reference_geometry = HarnessGeometry(
-            chunk_frames=int(chunk_frames),
-            overlap_frames=int(resolved_reference_frames),
-        ).validate()
+        reference_geometry = (
+            HarnessGeometry(
+                chunk_frames=int(chunk_frames),
+                overlap_frames=int(resolved_reference_frames),
+            ).validate()
+            if resolved_reference_frames < geometry.chunk_frames
+            else None
+        )
         chunk_count = _chunk_count(target_frames, geometry.chunk_frames)
         if len(chunk_prompts) != chunk_count:
             raise RuntimeError(
@@ -890,6 +933,12 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
             else torch.zeros(1, 64, 64, 3)
         )
         video = InputImpl.VideoFromFile(output_path)
+        reference_note = (
+            "complete previous chunk"
+            if resolved_reference_frames == geometry.chunk_frames
+            else "from previous generated tail"
+        )
+        reference_seconds = resolved_reference_frames / float(geometry.fps)
         report_lines = [
             "MiniMax H3 LongForm AV Continuation",
             "mode      native video + audio continuation; no latent overlap carry",
@@ -905,6 +954,12 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
             "chunks    %d" % chunk_count,
             "output    %d frames (%.3f s at %d fps)"
             % (target_frames, target_frames / geometry.fps, geometry.fps),
+            "reference R=%d frames (%.3f s) %s"
+            % (
+                resolved_reference_frames,
+                reference_seconds,
+                reference_note,
+            ),
             "dynamic   <Video %d> + <Audio %d> from previous generated chunk"
             % (dynamic_video_number, dynamic_audio_number),
             "audio     %d samples at %d Hz" % (written_audio, sample_rate),

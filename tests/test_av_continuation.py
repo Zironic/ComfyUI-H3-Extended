@@ -19,6 +19,7 @@ from chunked_ref2v.longform.nplusone_chunk_prompt_timeline import (
     prompts_for_av_continuation_plan,
 )
 from chunked_ref2v.geometry import HarnessGeometry
+from chunked_ref2v.longform.audio_runtime import audio_overlap_slice
 
 
 class LongFormAVContinuationTests(unittest.TestCase):
@@ -79,8 +80,68 @@ class LongFormAVContinuationTests(unittest.TestCase):
         self.assertEqual(sliced_audio.shape, (1, 32, 2, 135))
         self.assertEqual(int(sliced_video.shape[2]), int(overlap_count))
 
+    def test_dynamic_reference_tail_can_use_whole_chunk(self):
+        geometry = HarnessGeometry(chunk_frames=141, overlap_frames=81).validate()
+        pixels = torch.arange(141 * 64 * 96 * 3, dtype=torch.float32).reshape(
+            141, 64, 96, 3,
+        )
+        video = torch.arange(
+            1 * 24 * 42 * 4 * 6,
+            dtype=torch.float32,
+        ).reshape(1, 24, 42, 4, 6)
+        audio = torch.arange(1 * 32 * 2 * 235, dtype=torch.float32).reshape(
+            1, 32, 2, 235
+        )
+
+        sliced_pixels, sliced_video, sliced_audio = _slice_dynamic_av_reference(
+            pixels,
+            video,
+            audio,
+            reference_frames=141,
+            geometry=geometry,
+        )
+        self.assertEqual(sliced_pixels.shape, pixels.shape)
+        self.assertTrue(torch.equal(sliced_pixels, pixels))
+        self.assertIs(sliced_video, video)
+        self.assertIs(sliced_audio, audio)
+
     def test_reference_frames_are_snapped_to_legal_values(self):
         self.assertEqual(_resolve_reference_frames(141, 80), 81)
+
+    def test_reference_frames_respect_reference_input_range(self):
+        self.assertEqual(_resolve_reference_frames(141, 40), 51)
+
+    def test_reference_frames_can_snap_to_whole_chunk(self):
+        self.assertEqual(_resolve_reference_frames(141, 141), 141)
+
+    def test_reference_frames_reject_illegal_chunk(self):
+        with self.assertRaises(ValueError):
+            _resolve_reference_frames(124, 60)
+
+    def test_reference_tail_slice_preserves_shared_intervals(self):
+        geometry = HarnessGeometry(chunk_frames=141, overlap_frames=60).validate()
+        pixels = torch.arange(141 * 64 * 96 * 3, dtype=torch.float32).reshape(
+            141, 64, 96, 3,
+        )
+        video = torch.arange(
+            141 * 24 * 42 * 4 * 6,
+            dtype=torch.float32,
+        ).reshape(1, 24, 42, 4, 6)
+        audio = torch.arange(1 * 32 * 2 * 235, dtype=torch.float32).reshape(
+            1, 32, 2, 235
+        )
+
+        sliced_pixels, sliced_video, sliced_audio = _slice_dynamic_av_reference(
+            pixels,
+            video,
+            audio,
+            reference_frames=60,
+            geometry=geometry,
+        )
+        self.assertEqual(sliced_pixels.shape, (60, 64, 96, 3))
+        _, audio_overlap_count = audio_overlap_slice(geometry)
+        self.assertEqual(int(audio_overlap_count), 100)
+        self.assertEqual(sliced_audio.shape[-1], 100)
 
     def test_reference_frames_cannot_exceed_previous_chunk(self):
         geometry = HarnessGeometry(chunk_frames=141, overlap_frames=81).validate()

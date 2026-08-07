@@ -8,6 +8,13 @@ const NODE_NAMES = new Set([
     "MiniMaxH3LongFormAVContinuationZi",
 ]);
 
+const AV_CONTINUATION_NODE = "MiniMaxH3LongFormAVContinuationZi";
+const AV_CONTINUATION_PLAN_NODE = "MiniMaxH3NPlusOneChunkPromptTimelineZi";
+const STRICT_AV_NPLUSONE_NODES = new Set([
+    AV_CONTINUATION_NODE,
+    AV_CONTINUATION_PLAN_NODE,
+]);
+
 // H3 video generation lengths are 17k+5. The long-form nodes deliberately
 // start at 22 frames because five frames is not a useful production chunk.
 const CHUNK_FRAMES = Array.from(
@@ -17,6 +24,10 @@ const CHUNK_FRAMES = Array.from(
 const FPS = 24;
 const AUDIO_LATENT_FPS = 40;
 const FRAME_PER_TOKEN = [1, 4, 4, 4, 4];
+const REFERENCE_MIN_SECONDS = 2;
+const REFERENCE_MAX_SECONDS = 15;
+const MIN_REFERENCE_FRAMES = FPS * REFERENCE_MIN_SECONDS;
+const MAX_REFERENCE_FRAMES = FPS * REFERENCE_MAX_SECONDS;
 
 // Video is 24 fps and H3 audio latents are 40 Hz. Their time boundaries meet
 // every three video frames (five audio latents), so an exact A/V chunk length
@@ -93,10 +104,20 @@ function exactVideoOverlap(latentCount, strideFrames, overlapFrames) {
 }
 
 function legalReferenceFrames(chunkFrames) {
-    const latentCount = videoLatentT(chunkFrames);
+    const chunkFramesInt = Math.trunc(chunkFrames);
+    if (!Number.isFinite(chunkFramesInt)) {
+        return [];
+    }
+    if (!audioBoundaryExact(chunkFramesInt)) {
+        return [];
+    }
+    const latentCount = videoLatentT(chunkFramesInt);
     const candidates = [];
-    for (let overlapFrames = 1; overlapFrames < chunkFrames; overlapFrames += 1) {
-        const stride = chunkFrames - overlapFrames;
+    for (let overlapFrames = 1; overlapFrames <= chunkFramesInt; overlapFrames += 1) {
+        if (!audioBoundaryExact(overlapFrames)) {
+            continue;
+        }
+        const stride = chunkFramesInt - overlapFrames;
         if (!audioBoundaryExact(stride)) {
             continue;
         }
@@ -181,6 +202,9 @@ function audioAlignmentEnabled(node) {
 }
 
 function activeChunkFrames(node) {
+    if (node.__h3StrictAvNPlusOne) {
+        return AUDIO_ALIGNED_CHUNK_FRAMES;
+    }
     return audioAlignmentEnabled(node)
         ? AUDIO_ALIGNED_CHUNK_FRAMES
         : CHUNK_FRAMES;
@@ -199,7 +223,42 @@ function activeReferenceFrames(node) {
     if (!Number.isFinite(chunkFrames)) {
         return [];
     }
-    return legalReferenceFrames(Math.trunc(chunkFrames));
+    const references = legalReferenceFrames(Math.trunc(chunkFrames));
+    if (!isAVContinuationNode(node)) {
+        return references;
+    }
+    const bounded = references.filter(
+        (frames) => frames >= MIN_REFERENCE_FRAMES && frames <= MAX_REFERENCE_FRAMES,
+    );
+    return bounded.length === 0 ? references : bounded;
+}
+
+function nodeClassName(node) {
+    return node?.comfyClass || node?.type || node?.constructor?.comfyClass;
+}
+
+function hasAvContinuationInput(node) {
+    const inputs = node?.inputs || [];
+    return inputs.some((input) => input?.name === "n_plus_one_prompt_plan");
+}
+
+function hasAvContinuationShape(node) {
+    const widgets = node?.widgets || [];
+    return (
+        widgets.some((widget) => widget?.name === "reference_frames") &&
+        (widgets.some((widget) => widget?.name === "chunk_prompts_json") ||
+            hasAvContinuationInput(node))
+    );
+}
+
+function isAVContinuationNode(node) {
+    if (node.__h3StrictAvNPlusOne) return true;
+    return (
+        nodeClassName(node) === AV_CONTINUATION_NODE
+        || nodeClassName(node) === AV_CONTINUATION_PLAN_NODE
+        || hasAvContinuationInput(node)
+        || hasAvContinuationShape(node)
+    );
 }
 
 function syncFrameChoices(node) {
@@ -210,7 +269,7 @@ function syncFrameChoices(node) {
     );
     if (!chunkWidget) return;
 
-    const aligned = audioAlignmentEnabled(node);
+    const preferLarger = audioAlignmentEnabled(node) || node.__h3StrictAvNPlusOne;
     const chunks = activeChunkFrames(node);
     makeComboWidget(chunkWidget, chunks);
     setWidgetValue(
@@ -218,14 +277,15 @@ function syncFrameChoices(node) {
         chunkWidget,
         chunks.includes(Number(chunkWidget.value))
             ? Number(chunkWidget.value)
-            : nearestAllowed(chunkWidget.value, chunks, aligned),
+            : nearestAllowed(chunkWidget.value, chunks, preferLarger),
     );
 
-    if (overlapWidget) {
-        const overlaps = activeOverlapFrames(node).filter(
-            (frames) => frames < Number(chunkWidget.value),
-        );
-        makeComboWidget(overlapWidget, overlaps);
+        if (overlapWidget) {
+            const aligned = audioAlignmentEnabled(node) || node.__h3StrictAvNPlusOne;
+            const overlaps = activeOverlapFrames(node).filter(
+                (frames) => frames < Number(chunkWidget.value),
+            );
+            makeComboWidget(overlapWidget, overlaps);
 
         // Always run the value back through setWidgetValue, even when it is already
         // legal: a widget loaded as the number 4 has to become the string "4" or the
@@ -262,7 +322,7 @@ function installLegalSelectors(node) {
     if (!chunkWidget.__h3LegalFramesWrapped) {
         const originalCallback = chunkWidget.callback;
         chunkWidget.callback = function (value, ...args) {
-            const aligned = audioAlignmentEnabled(node);
+            const aligned = audioAlignmentEnabled(node) || node.__h3StrictAvNPlusOne;
             const allowed = activeChunkFrames(node);
             const legal = nearestAllowed(value, allowed, aligned);
             const next = legal === undefined ? value : String(legal);
@@ -326,11 +386,13 @@ app.registerExtension({
     name: "H3Extended.LongFormLegalFrameSelectors",
     async beforeRegisterNodeDef(nodeType, nodeData) {
         if (!NODE_NAMES.has(nodeData.name)) return;
+        const isStrictAvNPlusOne = STRICT_AV_NPLUSONE_NODES.has(nodeData.name);
 
         // Keep the backend schema as INT so primitive outputs remain compatible.
         // Only the instantiated widgets are converted to legal-value dropdowns.
         const originalCreated = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function () {
+            this.__h3StrictAvNPlusOne = isStrictAvNPlusOne;
             const result = originalCreated?.apply(this, arguments);
             installLegalSelectors(this);
             return result;
@@ -338,6 +400,7 @@ app.registerExtension({
 
         const originalConfigure = nodeType.prototype.onConfigure;
         nodeType.prototype.onConfigure = function () {
+            this.__h3StrictAvNPlusOne = isStrictAvNPlusOne;
             const result = originalConfigure?.apply(this, arguments);
             installLegalSelectors(this);
             return result;

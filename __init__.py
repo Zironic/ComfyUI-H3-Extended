@@ -28,6 +28,7 @@ from .chunked_ref2v.longform import (
     v2v_audio_runtime,
 )
 from .chunked_ref2v.nodes import MiniMaxH3HarnessExtension
+from .chunked_ref2v.bridge.nodes import MiniMaxH3BridgeExtension
 from . import cond_cache_diagnostics
 from . import taeh3_latent_preview
 from .diagnostics.nodes import MiniMaxH3DiagnosticsExtension
@@ -94,6 +95,7 @@ NODE_CATEGORIES = {
     "MiniMaxH3AttentionProbeZi": "H3-Extender/Diagnostics",
     "MiniMaxH3Ref2VExperimentHarnessZi": "H3-Extender/Experiments",
     "MiniMaxH3LongFormRef2VZi": "H3-Extender/Experiments",
+    "MiniMaxH3BridgeExperimentZi": "H3-Extender/Experiments",
 }
 
 
@@ -138,6 +140,7 @@ class H3ExtendedExtension(ComfyExtension):
             MiniMaxH3Extension(),
             MiniMaxH3ProbeExtension(),
             MiniMaxH3HarnessExtension(),
+            MiniMaxH3BridgeExtension(),
             MiniMaxH3ChunkPromptTimelineExtension(),
             MiniMaxH3NPlusOneChunkPromptTimelineExtension(),
             MiniMaxH3LongFormPreviewExtension(),

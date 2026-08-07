@@ -10,7 +10,7 @@ from chunked_ref2v.audio_boundary_profile import (
     profile_audio_boundaries_are_exact,
     resolve_audio_boundary_profile,
 )
-from chunked_ref2v.geometry import HarnessGeometry, audio_boundary_is_exact
+from chunked_ref2v.geometry import HarnessGeometry, UnalignedProfileError, audio_boundary_is_exact
 
 
 class AudioBoundaryProfileTests(unittest.TestCase):
@@ -32,12 +32,16 @@ class AudioBoundaryProfileTests(unittest.TestCase):
     def test_legal_reference_tail_frames(self):
         self.assertEqual(
             legal_reference_tail_frames(90),
-            [9, 21, 30, 39, 51, 60, 72, 81],
+            [9, 21, 30, 39, 51, 60, 72, 81, 90],
         )
         self.assertEqual(
             legal_reference_tail_frames(141),
-            [9, 21, 30, 39, 51, 60, 72, 81, 90, 102, 111, 123, 132],
+            [9, 21, 30, 39, 51, 60, 72, 81, 90, 102, 111, 123, 132, 141],
         )
+
+    def test_legal_reference_tail_frames_requires_chunk_boundary(self):
+        with self.assertRaises(UnalignedProfileError):
+            legal_reference_tail_frames(124)
 
     def test_default_90_4_profile_snaps_to_90_9(self):
         chunk, overlap, note = resolve_audio_boundary_profile(90, 4, True)

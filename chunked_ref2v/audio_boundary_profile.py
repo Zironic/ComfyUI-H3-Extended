@@ -44,6 +44,28 @@ def audio_aligned_chunk_frames(
     ]
 
 
+def validate_av_continuation_chunk_frames(
+    chunk_frames,
+    *,
+    min_frames=MIN_LONGFORM_CHUNK_FRAMES,
+    max_frames=MAX_LONGFORM_CHUNK_FRAMES,
+    fps=FPS,
+):
+    """Require a chunk length that lands on both video and audio shared boundaries."""
+
+    chunk_frames = int(chunk_frames)
+    legal = audio_aligned_chunk_frames(
+        min_frames=min_frames,
+        max_frames=max_frames,
+        fps=fps,
+    )
+    if chunk_frames not in legal:
+        raise UnalignedProfileError(
+            "chunk_frames=%d is not an aligned N+1 continuation length" % chunk_frames
+        )
+    return chunk_frames
+
+
 def profile_audio_boundaries_are_exact(
     chunk_frames,
     overlap_frames,
@@ -85,7 +107,12 @@ def aligned_overlap_frames(
     """Nearest aligned overlap for continuation that stays exact on shared boundaries."""
     chunk_frames = int(chunk_frames)
     overlap_frames = int(overlap_frames)
-    candidates = legal_reference_tail_frames(chunk_frames, fps=fps)
+    # Overlap is only meaningful when it is a strict suffix of the chunk.
+    candidates = [
+        candidate
+        for candidate in legal_reference_tail_frames(chunk_frames, fps=fps)
+        if 0 < candidate < chunk_frames
+    ]
     if overlap_frames in candidates:
         return overlap_frames
     if not candidates:
@@ -105,11 +132,17 @@ def legal_reference_tail_frames(chunk_frames, *, fps=FPS):
     * the stride and overlap align on H3 latent boundaries
     """
     chunk_frames = int(chunk_frames)
+    if not audio_boundary_is_exact(chunk_frames, fps=fps):
+        raise UnalignedProfileError(
+            "chunk end is not on the shared video/audio boundary"
+        )
     latent_t = video_latent_t(chunk_frames)
     candidates = []
-    for overlap_frames in range(1, chunk_frames):
+    for overlap_frames in range(1, chunk_frames + 1):
         stride_frames = chunk_frames - overlap_frames
-        if stride_frames <= 0:
+        if stride_frames < 0:
+            continue
+        if not audio_boundary_is_exact(overlap_frames, fps=fps):
             continue
         if not audio_boundary_is_exact(stride_frames, fps=fps):
             continue
@@ -214,6 +247,7 @@ __all__ = [
     "MAX_LONGFORM_CHUNK_FRAMES",
     "MIN_LONGFORM_CHUNK_FRAMES",
     "audio_aligned_chunk_frames",
+    "validate_av_continuation_chunk_frames",
     "aligned_overlap_frames",
     "legal_reference_tail_frames",
     "profile_audio_boundaries_are_exact",
