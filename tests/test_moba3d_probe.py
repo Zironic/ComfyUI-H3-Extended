@@ -38,6 +38,10 @@ def build_layout():
 def test_budgets():
     check(moba3d.parse_budgets("10,25,50") == (0.1, 0.25, 0.5), "percent budgets parse")
     check(moba3d.parse_budgets("0.1,0.5") == (0.1, 0.5), "fraction budgets parse")
+    check(moba3d.parse_budgets((0.1, 0.25, 0.5)) == (0.1, 0.25, 0.5),
+          "already-normalized tuple budgets are idempotent")
+    check(moba3d.parse_budgets([10, 25, 50]) == (0.1, 0.25, 0.5),
+          "numeric iterable percent budgets parse")
     check(moba3d.parse_budgets("auto") == moba3d.DEFAULT_BUDGETS, "auto budgets use defaults")
 
 
@@ -83,6 +87,16 @@ def test_router_prefers_planted_block(lay):
     first = result["budgets"][0]
     check(first["routed_mass_mean"] > 0.95, "mean-pooled router captures planted high-mass block at smallest budget")
     check(first["routing_regret_mean"] < 1e-3, "planted case is near oracle")
+
+    # Regression: sessions store normalized tuple budgets and analyze_routing
+    # reparses them. This must remain harmless.
+    tuple_result = moba3d.analyze_routing(
+        q, k, lay, q0, q0 + min(8, lay.frame_rows),
+        block_t=1, block_h=2, block_w=2,
+        budgets=moba3d.parse_budgets("10,25,50"), head_chunk=1,
+    )
+    check([r["budget"] for r in tuple_result["budgets"]] == [0.1, 0.25, 0.5],
+          "analyze_routing accepts normalized tuple budgets")
 
 
 def test_report(lay):
