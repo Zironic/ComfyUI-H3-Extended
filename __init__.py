@@ -16,6 +16,7 @@ from .chunked_ref2v.longform.chunk_prompt_timeline import (
     MiniMaxH3ChunkPromptTimelineExtension,
 )
 from .chunked_ref2v.longform import (
+    audio_boundary_nodes,
     completed_preview_runtime,
     opening_picture_runtime,
     v2v_audio_runtime,
@@ -39,6 +40,11 @@ WEB_DIRECTORY = "./web"
 # replacing the duplicated video-only sampler with synchronized video+audio
 # carry, source-audio conditioning, and dual-track output.
 v2v_audio_runtime.install()
+
+# The public long-form nodes all use the same exact 24 fps / 40 Hz audio-boundary
+# policy. Install this after the preview/runtime wrappers so it sees the actual
+# classes exported to Comfy and can preserve existing workflow widget positions.
+audio_boundary_nodes.install()
 
 # Keep finalized MP4 segments as the primary completed-output preview, but make
 # that channel failure-safe: GIF fallback first, explicit browser error second.
