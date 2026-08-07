@@ -92,7 +92,7 @@ class MiniMaxH3Moba3DProbe(io.ComfyNode):
             node_id="MiniMaxH3Moba3DProbeZi",
             display_name="MiniMax H3 MoBA 3D Probe (Zi)",
             category="model/patch/minimax",
-            description="Probe-only simulation of MiniMax's disclosed H3 sparse-attention idea: video-only 3D candidate blocks, per-query-token mean-pooled routing, dense non-video context, and exact sparse-vs-dense output error. Does not alter inference and is intentionally expensive on probed steps.",
+            description="Probe-only simulation of MiniMax's disclosed H3 sparse-attention idea: video-only 3D candidate blocks, per-query-token mean-pooled routing, dense non-video context, exact sparse-vs-dense output error, and optional sampler-latent convergence measurements. Does not alter inference and is intentionally expensive.",
             inputs=[
                 io.Model.Input("model"),
                 io.Boolean.Input("enabled", default=True),
@@ -109,6 +109,11 @@ class MiniMaxH3Moba3DProbe(io.ComfyNode):
                 io.Boolean.Input("include_audio_query", default=True, tooltip="Also test audio queries routing into video blocks."),
                 io.Boolean.Input("include_text_query", default=False),
                 io.Boolean.Input("capture_uncond", default=False),
+                io.Boolean.Input(
+                    "capture_latent_dynamics",
+                    default=True,
+                    tooltip="Measure target-video sampler x/x0 changes between every denoising callback at H3's 1x2x2 patch granularity, plus distance from explicit first/last keyframes. Adds moderate probe overhead but does not alter sampling.",
+                ),
             ],
             outputs=[io.Model.Output()],
         )
@@ -117,7 +122,7 @@ class MiniMaxH3Moba3DProbe(io.ComfyNode):
     def execute(cls, model, enabled, run_tag, layers, steps, query_time_positions,
                 query_spatial_positions, query_block, block_t, block_h, block_w,
                 video_budgets, include_audio_query, include_text_query,
-                capture_uncond) -> io.NodeOutput:
+                capture_uncond, capture_latent_dynamics=True) -> io.NodeOutput:
         if not enabled:
             return io.NodeOutput(model)
 
@@ -134,6 +139,7 @@ class MiniMaxH3Moba3DProbe(io.ComfyNode):
             include_audio=include_audio_query,
             include_text=include_text_query,
             capture_uncond=capture_uncond,
+            capture_latent_dynamics=capture_latent_dynamics,
             block_t=block_t,
             block_h=block_h,
             block_w=block_w,
@@ -149,8 +155,9 @@ class MiniMaxH3Moba3DProbe(io.ComfyNode):
             comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, "h3_moba3d_probe",
             moba_capture.make_wrapper(session), m.model_options, is_model_options=True)
         logging.info(
-            "[H3 MoBA3D probe] armed: tag=%s layers=%s steps=%s block=%dx%dx%d budgets=%s",
+            "[H3 MoBA3D probe] armed: tag=%s layers=%s steps=%s block=%dx%dx%d budgets=%s latent_dynamics=%s",
             run_tag, layers, steps, block_t, block_h, block_w, video_budgets,
+            capture_latent_dynamics,
         )
         return io.NodeOutput(m)
 
