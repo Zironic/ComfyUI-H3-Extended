@@ -21,6 +21,7 @@ from .chunked_ref2v.longform.nplusone_chunk_prompt_timeline import (
     MiniMaxH3NPlusOneChunkPromptTimelineExtension,
 )
 from .chunked_ref2v.longform import (
+    aligned_source_runtime,
     audio_boundary_nodes,
     completed_preview_runtime,
     opening_picture_runtime,
@@ -52,6 +53,12 @@ v2v_audio_runtime.install()
 # policy. Install this after the preview/runtime wrappers so it sees the actual
 # classes exported to Comfy and can preserve existing workflow widget positions.
 audio_boundary_nodes.install()
+
+# Optional same-time source AV conditioning for the native N+1 continuation
+# node. This is appended after all existing widgets so saved workflows keep
+# their positional values. The source reference can remain at source/native
+# resolution while the generated target uses an independent larger canvas.
+aligned_source_runtime.install()
 
 # Keep finalized MP4 segments as the primary completed-output preview, but make
 # that channel failure-safe: GIF fallback first, explicit browser error second.
