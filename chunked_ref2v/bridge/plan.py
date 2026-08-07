@@ -36,7 +36,8 @@ from ..geometry import (
 )
 
 RIGHT_REF_POLICIES = ("none", "natural", "counterfactual")
-PROMPT_POLICIES = ("continuation", "bridge", "neutral")
+PROMPT_POLICIES = ("continuation", "bridge", "bridge_swapped", "neutral")
+REF_ORDERS = ("past_first", "future_first")
 
 
 def head_latent_slice(latent_t, frames):
@@ -86,6 +87,7 @@ class BridgeArm:
     display_name: str
     right_ref: str = "none"
     prompt_policy: str = "continuation"
+    ref_order: str = "past_first"
     notes: str = ""
 
     def as_dict(self):
@@ -94,6 +96,7 @@ class BridgeArm:
             "display_name": self.display_name,
             "right_ref": self.right_ref,
             "prompt_policy": self.prompt_policy,
+            "ref_order": self.ref_order,
             "notes": self.notes,
         }
 
@@ -106,6 +109,18 @@ def _register(arm):
         raise ValueError("bad right_ref policy on %s" % arm.arm_id)
     if arm.prompt_policy not in PROMPT_POLICIES:
         raise ValueError("bad prompt policy on %s" % arm.arm_id)
+    if arm.ref_order not in REF_ORDERS:
+        raise ValueError("bad ref order on %s" % arm.arm_id)
+    # A swapped presentation with unswapped definitions would tell the model
+    # that the following part is the preceding one. That is a different (and
+    # useless) experiment, so it is refused rather than allowed by accident.
+    swapped_order = arm.ref_order == "future_first"
+    swapped_text = arm.prompt_policy == "bridge_swapped"
+    if arm.right_ref != "none" and swapped_order != swapped_text:
+        raise ValueError(
+            "%s mixes ref_order=%s with prompt_policy=%s; the definitions would "
+            "no longer describe the clips" % (arm.arm_id, arm.ref_order,
+                                              arm.prompt_policy))
     ARMS[arm.arm_id] = arm
     return arm
 
@@ -138,6 +153,19 @@ _register(BridgeArm(
 ))
 
 _register(BridgeArm(
+    arm_id="B_swapped",
+    display_name="B swapped - future presented first",
+    right_ref="natural",
+    prompt_policy="bridge_swapped",
+    ref_order="future_first",
+    notes="Same two clips as B, slots exchanged, definitions rewritten so they "
+          "still describe the clips truthfully. B produced <Video 2>'s content "
+          "then <Video 1>'s - a reverse-order replay rather than a bridge. If "
+          "that is keyed to slot position this arm inverts it; if it is keyed to "
+          "the text roles or to content, the output stays as it was.",
+))
+
+_register(BridgeArm(
     arm_id="D_no_chronology",
     display_name="D - natural right reference, no chronology wording",
     right_ref="natural",
@@ -149,9 +177,11 @@ _register(BridgeArm(
 
 # Cheapest first: A carries one reference block, the rest carry two. An OOM on a
 # two-reference arm then cannot destroy the control.
-ARM_ORDER = ["A_left_only", "B_natural", "C_counterfactual", "D_no_chronology"]
+ARM_ORDER = ["A_left_only", "B_natural", "B_swapped", "C_counterfactual",
+             "D_no_chronology"]
 
 SUITES = {
+    "swap": ["B_natural", "B_swapped"],
     "decisive": ["A_left_only", "B_natural", "C_counterfactual"],
     "full": list(ARM_ORDER),
     "plumbing": ["B_natural"],
@@ -161,7 +191,14 @@ SUITE_NAMES = list(SUITES) + ["custom"]
 
 # ---------------------------------------------------------------- prompts
 
+# The tag vocabulary is the one the source run actually used. Inventing a
+# variant here would be an untested variable riding along with the experiment.
+_TAG = "[video continuation + reference generation]"
+
+_SUBJECT_DEF = "<Subject 1> is the woman shown in <Video 1>."
+
 _CONTINUATION_DEFS = (
+    _SUBJECT_DEF + "\n"
     "<Video 1> is the immediately preceding part of the same continuous source "
     "video. Its final frame and motion state occur immediately before the target "
     "video begins.\n"
@@ -177,6 +214,41 @@ _BRIDGE_DEFS = _CONTINUATION_DEFS + (
     "after the target audio ends."
 )
 
+# B_swapped: the same two clips in exchanged slots. Every role statement is
+# inverted with them, so the text still describes what is actually there - only
+# the slot each clip occupies has changed.
+_SWAPPED_DEFS = (
+    _SUBJECT_DEF + "\n"
+    "<Video 1> is the immediately following part of the same continuous source "
+    "video. Its first frame and motion state occur immediately after the target "
+    "video ends.\n"
+    "<Audio 1> is the synchronized audio of <Video 1> and begins immediately "
+    "after the target audio ends.\n"
+    "<Video 2> is the immediately preceding part of the same continuous source "
+    "video. Its final frame and motion state occur immediately before the target "
+    "video begins.\n"
+    "<Audio 2> is the synchronized audio of <Video 2> and ends immediately "
+    "before the target audio begins."
+)
+
+_SWAPPED_SUMMARY = (
+    _TAG + " The target video fills the missing continuous interval between "
+    "<Video 2> and <Video 1>. It continues directly forward from the end of "
+    "<Video 2> and reaches a compatible final visual and motion state that "
+    "continues directly into the beginning of <Video 1>."
+)
+
+_SWAPPED_TAIL = (
+    "The target begins immediately after the final moment of <Video 2>, "
+    "preserving its subject state, camera trajectory, motion direction and "
+    "phase, environment, and lighting. The action proceeds continuously through "
+    "the requested intermediate events. By the end of the target, the subject "
+    "state, spatial arrangement, camera position and motion, and ongoing action "
+    "approach the state immediately preceding the beginning of <Video 1>, so "
+    "that playback can continue directly into <Video 1> without a visible "
+    "restart."
+)
+
 # Arm D: the same two references, presented without any chronological claim.
 _NEUTRAL_DEFS = _CONTINUATION_DEFS + (
     "\n<Video 2> is a reference video of the same subject and environment.\n"
@@ -184,21 +256,22 @@ _NEUTRAL_DEFS = _CONTINUATION_DEFS + (
 )
 
 _CONTINUATION_SUMMARY = (
-    "[video continuation + audio reference] The target video continues directly "
-    "forward from the end of <Video 1>."
+    _TAG + " The target video continues directly forward from the end of "
+    "<Video 1>."
 )
 
 _BRIDGE_SUMMARY = (
-    "[video continuation + reference generation + audio reference] The target "
-    "video fills the missing continuous interval between <Video 1> and "
-    "<Video 2>. It continues directly forward from the end of <Video 1> and "
-    "reaches a compatible final visual and motion state that continues directly "
-    "into the beginning of <Video 2>."
+    _TAG + " The target video fills the missing continuous interval between "
+    "<Video 1> and <Video 2>. It continues directly forward from the end of "
+    "<Video 1> and reaches a compatible final visual and motion state that "
+    "continues directly into the beginning of <Video 2>."
 )
 
-_NEUTRAL_SUMMARY = (
-    "[video continuation + reference generation + audio reference] The target "
-    "video continues directly forward from the end of <Video 1>."
+_NEUTRAL_SUMMARY = _CONTINUATION_SUMMARY
+
+_RETENTION = (
+    "<Subject 1> fully_preserved - Her identity, outfit, hair and appearance "
+    "remain consistent with <Video 1>."
 )
 
 _CONTINUATION_TAIL = (
@@ -218,12 +291,30 @@ _BRIDGE_TAIL = _CONTINUATION_TAIL + (
 _POLICY_TEXT = {
     "continuation": (_CONTINUATION_DEFS, _CONTINUATION_SUMMARY, _CONTINUATION_TAIL),
     "bridge": (_BRIDGE_DEFS, _BRIDGE_SUMMARY, _BRIDGE_TAIL),
+    "bridge_swapped": (_SWAPPED_DEFS, _SWAPPED_SUMMARY, _SWAPPED_TAIL),
     "neutral": (_NEUTRAL_DEFS, _NEUTRAL_SUMMARY, _CONTINUATION_TAIL),
 }
 
 
+def is_formatted(prompt):
+    """Whether a prompt is already a full H3 chunk prompt.
+
+    A real chunk prompt carries its own `summary:` and `detailed_description:`
+    headers. Wrapping one in another `detailed_description:` would nest the whole
+    thing and destroy it, so the two cases have to be told apart.
+    """
+    body = (prompt or "").lower()
+    return "summary:" in body and "detailed_description:" in body
+
+
 def build_prompt(base_prompt, policy):
-    """Assemble an arm's prompt.
+    """Assemble an arm's prompt in the house format.
+
+    Two shapes go in. A bare description gets wrapped in the four sections the
+    long-form runs use. An already-formatted chunk prompt is left completely
+    alone except for the `subject_definitions:` block, which is where the
+    `<Video n>` roles have to be declared and which a chunk prompt never carries
+    (the long-form node supplies it separately as the global prompt).
 
     B and C both resolve to `bridge`, so their prompts are identical strings by
     construction - the only difference between those arms is what the second
@@ -234,10 +325,15 @@ def build_prompt(base_prompt, policy):
     except KeyError:
         raise ValueError("unknown prompt policy %r" % policy) from None
     body = (base_prompt or "").strip()
+
+    if is_formatted(body):
+        return "subject_definitions:\n%s\n\n%s" % (defs, body)
+
     return (
         "subject_definitions:\n%s\n\n"
         "summary:\n%s\n\n"
-        "detailed_description:\n%s\n%s" % (defs, summary, body, tail)
+        "retention_analysis:\n%s\n\n"
+        "detailed_description:\n%s\n%s" % (defs, summary, _RETENTION, body, tail)
     ).strip()
 
 

@@ -21,7 +21,12 @@ except ImportError:  # pragma: no cover
 from . import reference_runner, runner
 from .audio_runtime import resolve_audio_aligned_overlap
 from .chunk_stream import chunk_count_for
-from .nodes import _describe_ffmpeg, _preview, _preview_from_video, _video_result
+from .nodes import (
+    _describe_ffmpeg,
+    _preview,
+    _preview_from_video,
+    _video_from_path,
+)
 
 LOG = "[H3 Extended] longform reference"
 CANVAS_MULTIPLE = 32
@@ -37,7 +42,6 @@ class MiniMaxH3LongFormReferenceVideo(io.ComfyNode):
             display_name="MiniMax H3 LongFormReferenceVideo (Zi)",
             category="model/video/minimax/testing",
             is_experimental=True,
-            is_output_node=True,
             description=(
                 "Generates an independently sized long clip by repeating the same "
                 "prompt and reference payload for overlapping chunks. It does not "
@@ -116,7 +120,6 @@ class MiniMaxH3LongFormReferenceVideo(io.ComfyNode):
                         "imageio_ffmpeg binary."
                     ),
                 ),
-                io.Boolean.Input("output_video", default=True),
                 io.Boolean.Input(
                     "save_frames", default=False,
                     tooltip="Save a diagnostic PNG sequence in addition to the video.",
@@ -187,12 +190,14 @@ class MiniMaxH3LongFormReferenceVideo(io.ComfyNode):
                     ),
                 ),
             ],
+            # Not an output node: the VIDEO goes to Save Video, which owns
+            # final naming, container, codec, metadata, and the output preview.
             outputs=[
+                io.Video.Output(display_name="video"),
                 io.Image.Output(display_name="preview"),
                 io.String.Output(display_name="run_directory"),
                 io.String.Output(display_name="video_path"),
                 io.String.Output(display_name="report"),
-                io.Video.Output(display_name="video"),
             ],
             hidden=[io.Hidden.unique_id],
         )
@@ -204,7 +209,7 @@ class MiniMaxH3LongFormReferenceVideo(io.ComfyNode):
         overlap_frames=4, align_audio_chunks=False, carry=runner.CARRY_OVERLAP,
         ref_image_size="native", cond_cache="auto", attention="auto",
         activation="mlp_chunked_native", run_directory="",
-        ffmpeg_location="", output_video=True, save_frames=False,
+        ffmpeg_location="", save_frames=False,
         diagnostic_dump_chunks=False, ref_images=None, ref_videos=None, ref_video_audios=None,
         ref_audios=None,
     ) -> io.NodeOutput:
@@ -251,7 +256,6 @@ class MiniMaxH3LongFormReferenceVideo(io.ComfyNode):
             ref_image_size=ref_image_size,
             cond_cache=cond_cache,
             save_frames=save_frames,
-            output_video=output_video,
             diagnostic_dump_chunks=diagnostic_dump_chunks,
             ffmpeg_location=ffmpeg_location.strip() or None,
             runtime_config={"attention": attention, "activation": activation},
@@ -272,7 +276,7 @@ class MiniMaxH3LongFormReferenceVideo(io.ComfyNode):
             ),
             "references %d" % len(summary.get("reference_notes", [])),
             "audio     reference conditioning retained; stitched output is video-only",
-            "video     %s" % (summary["output_path"] or "disabled"),
+            "video     %s" % summary["output_path"],
             "runtime   %s" % memory.describe(memory_status),
             "run dir   %s" % root,
             "ffmpeg    %s" % _describe_ffmpeg(ffmpeg_location.strip() or None),
@@ -293,9 +297,9 @@ class MiniMaxH3LongFormReferenceVideo(io.ComfyNode):
         if preview is None:
             preview = torch.zeros(1, 64, 64, 3)
 
-        video, video_ui = _video_result(summary["output_path"])
         return io.NodeOutput(
-            preview, root, summary["output_path"], report, video, ui=video_ui,
+            _video_from_path(summary["output_path"]),
+            preview, root, summary["output_path"], report,
         )
 
 

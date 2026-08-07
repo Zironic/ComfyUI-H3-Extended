@@ -41,7 +41,7 @@ from .runner import (
     _save,
     _unpack_conditioning,
 )
-from .writer import FFmpegVideoWriter
+from .writer import FFmpegVideoWriter, close_writers
 
 LOG = "[H3 Extended] longform reference"
 
@@ -201,11 +201,10 @@ class LongFormReferenceRun(LongFormRun):
         return chunk_count
 
     def sample_and_write(self, *, model, conditioning, sampler, sigmas,
-                         video_vae, chunk_count, output_video, save_frames,
+                         video_vae, chunk_count, save_frames,
                          ffmpeg_location):
         out_dir = os.path.join(self.root, "frames")
         output_path = os.path.join(self.root, "output", "final.mp4")
-        writer = None
         state = {"written": 0}
         pbar = None
         try:
@@ -214,10 +213,9 @@ class LongFormReferenceRun(LongFormRun):
         except Exception:
             pass
 
-        if output_video:
-            writer = FFmpegVideoWriter(
-                output_path, width=self.canvas[0], height=self.canvas[1],
-                fps=self.geometry.fps, ffmpeg_location=ffmpeg_location).open()
+        writer = FFmpegVideoWriter(
+            output_path, width=self.canvas[0], height=self.canvas[1],
+            fps=self.geometry.fps, ffmpeg_location=ffmpeg_location).open()
 
         def emit(index, latent):
             take = self._emit_chunk(
@@ -226,6 +224,7 @@ class LongFormReferenceRun(LongFormRun):
                 written=state["written"], out_dir=out_dir, pbar=pbar)
             state["written"] += take
 
+        completed = False
         try:
             resume_from = self._first_invalid("samples", chunk_count)
             for index in range(resume_from):
@@ -236,14 +235,12 @@ class LongFormReferenceRun(LongFormRun):
             self.sample_chunks(
                 model=model, conditioning=conditioning, sampler=sampler,
                 sigmas=sigmas, chunk_count=chunk_count, on_sampled=emit)
+            self._check_frame_total(state["written"])
+            completed = True
         finally:
-            if writer is not None:
-                writer.close(commit=True)
+            close_writers(writer, commit=completed)
 
-        if state["written"] != self.target_frames:
-            raise RuntimeError("assembled %d frames, expected exactly %d" %
-                               (state["written"], self.target_frames))
-        return state["written"], output_path if output_video else ""
+        return state["written"], output_path
 
 
 def _pack_blocks(blocks):
@@ -279,7 +276,7 @@ def run(*, chunk_frames, overlap_frames, chunk_count, target_frames, model,
         clip, video_vae, audio_vae, prompt, sampler, sigmas, seed, carry,
         canvas, root, ref_images=None, ref_videos=None,
         ref_video_audios=None, ref_audios=None, ref_image_size="native",
-        cond_cache="auto", save_frames=False, output_video=True,
+        cond_cache="auto", save_frames=False,
         ffmpeg_location=None, runtime_config=None,
         diagnostic_dump_chunks=False):
     geometry = HarnessGeometry(
@@ -332,7 +329,7 @@ def run(*, chunk_frames, overlap_frames, chunk_count, target_frames, model,
         frames, output_path = run_obj.sample_and_write(
             model=model, conditioning=conditioning, sampler=sampler,
             sigmas=sigmas, video_vae=video_vae, chunk_count=chunk_count,
-            output_video=output_video, save_frames=save_frames,
+            save_frames=save_frames,
             ffmpeg_location=ffmpeg_location)
 
     manifest.update_state(complete=True, frames_written=frames,

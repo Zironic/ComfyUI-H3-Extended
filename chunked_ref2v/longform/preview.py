@@ -54,7 +54,7 @@ from ..model_patch import patch_target_conditions
 from . import diagnostics, runner
 from . import taeh3 as taeh3_backend
 from .frame_source import resolve_ffmpeg
-from .writer import FFmpegVideoWriter
+from .writer import FFmpegVideoWriter, close_writers
 
 LOG = "[H3 Extended] longform preview"
 EVENT = "h3_longform_preview"
@@ -539,10 +539,15 @@ class LongFormPreviewPublisher:
                 crf=28,
                 preset="ultrafast",
             ).open()
+            written = False
             try:
                 writer.write(frames_u8)
+                written = True
             finally:
-                writer.close(commit=True)
+                # The GIF fallback below returns its own path, so a committed
+                # half-written MP4 would just sit in temp_root under a name the
+                # browser may still be asked for.
+                close_writers(writer, commit=written)
         except Exception as exc:
             logging.warning(
                 "%s current preview MP4 failed, writing a GIF instead: %s", LOG, exc
@@ -722,10 +727,12 @@ class LongFormPreviewPublisher:
             crf=24,
             preset="ultrafast",
         ).open()
+        written = False
         try:
             writer.write(frames)
+            written = True
         finally:
-            writer.close(commit=True)
+            close_writers(writer, commit=written)
         self.completed_frames = int(completed_frames)
 
         # Sound is a bonus on a preview: a failed append keeps the silent
@@ -1117,6 +1124,7 @@ def _emit_chunk_with_preview(
     pixels = runner.decode_chunk(video_vae, latent).to("cpu", torch.float32)
     # Before any trimming: the assembled output never contains the overlap.
     diagnostics.emit_video(self, index, pixels)
+    runner.on_decoded_pixels(self, index, pixels, chunk_count)
     remaining = self.target_frames - written
     if remaining <= 0:
         return 0

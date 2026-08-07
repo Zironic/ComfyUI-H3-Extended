@@ -6,7 +6,7 @@ import os
 import torch
 
 import nodes
-from comfy_api.latest import ComfyExtension, io, ui
+from comfy_api.latest import ComfyExtension, InputImpl, io
 
 try:
     from .. import memory
@@ -113,7 +113,6 @@ class MiniMaxH3LongFormRef2V(io.ComfyNode):
                                          "Accepts either an executable or a "
                                          "directory containing one. The resolved "
                                          "path is echoed in the report output.")),
-                io.Boolean.Input("output_video", default=True),
                 io.Boolean.Input("preserve_source_audio", default=True),
                 io.Boolean.Input("save_frames", default=False,
                                  tooltip="Diagnostic PNG sequence; normally leave disabled."),
@@ -122,13 +121,14 @@ class MiniMaxH3LongFormRef2V(io.ComfyNode):
                                       input=io.Image.Input("ref_image"),
                                       prefix="ref_image_", min=0, max=9)),
             ],
-            is_output_node=True,
+            # Not an output node: the VIDEO goes to Save Video, which owns
+            # final naming, container, codec, metadata, and the output preview.
             outputs=[
+                io.Video.Output(display_name="video"),
                 io.Image.Output(display_name="preview"),
                 io.String.Output(display_name="run_directory"),
                 io.String.Output(display_name="video_path"),
                 io.String.Output(display_name="report"),
-                io.Video.Output(display_name="video"),
             ],
             hidden=[io.Hidden.unique_id],
         )
@@ -140,7 +140,7 @@ class MiniMaxH3LongFormRef2V(io.ComfyNode):
                 ref_image_size="native", cond_cache="auto", attention="auto",
                 activation="mlp_chunked_native", canvas_mode="native", megapixels=1.0,
                 width=0, height=0,
-                run_directory="", ffmpeg_location="", output_video=True,
+                run_directory="", ffmpeg_location="",
                 preserve_source_audio=True, save_frames=False,
                 ref_images=None) -> io.NodeOutput:
         video_path = video_path.strip().strip('"')
@@ -238,7 +238,6 @@ class MiniMaxH3LongFormRef2V(io.ComfyNode):
             ref_image_size=ref_image_size,
             cond_cache=cond_cache,
             save_frames=save_frames,
-            output_video=output_video,
             preserve_audio=preserve_source_audio,
             ffmpeg_location=ffmpeg_location.strip() or None,
             runtime_config={"attention": attention, "activation": activation},
@@ -258,7 +257,7 @@ class MiniMaxH3LongFormRef2V(io.ComfyNode):
             "output    %d exact frames (%.3f s at %d fps)" % (
                 summary["frames"], summary["frames"] / geometry.fps, geometry.fps
             ),
-            "video     %s" % (summary["output_path"] or "disabled"),
+            "video     %s" % summary["output_path"],
             "runtime   %s" % memory.describe(memory_status),
             "run dir   %s" % root,
             # Both of these accept a blank widget and resolve themselves, so echo
@@ -274,41 +273,24 @@ class MiniMaxH3LongFormRef2V(io.ComfyNode):
         if preview is None:
             preview = torch.zeros(1, 64, 64, 3)
 
-        # Show the stitched result itself, with its audio, rather than only a
-        # strip of sampled frames. The writer already put the file under the
-        # output directory, so the player can reference it in place - no second
-        # copy of a file that can run to gigabytes.
-        video, video_ui = _video_result(summary["output_path"])
-        return io.NodeOutput(preview, root, summary["output_path"], report, video,
-                             ui=video_ui)
+        return io.NodeOutput(
+            _video_from_path(summary["output_path"]),
+            preview, root, summary["output_path"], report,
+        )
 
 
-def _video_result(output_path):
-    """The written file as a VIDEO output plus an in-graph player.
+def _video_from_path(output_path):
+    """The streamed backing file as a normal Comfy VIDEO value.
 
-    `ui.PreviewVideo` addresses files relative to the output directory, so a run
-    written anywhere else - a custom `run_directory` on another drive - can still
-    be returned as VIDEO but cannot be played inline. That is a display
-    limitation only; the file on disk is unaffected either way.
+    The file is an implementation detail of the bounded-memory writer: it exists
+    so a run never has to hold the whole clip as an IMAGE batch. Downstream, it
+    is just a VIDEO for Save Video to name, transcode, and preview.
     """
     if not output_path or not os.path.isfile(output_path):
-        return None, None
-
-    import folder_paths
-    from comfy_api.latest import _input_impl
-
-    video = _input_impl.VideoFromFile(output_path)
-    try:
-        relative = os.path.relpath(output_path, folder_paths.get_output_directory())
-    except ValueError:  # different drive on Windows
-        return video, None
-    if relative.startswith(os.pardir):
-        logging.info("%s output is outside the output directory; no inline "
-                     "player for %s", LOG, output_path)
-        return video, None
-    subfolder, filename = os.path.split(relative)
-    return video, ui.PreviewVideo(
-        [ui.SavedResult(filename, subfolder, io.FolderType.output)])
+        raise RuntimeError(
+            "long-form generation completed without a backing video file"
+        )
+    return InputImpl.VideoFromFile(output_path)
 
 
 def _describe_ffmpeg(explicit):
@@ -337,15 +319,13 @@ def _preview_from_video(video_path, limit=48, ffmpeg_location=None):
         if total <= 0:
             return None
 
-        # One decode pass, downscaled, keeping every Nth frame. Seeking per
-        # frame would spawn `limit` ffmpeg processes, and reading everything
-        # would hold the whole run in memory - 4320 frames of a 3 minute job.
-        scale = width / max(1, meta.display_width)
-        canvas = (max(16, int(meta.display_width * scale) // 2 * 2),
-                  max(16, int(meta.display_height * scale) // 2 * 2))
+        # One decode pass at the video's own resolution, keeping every Nth
+        # frame. Seeking per frame would spawn `limit` ffmpeg processes, and
+        # reading everything would hold the whole run in memory - 4320 frames
+        # of a 3 minute job. `canvas=None` leaves the source size alone.
         step = max(1, total // limit)
         kept = []
-        with FFmpegFrameSource(video_path, canvas=canvas,
+        with FFmpegFrameSource(video_path,
                                ffmpeg_location=ffmpeg_location) as source:
             while len(kept) < limit:
                 batch = source.read_frames(step)
@@ -362,7 +342,8 @@ def _preview_from_video(video_path, limit=48, ffmpeg_location=None):
         return None
 
 
-def _preview(frames_dir, limit=48, width=384):
+def _preview(frames_dir, limit=48):
+    """Sample the diagnostic PNG sequence at the size it was written."""
     from PIL import Image
     import numpy as np
 
@@ -375,8 +356,6 @@ def _preview(frames_dir, limit=48, width=384):
     out = []
     for name in files[::step][:limit]:
         img = Image.open(os.path.join(frames_dir, name)).convert("RGB")
-        if img.width > width:
-            img = img.resize((width, max(1, int(img.height * width / img.width))))
         out.append(np.asarray(img, dtype=np.float32) / 255.0)
     return torch.from_numpy(np.stack(out))
 

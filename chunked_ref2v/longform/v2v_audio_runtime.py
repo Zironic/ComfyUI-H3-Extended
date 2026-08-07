@@ -39,7 +39,7 @@ from .audio_runtime import audio_latent_boundary, audio_overlap_slice
 from .audio_source import read_audio_window
 from .chunk_stream import iter_source_chunks
 from .dual_audio import mux_generated_and_source_audio
-from .writer import FFmpegVideoWriter
+from .writer import FFmpegVideoWriter, close_writers
 
 LOG = "[H3 Extended] longform Ref2V audio"
 _SOURCE_AUDIO_VERSION = 1
@@ -441,7 +441,6 @@ class _AVAssembler:
         video_vae,
         audio_vae,
         chunk_count,
-        output_video,
         save_frames,
         source_video,
         start_frame,
@@ -452,7 +451,6 @@ class _AVAssembler:
         self.video_vae = video_vae
         self.audio_vae = audio_vae
         self.chunk_count = int(chunk_count)
-        self.output_video = bool(output_video)
         self.save_frames = bool(save_frames)
         self.source_video = source_video
         self.start_frame = int(start_frame)
@@ -477,14 +475,13 @@ class _AVAssembler:
         self.pbar = runner._progress_bar(self.chunk_count)
 
     def open(self):
-        if self.output_video:
-            self.video_writer = FFmpegVideoWriter(
-                self.raw_video,
-                width=self.run.canvas[0],
-                height=self.run.canvas[1],
-                fps=self.run.geometry.fps,
-                ffmpeg_location=self.ffmpeg_location,
-            ).open()
+        self.video_writer = FFmpegVideoWriter(
+            self.raw_video,
+            width=self.run.canvas[0],
+            height=self.run.canvas[1],
+            fps=self.run.geometry.fps,
+            ffmpeg_location=self.ffmpeg_location,
+        ).open()
         return self
 
     def emit(self, index, video_latent, audio_latent):
@@ -502,62 +499,48 @@ class _AVAssembler:
         if take_frames <= 0:
             return
 
-        if self.output_video:
-            waveform = decode_audio_chunk(self.audio_vae, audio_latent)
-            sample_rate = audio_sample_rate(self.audio_vae)
-            channels = int(waveform.shape[1])
-            if self.sample_rate is None:
-                self.sample_rate = sample_rate
-                self.channels = channels
-                self.audio_writer = FFmpegAudioWriter(
-                    self.raw_audio,
-                    sample_rate=sample_rate,
-                    channels=channels,
-                    ffmpeg_location=self.ffmpeg_location,
-                ).open()
-            elif sample_rate != self.sample_rate or channels != self.channels:
-                raise RuntimeError(
-                    "audio VAE output format changed between chunks"
-                )
-
-            desired_total = audio_samples_for_frames(
-                self.frames + take_frames,
-                sample_rate,
-                fps=self.run.geometry.fps,
+        waveform = decode_audio_chunk(self.audio_vae, audio_latent)
+        sample_rate = audio_sample_rate(self.audio_vae)
+        channels = int(waveform.shape[1])
+        if self.sample_rate is None:
+            self.sample_rate = sample_rate
+            self.channels = channels
+            self.audio_writer = FFmpegAudioWriter(
+                self.raw_audio,
+                sample_rate=sample_rate,
+                channels=channels,
+                ffmpeg_location=self.ffmpeg_location,
+            ).open()
+        elif sample_rate != self.sample_rate or channels != self.channels:
+            raise RuntimeError(
+                "audio VAE output format changed between chunks"
             )
-            take_samples = desired_total - self.audio_samples
-            if int(waveform.shape[-1]) < take_samples:
-                raise RuntimeError(
-                    "audio chunk %d decoded %d samples, need %d for %d "
-                    "committed video frames"
-                    % (
-                        index,
-                        waveform.shape[-1],
-                        take_samples,
-                        take_frames,
-                    )
+
+        desired_total = audio_samples_for_frames(
+            self.frames + take_frames,
+            sample_rate,
+            fps=self.run.geometry.fps,
+        )
+        take_samples = desired_total - self.audio_samples
+        if int(waveform.shape[-1]) < take_samples:
+            raise RuntimeError(
+                "audio chunk %d decoded %d samples, need %d for %d "
+                "committed video frames"
+                % (
+                    index,
+                    waveform.shape[-1],
+                    take_samples,
+                    take_frames,
                 )
-            self.audio_writer.write(waveform[..., :take_samples])
-            self.audio_samples += take_samples
-            del waveform
+            )
+        self.audio_writer.write(waveform[..., :take_samples])
+        self.audio_samples += take_samples
+        del waveform
 
         self.frames += take_frames
 
     def close(self, *, commit):
-        error = None
-        try:
-            if self.video_writer is not None:
-                self.video_writer.close(commit=commit)
-        except Exception as exc:
-            error = exc
-        try:
-            if self.audio_writer is not None:
-                self.audio_writer.close(commit=commit)
-        except Exception as exc:
-            if error is None:
-                error = exc
-        if error is not None:
-            raise error
+        close_writers(self.video_writer, self.audio_writer, commit=commit)
 
     def finalize(self):
         if self.frames != self.run.target_frames:
@@ -565,8 +548,6 @@ class _AVAssembler:
                 "assembled %d frames, expected exactly %d"
                 % (self.frames, self.run.target_frames)
             )
-        if not self.output_video:
-            return self.frames, ""
         expected_audio = audio_samples_for_frames(
             self.run.target_frames,
             self.sample_rate,
@@ -653,21 +634,19 @@ def _pass_cd_av(
     video_vae,
     chunk_count,
     save_frames=True,
-    output_video=True,
     source_video=None,
     start_frame=0,
     preserve_audio=True,
     ffmpeg_location=None,
 ):
     audio_vae = _ACTIVE_AUDIO_VAE.get()
-    if output_video and audio_vae is None:
+    if audio_vae is None:
         raise RuntimeError("long-form Ref2V audio VAE is not active")
     assembler = _AVAssembler(
         self,
         video_vae=video_vae,
         audio_vae=audio_vae,
         chunk_count=chunk_count,
-        output_video=output_video,
         save_frames=save_frames,
         source_video=source_video,
         start_frame=start_frame,
@@ -723,21 +702,19 @@ def _pass_d_av(
     video_vae,
     chunk_count,
     save_frames=True,
-    output_video=True,
     source_video=None,
     start_frame=0,
     preserve_audio=True,
     ffmpeg_location=None,
 ):
     audio_vae = _ACTIVE_AUDIO_VAE.get()
-    if output_video and audio_vae is None:
+    if audio_vae is None:
         raise RuntimeError("long-form Ref2V audio VAE is not active")
     assembler = _AVAssembler(
         self,
         video_vae=video_vae,
         audio_vae=audio_vae,
         chunk_count=chunk_count,
-        output_video=output_video,
         save_frames=save_frames,
         source_video=source_video,
         start_frame=start_frame,

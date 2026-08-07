@@ -17,7 +17,7 @@ from .nodes import (
     _describe_ffmpeg,
     _preview,
     _preview_from_video,
-    _video_result,
+    _video_from_path,
 )
 from .preview import (
     DECODER_AUTO,
@@ -181,7 +181,6 @@ class MiniMaxH3LongFormReferenceVideoPreview(
         activation="mlp_chunked_native",
         run_directory="",
         ffmpeg_location="",
-        output_video=True,
         save_frames=False,
         diagnostic_dump_chunks=False,
         chunk_align_audio_references=False,
@@ -242,9 +241,9 @@ class MiniMaxH3LongFormReferenceVideoPreview(
                 width=int(live_preview_width),
                 decoder=str(current_preview_decoder or DECODER_AUTO),
             ),
-            # This runtime decodes a waveform per chunk, but only when it is
-            # writing a video; without one there is nothing to wait for.
-            audio_expected=bool(output_video),
+            # This runtime decodes a waveform per chunk, and the node always
+            # writes one, so every completed segment carries audio.
+            audio_expected=True,
         )
         token = activate(publisher)
         publisher._announce("reset")
@@ -288,14 +287,13 @@ class MiniMaxH3LongFormReferenceVideoPreview(
                 ref_image_size=ref_image_size,
                 cond_cache=cond_cache,
                 save_frames=save_frames,
-                output_video=output_video,
                 diagnostic_dump_chunks=diagnostic_dump_chunks,
                 ffmpeg_location=ffmpeg_location.strip() or None,
                 runtime_config={
                     "attention": attention,
                     "activation": activation,
                     "audio_carry_frames": overlap_frames,
-                    "audio_output": bool(output_video),
+                    "audio_output": True,
                     "audio_reference_mode": (
                         "chunk_aligned"
                         if chunk_align_audio_references
@@ -337,25 +335,17 @@ class MiniMaxH3LongFormReferenceVideoPreview(
                 if chunk_align_audio_references
                 else "complete references reused per chunk"
             ),
-            "audio     %s"
+            "audio     %d samples at %d Hz; O=%d -> latent [%d:%d]"
             % (
-                (
-                    "%d samples at %d Hz; O=%d -> latent [%d:%d]"
-                    % (
-                        summary["audio_samples"],
-                        summary["audio_sample_rate"],
-                        overlap_frames,
-                        audio_start,
-                        audio_start + audio_count,
-                    )
-                )
-                if output_video
-                else "disabled with output_video"
+                summary["audio_samples"],
+                summary["audio_sample_rate"],
+                overlap_frames,
+                audio_start,
+                audio_start + audio_count,
             ),
             "references %d"
             % len(summary.get("reference_notes", [])),
-            "video     %s"
-            % (summary["output_path"] or "disabled"),
+            "video     %s" % summary["output_path"],
             "runtime   %s" % memory.describe(memory_status),
             "run dir   %s" % root,
             "ffmpeg    %s"
@@ -382,14 +372,12 @@ class MiniMaxH3LongFormReferenceVideoPreview(
         if preview is None:
             preview = torch.zeros(1, 64, 64, 3)
 
-        video, video_ui = _video_result(summary["output_path"])
         return io.NodeOutput(
+            _video_from_path(summary["output_path"]),
             preview,
             root,
             summary["output_path"],
             report,
-            video,
-            ui=video_ui,
         )
 
 

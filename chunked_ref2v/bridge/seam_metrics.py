@@ -105,6 +105,30 @@ def audio_latent_discontinuity(a_latent, b_latent):
     return float(torch.linalg.vector_norm(a - b)) * 2.0 / scale
 
 
+def replay_metrics(generated, past, future):
+    """How much of the output is just the references played back.
+
+    The first observed behaviour was not a bridge at all: the first half
+    reproduced the future reference and the second half the past one - the two
+    inputs replayed in reverse slot order. These four numbers separate that from
+    a genuine bridge, which should match *neither* reference closely.
+
+        reverse replay : first_half_vs_future and second_half_vs_past both low
+        forward replay : first_half_vs_past and second_half_vs_future both low
+        real bridge    : all four high
+    """
+    n = int(generated.shape[0])
+    k = min(n // 2, int(past.shape[0]), int(future.shape[0]))
+    if k < 2:
+        return {}
+    return {
+        "replay_first_half_vs_future": mae(generated[:k], future[:k]),
+        "replay_second_half_vs_past": mae(generated[n - k:], past[-k:]),
+        "replay_first_half_vs_past": mae(generated[:k], past[-k:]),
+        "replay_second_half_vs_future": mae(generated[n - k:], future[:k]),
+    }
+
+
 def collect(*, generated, left_context, right_natural, right_counterfactual=None,
             ground_truth=None, generated_audio=None, right_natural_audio=None,
             window=8, max_shift=24):
@@ -136,6 +160,8 @@ def collect(*, generated, left_context, right_natural, right_counterfactual=None
         out["counterfactual_dx"] = mean_horizontal_velocity(
             right_counterfactual[:window], max_shift)
         out["dx_error_counterfactual"] = abs(ending_dx - out["counterfactual_dx"])
+
+    out.update(replay_metrics(generated, left_context, right_natural))
 
     out["right_seam_audio_natural"] = audio_latent_discontinuity(
         generated_audio, right_natural_audio)

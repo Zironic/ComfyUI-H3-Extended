@@ -22,6 +22,26 @@ from dataclasses import dataclass
 
 FRAME_PER_TOKEN = (1, 4, 4, 4, 4)
 FPS = 24
+VAE_GROUP_POSITIONS = len(FRAME_PER_TOKEN)
+VAE_GROUP_FRAMES = sum(FRAME_PER_TOKEN)
+
+
+def splitmix64(seed):
+    z = (seed + 0x9E3779B97F4A7C15) & 0xFFFFFFFFFFFFFFFF
+    z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & 0xFFFFFFFFFFFFFFFF
+    z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & 0xFFFFFFFFFFFFFFFF
+    return (z ^ (z >> 31)) & 0xFFFFFFFFFFFFFFFF
+
+
+def chunk_seed(seed, index):
+    """Per-chunk noise seed derived from the run seed.
+
+    Lives here rather than in `harness` so the prompt planner and the resume
+    scan can derive the same value without importing torch. Both sides deriving
+    it independently is exactly how a resume ends up rejecting chunks it should
+    have kept, so there is one definition.
+    """
+    return splitmix64(int(seed) + 1000 + int(index))
 AUDIO_LATENT_FPS = 40
 
 

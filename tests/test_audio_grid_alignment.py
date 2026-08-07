@@ -123,14 +123,14 @@ class WidgetOrderTests(unittest.TestCase):
         return inputs
 
     def test_align_toggle_stays_after_every_previously_saved_widget(self):
-        base = ["output_video", "save_frames", "align_audio_chunks", "ref_images"]
+        base = ["ffmpeg_location", "save_frames", "align_audio_chunks", "ref_images"]
         preview = ["chunk_align_audio_references", "live_preview_width"]
         merged = self.build(base, preview)
 
         self.assertEqual(
             merged,
             [
-                "output_video",
+                "ffmpeg_location",
                 "save_frames",
                 "chunk_align_audio_references",
                 "live_preview_width",
@@ -142,7 +142,7 @@ class WidgetOrderTests(unittest.TestCase):
         self.assertEqual(widgets[-1], "align_audio_chunks")
 
     def test_older_schema_without_the_toggle_still_anchors_on_ref_images(self):
-        base = ["output_video", "save_frames", "ref_images"]
+        base = ["ffmpeg_location", "save_frames", "ref_images"]
         merged = self.build(base, ["live_preview_width"])
         self.assertEqual(merged[-1], "ref_images")
         self.assertEqual(merged[-2], "live_preview_width")

@@ -17,17 +17,14 @@ import contextvars
 import gc
 import hashlib
 import logging
-import os
 from dataclasses import dataclass, is_dataclass, replace
 
-import torch
 from comfy_api.latest import io
 
 from .. import harness, ref_builder
 from . import (
     chunk_aligned_audio_refs,
     chunk_prompt_timeline,
-    preview,
     reference_preview_nodes,
     reference_runner,
     runner,
@@ -41,7 +38,6 @@ _ACTIVE = contextvars.ContextVar(
 _INSTALLED = False
 _ORIGINAL_PREPARE = None
 _ORIGINAL_CONDITIONING_FOR_CHUNK = None
-_ORIGINAL_EMIT_CHUNK = None
 _ORIGINAL_NODE_SCHEMA = None
 _ORIGINAL_NODE_EXECUTE = None
 
@@ -252,101 +248,32 @@ def _conditioning_for_chunk(conditioning, index):
     return conditioning.for_index(index)
 
 
-def _emit_chunk_with_opening_picture(
-    self,
-    index,
-    latent,
-    *,
-    video_vae,
-    chunk_count,
-    writer,
-    save_frames,
-    written,
-    out_dir,
-    pbar=None,
-):
-    """Preview-aware emit path plus one CPU frame retained for the next chunk."""
+def _retain_opening_picture(run, index, pixels, chunk_count):
+    """Keep one CPU frame from this chunk to open the next one.
 
-    geometry = self.geometry
-    pixels = runner.decode_chunk(video_vae, latent).to("cpu", torch.float32)
+    Registered as a decoded-pixels hook so the canonical ``_emit_chunk`` keeps
+    owning the diagnostics dump and the audio-aware completed-preview staging.
+    """
 
-    if _ACTIVE.get() and index < chunk_count - 1:
-        source_index = int(geometry.stride_frames)
-        if source_index >= int(pixels.shape[0]):
-            raise RuntimeError(
-                "chunk %d decoded %d frames; cannot extract next chunk frame zero at %d"
-                % (index, int(pixels.shape[0]), source_index)
-            )
-        self._h3_next_opening_picture = (
-            pixels[source_index:source_index + 1].detach().clone()
+    if not _ACTIVE.get() or index >= chunk_count - 1:
+        return
+
+    source_index = int(run.geometry.stride_frames)
+    if source_index >= int(pixels.shape[0]):
+        raise RuntimeError(
+            "chunk %d decoded %d frames; cannot extract next chunk frame zero at %d"
+            % (index, int(pixels.shape[0]), source_index)
         )
-        logging.info(
-            "%s chunk %d retained decoded frame %d for chunk %d frame zero",
-            LOG,
-            index,
-            source_index,
-            index + 1,
-        )
-
-    remaining = self.target_frames - written
-    if remaining <= 0:
-        return 0
-    take = min(
-        int(pixels.shape[0])
-        if index == chunk_count - 1
-        else geometry.stride_frames,
-        remaining,
+    run._h3_next_opening_picture = (
+        pixels[source_index:source_index + 1].detach().clone()
     )
-    frames_u8 = (pixels[:take].clamp(0, 1) * 255.0 + 0.5).to(torch.uint8)
-    if writer is not None:
-        writer.write(frames_u8)
-    if save_frames:
-        from PIL import Image
-
-        for i in range(take):
-            Image.fromarray(frames_u8[i].numpy()).save(
-                os.path.join(out_dir, "frame_%06d.png" % (written + i))
-            )
-
-    publisher = preview.current_publisher()
-    if publisher is not None:
-        try:
-            publisher.publish_completed_chunk(
-                chunk_index=index,
-                frames_u8=frames_u8,
-                completed_frames=written + take,
-            )
-        except Exception as exc:
-            logging.warning(
-                "%s completed preview failed for chunk %d: %s",
-                LOG,
-                index,
-                exc,
-            )
-        if pbar is not None:
-            pbar.update_absolute(index + 1, chunk_count)
-    elif pbar is not None:
-        runner._send_preview(
-            pbar,
-            frames_u8[-1],
-            index + 1,
-            chunk_count,
-        )
-
-    self.event(
-        pass_="D",
-        chunk=index,
-        frames=take,
-        total=written + take,
+    logging.info(
+        "%s chunk %d retained decoded frame %d for chunk %d frame zero",
+        LOG,
+        index,
+        source_index,
+        index + 1,
     )
-    if self.manifest:
-        self.manifest.update_state(
-            pass_d_chunks=index + 1,
-            frames_written=written + take,
-        )
-    del pixels, frames_u8
-    gc.collect()
-    return take
 
 
 def _replace_inputs(schema, inputs):
@@ -429,7 +356,7 @@ def install():
     """Install after chunk-prompt, audio-reference, and preview patches."""
 
     global _INSTALLED, _ORIGINAL_PREPARE
-    global _ORIGINAL_CONDITIONING_FOR_CHUNK, _ORIGINAL_EMIT_CHUNK
+    global _ORIGINAL_CONDITIONING_FOR_CHUNK
     if _INSTALLED:
         return
 
@@ -441,8 +368,7 @@ def install():
     )
     chunk_prompt_timeline.conditioning_for_chunk = _conditioning_for_chunk
 
-    _ORIGINAL_EMIT_CHUNK = runner.LongFormRun._emit_chunk
-    runner.LongFormRun._emit_chunk = _emit_chunk_with_opening_picture
+    runner.register_decoded_pixels_hook(_retain_opening_picture)
 
     _patch_node()
     _INSTALLED = True

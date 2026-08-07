@@ -41,11 +41,9 @@ from .strategies import StrategyUnavailable
 LOG_PREFIX = "[H3 Extended] harness"
 
 
-def splitmix64(seed):
-    z = (seed + 0x9E3779B97F4A7C15) & 0xFFFFFFFFFFFFFFFF
-    z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & 0xFFFFFFFFFFFFFFFF
-    z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & 0xFFFFFFFFFFFFFFFF
-    return (z ^ (z >> 31)) & 0xFFFFFFFFFFFFFFFF
+# Re-exported: the definition moved to `geometry` so the prompt planner and the
+# resume scan can derive chunk seeds without importing torch.
+from .geometry import splitmix64  # noqa: E402,F401  (kept importable from here)
 
 
 class SeedSet:

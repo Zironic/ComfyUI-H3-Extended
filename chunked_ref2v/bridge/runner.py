@@ -31,14 +31,15 @@ def _encode_context(video_vae, audio_vae, frames, audio, canvas, cond_cache):
     """Encode one whole context segment. No snapping: `frames` is already legal."""
     width, height = canvas
     pixels = ref_builder.resize(frames, width, height)
-    latent = harness_encode(video_vae, pixels, cond_cache, "bridge context video")
+    latent = _encode_pixels(video_vae, pixels, cond_cache, "bridge context video")
     audio_latent = None
     if audio is not None and audio_vae is not None:
         audio_latent, _ = ref_builder.encode_ref_audio(audio_vae, audio, cond_cache)
     return pixels, latent, audio_latent
 
 
-def harness_encode(vae, pixels, cond_cache, label):
+def _encode_pixels(vae, pixels, cond_cache, label):
+    """Whole-segment encode. The caller guarantees a legal 17k+5 length."""
     try:
         from ... import latent_cache
     except ImportError:
@@ -91,7 +92,12 @@ class BridgeContext:
         self.right_natural = None
         self.right_counterfactual = None
         self.ground_truth = None
+        self.source_audio = None
         self.notes = []
+
+    def playback_audio(self, start_frame, frames):
+        """Source waveform for a frame interval, for listening to a seam."""
+        return slice_audio_span(self.source_audio, start_frame, frames, self.plan.fps)
 
     def _slice_side(self, pixels, latent, audio_latent, *, side):
         plan = self.plan
@@ -121,6 +127,7 @@ class BridgeContext:
                 need_counterfactual=True):
         plan = self.plan
         c = plan.chunk_frames
+        self.source_audio = source_audio
 
         c1 = source_frames[plan.left_start:plan.bridge_start]
         c3 = source_frames[plan.right_start:plan.right_start + c]
@@ -177,25 +184,34 @@ class BridgeContext:
 
 
 def _arm_references(context, arm):
-    items, blocks = [], []
-    left_items, left_block = _av_reference(
-        context.left["pixels"], context.left["latent"],
-        context.left["audio_latent"], context.canvas)
-    items.extend(left_items)
-    blocks.append(left_block)
+    """Qwen items and DiT blocks for one arm, in slot order.
 
+    Ordinals are assigned by position in this list - the first video item
+    becomes <Video 1> - so the order here *is* the slot assignment. `ref_order`
+    exchanges the two slots; the arm's prompt policy inverts the role statements
+    to match, and `_register` refuses any arm where those two disagree.
+    """
     right = None
     if arm.right_ref == "natural":
         right = context.right_natural
     elif arm.right_ref == "counterfactual":
         right = context.right_counterfactual
+
+    sides = [("past", context.left)]
     if right is not None:
-        right_items, right_block = _av_reference(
-            right["pixels"], right["latent"], right["audio_latent"],
-            context.canvas)
-        items.extend(right_items)
-        blocks.append(right_block)
-    return items, blocks
+        sides.append(("future", right))
+        if arm.ref_order == "future_first":
+            sides.reverse()
+
+    items, blocks, order = [], [], []
+    for role, side in sides:
+        side_items, side_block = _av_reference(
+            side["pixels"], side["latent"], side["audio_latent"], context.canvas)
+        items.extend(side_items)
+        blocks.append(side_block)
+        order.append("<Video %d> = %s" % (len(blocks), role))
+    logging.info("%s %s slots: %s", LOG_PREFIX, arm.arm_id, ", ".join(order))
+    return items, blocks, order
 
 
 def _encode_conditioning(clip, prompt, ref_items, cond_cache):
@@ -223,7 +239,8 @@ def run_arms(context, arm_ids, *, model, clip, video_vae, sampler, sigmas, seed,
         results[arm_id] = record
         started = time.time()
         try:
-            items, blocks = _arm_references(context, arm)
+            items, blocks, slot_order = _arm_references(context, arm)
+            record["slot_order"] = slot_order
             conditioning = harness.attach_refs(
                 _encode_conditioning(clip, prompts[arm_id], items, cond_cache),
                 blocks)
@@ -249,6 +266,8 @@ def run_arms(context, arm_ids, *, model, clip, video_vae, sampler, sigmas, seed,
             record["reference_blocks"] = len(blocks)
             record["prompt_chars"] = len(prompts[arm_id])
             record["pixels"] = pixels
+            # kept so the node can decode a listenable seam without reloading
+            record["audio_latent"] = audio_latent.to("cpu", torch.float32)
             record["status"] = "completed"
             if save_to:
                 record["artifacts"] = _persist(save_to, arm_id, pixels,
@@ -305,7 +324,8 @@ def write_manifest(directory, *, plan, arm_ids, seed, base_prompt, results, note
         "base_prompt": base_prompt,
         "notes": notes,
         "arms": {
-            arm_id: {k: v for k, v in record.items() if k != "pixels"}
+            arm_id: {k: v for k, v in record.items()
+                     if k not in ("pixels", "audio_latent")}
             for arm_id, record in results.items()
             if arm_id != "_decisive" and isinstance(record, dict)
         },

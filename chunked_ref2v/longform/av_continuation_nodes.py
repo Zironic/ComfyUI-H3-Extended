@@ -61,7 +61,7 @@ from .preview import (
 from .reference_nodes import _validate_canvas
 from .reference_runner import _ordered_values, _paired_audio
 from .runner import decode_chunk
-from .writer import FFmpegVideoWriter
+from .writer import FFmpegVideoWriter, close_writers
 
 LOG = "[H3 Extended] longform AV continuation"
 REFERENCE_SECONDS_MIN = 2
@@ -688,6 +688,10 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
         previous_video = previous_audio = previous_pixels = None
         reference_notes = []
 
+        # Raw artifacts are committed only once every chunk has been written
+        # and both totals check out; a run that dies mid-chunk leaves partials
+        # that close_writers removes instead of a truncated final file.
+        completed = False
         try:
             with torch.inference_mode():
                 static_items, static_blocks, reference_notes = _encode_static_references(
@@ -894,6 +898,17 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
                     "assembled %d frames, expected exactly %d"
                     % (written_frames, target_frames)
                 )
+            expected_audio = audio_samples_for_frames(
+                target_frames,
+                sample_rate,
+                fps=geometry.fps,
+            )
+            if written_audio != expected_audio:
+                raise RuntimeError(
+                    "assembled %d audio samples, expected exactly %d"
+                    % (written_audio, expected_audio)
+                )
+            completed = True
         finally:
             # A run that ended between staging a chunk and decoding its audio
             # would otherwise strand those frames; publish them silently rather
@@ -903,20 +918,7 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
             except Exception as exc:
                 logging.warning("%s final preview flush failed: %s", LOG, exc)
             deactivate(preview_token)
-            video_writer.close(commit=True)
-            if audio_writer is not None:
-                audio_writer.close(commit=True)
-
-        expected_audio = audio_samples_for_frames(
-            target_frames,
-            sample_rate,
-            fps=geometry.fps,
-        )
-        if written_audio != expected_audio:
-            raise RuntimeError(
-                "assembled %d audio samples, expected exactly %d"
-                % (written_audio, expected_audio)
-            )
+            close_writers(video_writer, audio_writer, commit=completed)
 
         output_path = mux_generated_audio(
             raw_video,

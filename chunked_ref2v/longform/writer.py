@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 
 from .frame_source import resolve_ffmpeg
+
+LOG = "[H3 Extended] longform writer"
 
 
 class VideoWriterError(RuntimeError):
@@ -15,6 +18,44 @@ class VideoWriterError(RuntimeError):
 def _partial_path(path, marker="partial"):
     root, ext = os.path.splitext(path)
     return "%s.%s%s" % (root, marker, ext or ".mkv")
+
+
+def close_writers(*writers, commit):
+    """Close every writer, whatever any one of them does.
+
+    Two sequential ``close()`` calls strand the later writer's ffmpeg process
+    whenever an earlier one raises, so each close is isolated and every writer
+    gets shut down before anything is re-raised.
+
+    ``commit`` is the outcome of the work, not a constant: True promotes each
+    partial file to its final name, False deletes it. Committing from an
+    unconditional ``finally`` publishes a truncated video under the name that
+    means "finished".
+
+    That makes ``commit`` the signal for what a close failure means. Committing
+    means the run believed it succeeded, so an encoder that could not finish is
+    the news and the first such error is raised. ``commit=False`` only ever
+    happens while a real failure is already unwinding - there, a shutdown error
+    is a symptom, and raising it from ``finally`` would replace the exception
+    that explains the run, so it is logged instead.
+    """
+    error = None
+    for writer in writers:
+        if writer is None:
+            continue
+        try:
+            writer.close(commit=commit)
+        except Exception as exc:
+            if commit:
+                if error is None:
+                    error = exc
+            else:
+                logging.warning(
+                    "%s discarding partial output: %s: %s",
+                    LOG, type(exc).__name__, exc,
+                )
+    if error is not None:
+        raise error
 
 
 class FFmpegVideoWriter:

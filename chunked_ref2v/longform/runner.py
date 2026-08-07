@@ -30,13 +30,38 @@ from .manifest import (
     object_fingerprint,
     tensor_digest,
 )
-from .writer import FFmpegVideoWriter, mux_source_audio
+from .writer import FFmpegVideoWriter, close_writers, mux_source_audio
 
 LOG = "[H3 Extended] longform"
 CARRY_NONE = "none"
 CARRY_FRAME = "direct_latent_frame"
 CARRY_OVERLAP = "direct_latent_overlap"
 CARRY_MODES = (CARRY_OVERLAP, CARRY_FRAME, CARRY_NONE)
+
+_DECODED_PIXELS_HOOKS = []
+
+
+def register_decoded_pixels_hook(hook):
+    """Observe every chunk's untrimmed decode from inside ``_emit_chunk``.
+
+    Features that only need to look at the decoded pixels must register here
+    rather than replacing ``_emit_chunk``.  A replacement has to re-implement
+    the diagnostics dump and the audio-aware completed-preview staging, and a
+    copy that silently falls behind those contracts drops chunk audio and chunk
+    frame dumps without any error.
+
+    Called as ``hook(run, index, pixels, chunk_count)`` after the diagnostics
+    dump and before any overlap trimming, so ``pixels`` still holds the whole
+    chunk.  Exceptions propagate: a hook that cannot do its job means the run
+    is producing wrong output.
+    """
+    _DECODED_PIXELS_HOOKS.append(hook)
+    return hook
+
+
+def on_decoded_pixels(run, index, pixels, chunk_count):
+    for hook in _DECODED_PIXELS_HOOKS:
+        hook(run, index, pixels, chunk_count)
 
 
 def _save(path, tensors):
@@ -382,6 +407,7 @@ class LongFormRun:
         pixels = decode_chunk(video_vae, latent).to("cpu", torch.float32)
         # Before any trimming: the assembled output never contains the overlap.
         diagnostics.emit_video(self, index, pixels)
+        on_decoded_pixels(self, index, pixels, chunk_count)
         remaining = self.target_frames - written
         if remaining <= 0:
             return 0
@@ -409,7 +435,7 @@ class LongFormRun:
         return take
 
     def pass_d(self, *, video_vae, chunk_count, save_frames=True,
-               output_video=True, source_video=None, start_frame=0,
+               source_video=None, start_frame=0,
                preserve_audio=True, ffmpeg_location=None):
         geometry = self.geometry
         out_dir = os.path.join(self.root, "frames")
@@ -419,15 +445,14 @@ class LongFormRun:
         started = time.time()
         pbar = _progress_bar(chunk_count)
 
-        writer = None
-        if output_video:
-            writer = FFmpegVideoWriter(
-                raw_video,
-                width=self.canvas[0],
-                height=self.canvas[1],
-                fps=geometry.fps,
-                ffmpeg_location=ffmpeg_location,
-            ).open()
+        writer = FFmpegVideoWriter(
+            raw_video,
+            width=self.canvas[0],
+            height=self.canvas[1],
+            fps=geometry.fps,
+            ffmpeg_location=ffmpeg_location,
+        ).open()
+        completed = False
         try:
             for index in range(chunk_count):
                 stored = _load(self.path("samples", index))
@@ -442,14 +467,15 @@ class LongFormRun:
                     break
                 written += take
                 del stored
+            self._check_frame_total(written)
+            completed = True
         finally:
-            if writer is not None:
-                writer.close(commit=True)
+            # Only a validated run may promote raw_video to its final name; a
+            # short or failed pass leaves nothing that looks finished.
+            close_writers(writer, commit=completed)
 
-        if written != self.target_frames:
-            raise RuntimeError("assembled %d frames, expected exactly %d" % (written, self.target_frames))
-        output_path = raw_video if output_video else ""
-        if output_video and preserve_audio and source_video:
+        output_path = raw_video
+        if preserve_audio and source_video:
             try:
                 output_path = mux_source_audio(
                     raw_video,
@@ -466,14 +492,23 @@ class LongFormRun:
         logging.info("%s pass D complete: %d frames in %.1f s", LOG, written, time.time() - started)
         return written, output_path
 
-    def _finalize_video(self, *, written, output_video, preserve_audio,
-                        source_video, start_frame, ffmpeg_location, raw_video,
-                        final_video):
+    def _check_frame_total(self, written):
+        """Assert the assembled length, before anything is committed.
+
+        Callers run this inside the writer's ``try`` rather than after it: a
+        run that assembled the wrong number of frames must not leave a video
+        behind under the name that means "complete".
+        """
         if written != self.target_frames:
             raise RuntimeError("assembled %d frames, expected exactly %d"
                                % (written, self.target_frames))
-        output_path = raw_video if output_video else ""
-        if output_video and preserve_audio and source_video:
+
+    def _finalize_video(self, *, written, preserve_audio,
+                        source_video, start_frame, ffmpeg_location, raw_video,
+                        final_video):
+        self._check_frame_total(written)
+        output_path = raw_video
+        if preserve_audio and source_video:
             try:
                 output_path = mux_source_audio(
                     raw_video, source_video, final_video,
@@ -486,7 +521,7 @@ class LongFormRun:
         return output_path
 
     def pass_cd(self, *, model, sampler, sigmas, video_vae, chunk_count,
-                save_frames=True, output_video=True, source_video=None,
+                save_frames=True, source_video=None,
                 start_frame=0, preserve_audio=True, ffmpeg_location=None):
         """Sample and decode chunk by chunk, writing the video as it goes.
 
@@ -504,11 +539,9 @@ class LongFormRun:
         pbar = _progress_bar(chunk_count)
         state = {"written": 0}
 
-        writer = None
-        if output_video:
-            writer = FFmpegVideoWriter(
-                raw_video, width=self.canvas[0], height=self.canvas[1],
-                fps=self.geometry.fps, ffmpeg_location=ffmpeg_location).open()
+        writer = FFmpegVideoWriter(
+            raw_video, width=self.canvas[0], height=self.canvas[1],
+            fps=self.geometry.fps, ffmpeg_location=ffmpeg_location).open()
 
         def emit(index, latent):
             take = self._emit_chunk(
@@ -517,6 +550,7 @@ class LongFormRun:
                 written=state["written"], out_dir=out_dir, pbar=pbar)
             state["written"] += take
 
+        completed = False
         try:
             # Chunks sampled by an earlier interrupted run are skipped by
             # pass_c, so their frames would never reach the writer. Decode them
@@ -534,13 +568,14 @@ class LongFormRun:
 
             self.pass_c(model=model, sampler=sampler, sigmas=sigmas,
                         chunk_count=chunk_count, on_sampled=emit)
+            self._check_frame_total(state["written"])
+            completed = True
         finally:
-            if writer is not None:
-                writer.close(commit=True)
+            close_writers(writer, commit=completed)
 
         written = state["written"]
         output_path = self._finalize_video(
-            written=written, output_video=output_video,
+            written=written,
             preserve_audio=preserve_audio, source_video=source_video,
             start_frame=start_frame, ffmpeg_location=ffmpeg_location,
             raw_video=raw_video, final_video=final_video)
@@ -553,7 +588,7 @@ def run(*, video_path, start_frame, chunk_frames, overlap_frames, chunk_count,
         target_frames, model, clip, video_vae, audio_vae, prompt, sampler,
         sigmas, seed, carry, canvas, root, ref_images=None,
         ref_image_size="match", cond_cache="auto", save_frames=True, fps=24,
-        output_video=True, preserve_audio=True, ffmpeg_location=None,
+        preserve_audio=True, ffmpeg_location=None,
         runtime_config=None, interleave_decode=True):
     geometry = HarnessGeometry(
         chunk_frames=chunk_frames,
@@ -624,7 +659,7 @@ def run(*, video_path, start_frame, chunk_frames, overlap_frames, chunk_count,
             frames, output_path = run_obj.pass_cd(
                 model=model, sampler=sampler, sigmas=sigmas,
                 video_vae=video_vae, chunk_count=chunk_count,
-                save_frames=save_frames, output_video=output_video,
+                save_frames=save_frames,
                 source_video=video_path, start_frame=start_frame,
                 preserve_audio=preserve_audio, ffmpeg_location=ffmpeg_location,
             )
@@ -635,7 +670,6 @@ def run(*, video_path, start_frame, chunk_frames, overlap_frames, chunk_count,
                 video_vae=video_vae,
                 chunk_count=chunk_count,
                 save_frames=save_frames,
-                output_video=output_video,
                 source_video=video_path,
                 start_frame=start_frame,
                 preserve_audio=preserve_audio,

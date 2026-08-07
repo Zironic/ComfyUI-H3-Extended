@@ -37,7 +37,7 @@ from .audio_output import (
     mux_generated_audio,
 )
 from .runner import CARRY_FRAME, CARRY_NONE
-from .writer import FFmpegVideoWriter
+from .writer import FFmpegVideoWriter, close_writers
 
 LOG = "[H3 Extended] longform reference audio"
 _ACTIVE_AUDIO_VAE = contextvars.ContextVar(
@@ -268,15 +268,12 @@ def _sample_and_write_av(
     sigmas,
     video_vae,
     chunk_count,
-    output_video,
     save_frames,
     ffmpeg_location,
 ):
     audio_vae = _ACTIVE_AUDIO_VAE.get()
-    # Diagnostics need the generated audio whether or not a video was asked for.
     dump_diagnostics = diagnostics.enabled(self)
-    need_audio = output_video or dump_diagnostics
-    if need_audio and audio_vae is None:
+    if audio_vae is None:
         raise RuntimeError("LongFormReferenceVideo audio VAE is not active")
 
     out_dir = os.path.join(self.root, "frames")
@@ -286,7 +283,7 @@ def _sample_and_write_av(
     )
     final_video = os.path.join(self.root, "output", "final.mp4")
 
-    video_writer = audio_writer = None
+    audio_writer = None
     state = {
         "frames": 0,
         "audio_samples": 0,
@@ -301,14 +298,13 @@ def _sample_and_write_av(
     except Exception:
         pass
 
-    if output_video:
-        video_writer = FFmpegVideoWriter(
-            raw_video,
-            width=self.canvas[0],
-            height=self.canvas[1],
-            fps=self.geometry.fps,
-            ffmpeg_location=ffmpeg_location,
-        ).open()
+    video_writer = FFmpegVideoWriter(
+        raw_video,
+        width=self.canvas[0],
+        height=self.canvas[1],
+        fps=self.geometry.fps,
+        ffmpeg_location=ffmpeg_location,
+    ).open()
 
     def _publish_preview_chunk(waveform, sample_rate):
         """Release the chunk the live preview staged inside _emit_chunk.
@@ -346,10 +342,8 @@ def _sample_and_write_av(
         )
 
         # One decode serves both the diagnostic dump and the assembly below.
-        waveform = sample_rate = None
-        if need_audio:
-            waveform = decode_audio_chunk(audio_vae, audio_latent)
-            sample_rate = audio_sample_rate(audio_vae)
+        waveform = decode_audio_chunk(audio_vae, audio_latent)
+        sample_rate = audio_sample_rate(audio_vae)
 
         if dump_diagnostics:
             samples = diagnostics.dump_chunk_audio(
@@ -370,55 +364,57 @@ def _sample_and_write_av(
         if take_frames <= 0:
             return
 
-        if output_video:
-            channels = int(waveform.shape[1])
-            if state["audio_sample_rate"] is None:
-                state["audio_sample_rate"] = sample_rate
-                state["audio_channels"] = channels
-                audio_writer = FFmpegAudioWriter(
-                    raw_audio,
-                    sample_rate=sample_rate,
-                    channels=channels,
-                    ffmpeg_location=ffmpeg_location,
-                ).open()
-            elif (
-                sample_rate != state["audio_sample_rate"]
-                or channels != state["audio_channels"]
-            ):
-                raise RuntimeError(
-                    "audio VAE output format changed between chunks"
-                )
-
-            desired_total = audio_samples_for_frames(
-                state["frames"] + take_frames,
-                sample_rate,
-                fps=self.geometry.fps,
+        channels = int(waveform.shape[1])
+        if state["audio_sample_rate"] is None:
+            state["audio_sample_rate"] = sample_rate
+            state["audio_channels"] = channels
+            audio_writer = FFmpegAudioWriter(
+                raw_audio,
+                sample_rate=sample_rate,
+                channels=channels,
+                ffmpeg_location=ffmpeg_location,
+            ).open()
+        elif (
+            sample_rate != state["audio_sample_rate"]
+            or channels != state["audio_channels"]
+        ):
+            raise RuntimeError(
+                "audio VAE output format changed between chunks"
             )
-            take_samples = desired_total - state["audio_samples"]
-            if waveform.shape[-1] < take_samples:
-                raise RuntimeError(
-                    "audio chunk %d decoded %d samples, need %d for "
-                    "%d committed video frames"
-                    % (
-                        index,
-                        waveform.shape[-1],
-                        take_samples,
-                        take_frames,
-                    )
+
+        desired_total = audio_samples_for_frames(
+            state["frames"] + take_frames,
+            sample_rate,
+            fps=self.geometry.fps,
+        )
+        take_samples = desired_total - state["audio_samples"]
+        if waveform.shape[-1] < take_samples:
+            raise RuntimeError(
+                "audio chunk %d decoded %d samples, need %d for "
+                "%d committed video frames"
+                % (
+                    index,
+                    waveform.shape[-1],
+                    take_samples,
+                    take_frames,
                 )
-            committed = waveform[..., :take_samples]
-            audio_writer.write(committed)
-            state["audio_samples"] += take_samples
-            # The live preview staged this chunk's frames inside _emit_chunk and
-            # is waiting for exactly these samples, so its segment carries the
-            # same audio the final mux will.
-            _publish_preview_chunk(committed, sample_rate)
-            del waveform, committed
-        else:
-            _publish_preview_chunk(None, None)
+            )
+        committed = waveform[..., :take_samples]
+        audio_writer.write(committed)
+        state["audio_samples"] += take_samples
+        # The live preview staged this chunk's frames inside _emit_chunk and
+        # is waiting for exactly these samples, so its segment carries the
+        # same audio the final mux will.
+        _publish_preview_chunk(committed, sample_rate)
+        del waveform, committed
 
         state["frames"] += take_frames
 
+    # Only a run that sampled, wrote and validated every frame may commit its
+    # raw artifacts; anything else leaves partials behind for close_writers to
+    # delete, so a failed run never leaves a truncated video_only.mkv sitting
+    # under its final name.
+    completed = False
     try:
         resume_from = self._first_invalid("samples", chunk_count)
         for index in range(resume_from):
@@ -444,20 +440,12 @@ def _sample_and_write_av(
             chunk_count=chunk_count,
             on_sampled=emit,
         )
-    finally:
-        if video_writer is not None:
-            video_writer.close(commit=True)
-        if audio_writer is not None:
-            audio_writer.close(commit=True)
 
-    if state["frames"] != self.target_frames:
-        raise RuntimeError(
-            "assembled %d frames, expected exactly %d"
-            % (state["frames"], self.target_frames)
-        )
-
-    output_path = ""
-    if output_video:
+        if state["frames"] != self.target_frames:
+            raise RuntimeError(
+                "assembled %d frames, expected exactly %d"
+                % (state["frames"], self.target_frames)
+            )
         expected_audio = audio_samples_for_frames(
             self.target_frames,
             state["audio_sample_rate"],
@@ -468,14 +456,18 @@ def _sample_and_write_av(
                 "assembled %d audio samples, expected exactly %d"
                 % (state["audio_samples"], expected_audio)
             )
-        output_path = mux_generated_audio(
-            raw_video,
-            raw_audio,
-            final_video,
-            frame_count=self.target_frames,
-            fps=self.geometry.fps,
-            ffmpeg_location=ffmpeg_location,
-        )
+        completed = True
+    finally:
+        close_writers(video_writer, audio_writer, commit=completed)
+
+    output_path = mux_generated_audio(
+        raw_video,
+        raw_audio,
+        final_video,
+        frame_count=self.target_frames,
+        fps=self.geometry.fps,
+        ffmpeg_location=ffmpeg_location,
+    )
 
     self._h3_audio_output = {
         "samples": state["audio_samples"],
@@ -520,16 +512,12 @@ def run(**kwargs):
     finally:
         _ACTIVE_AUDIO_VAE.reset(token)
 
-    if kwargs.get("output_video", True):
-        sample_rate = audio_sample_rate(audio_vae)
-        audio_samples = audio_samples_for_frames(
-            kwargs["target_frames"],
-            sample_rate,
-            fps=geometry.fps,
-        )
-    else:
-        sample_rate = None
-        audio_samples = 0
+    sample_rate = audio_sample_rate(audio_vae)
+    audio_samples = audio_samples_for_frames(
+        kwargs["target_frames"],
+        sample_rate,
+        fps=geometry.fps,
+    )
     summary.update(
         {
             "audio_samples": audio_samples,

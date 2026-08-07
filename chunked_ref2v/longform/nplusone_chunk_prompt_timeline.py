@@ -17,9 +17,13 @@ from ..audio_boundary_profile import (
     legal_reference_tail_frames,
     validate_av_continuation_chunk_frames,
 )
+from ..geometry import chunk_seed as derive_chunk_seed
 
 FPS = 24
-PLAN_VERSION = 2
+# 3: the plan owns the run seed and the derived per-chunk seeds. Seed lives with
+# the thing being edited, so a requeue after a prompt edit keeps it - which is
+# what makes resuming an existing run possible at all.
+PLAN_VERSION = 3
 POLICY_AV_CONTINUATION = "previous_av_continuation"
 REFERENCE_MIN_SECONDS = 2
 REFERENCE_MAX_SECONDS = 15
@@ -83,11 +87,13 @@ def build_nplusone_chunk_prompt_plan(
     global_prompt="",
     chunk_prompts_json="",
     reference_frames=90,
+    seed=0,
     continuation_policy=POLICY_AV_CONTINUATION,
 ):
     output_seconds = int(output_seconds)
     chunk_frames = int(chunk_frames)
     reference_frames = int(reference_frames)
+    seed = int(seed) & 0xFFFFFFFFFFFFFFFF
     if output_seconds <= 0:
         raise ValueError("output_seconds must be positive")
     if chunk_frames <= 0:
@@ -115,6 +121,8 @@ def build_nplusone_chunk_prompt_plan(
         "global_prompt": str(global_prompt or ""),
         "chunk_prompts": prompts,
         "reference_frames": resolved_reference_frames,
+        "seed": seed,
+        "chunk_seeds": [derive_chunk_seed(seed, index) for index in range(chunk_count)],
     }
 
 
@@ -170,9 +178,25 @@ def validate_nplusone_chunk_prompt_plan(
             )
         )
 
+    seed = int(plan.get("seed", 0)) & 0xFFFFFFFFFFFFFFFF
+    chunk_seeds = plan.get("chunk_seeds")
+    expected_seeds = [
+        derive_chunk_seed(seed, index) for index in range(expected["chunk_count"])
+    ]
+    if list(chunk_seeds or []) != expected_seeds:
+        # A plan whose seeds do not follow from its own seed would make the
+        # resume scan reject chunks that are actually valid, or keep ones that
+        # are not.
+        raise ValueError(
+            "N+1 chunk prompt plan chunk_seeds do not match seed=%d over %d chunks"
+            % (seed, expected["chunk_count"])
+        )
+
     normalized = dict(plan)
     normalized["global_prompt"] = str(plan.get("global_prompt") or "")
     normalized["chunk_prompts"] = [str(item or "") for item in prompts]
+    normalized["seed"] = seed
+    normalized["chunk_seeds"] = expected_seeds
     return normalized
 
 
@@ -273,6 +297,19 @@ class MiniMaxH3NPlusOneChunkPromptTimeline(io.ComfyNode):
                         "Tail frames from each generated chunk used as dynamic "
                         "references for the next chunk. This is resolved to the "
                         "same AV-aligned set used by continuation execution."
+                    ),
+                ),
+                io.Int.Input(
+                    "seed",
+                    default=0,
+                    min=0,
+                    max=0xFFFFFFFFFFFFFFFF,
+                    control_after_generate=True,
+                    tooltip=(
+                        "Run seed. Per-chunk seeds derive from it, and it travels "
+                        "in the plan. Keep it fixed to requeue after editing a "
+                        "chunk prompt: a changed seed rerolls every chunk, while an "
+                        "unchanged one lets completed chunks be reused."
                     ),
                 ),
             ],
