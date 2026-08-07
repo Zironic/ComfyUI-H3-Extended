@@ -104,33 +104,21 @@ class ForwardMobaProbe:
 
         if self.queries is None:
             self.queries = capture.select_query_blocks(
-                self.layout,
-                self.run.n_time,
-                self.run.n_spatial,
-                self.run.query_block,
-                include_audio=self.run.include_audio,
-                include_text=self.run.include_text,
-            )
+                self.layout, self.run.n_time, self.run.n_spatial, self.run.query_block,
+                include_audio=self.run.include_audio, include_text=self.run.include_text)
 
+        prepared = moba3d.prepare_video_router(
+            k, self.layout,
+            block_t=self.run.block_t, block_h=self.run.block_h, block_w=self.run.block_w)
         for spec in self.queries:
             result = moba3d.analyze_routing(
-                q,
-                k,
-                self.layout,
-                spec["start"],
-                spec["stop"],
-                block_t=self.run.block_t,
-                block_h=self.run.block_h,
-                block_w=self.run.block_w,
-                budgets=self.run.budgets,
-            )
+                q, k, self.layout, spec["start"], spec["stop"],
+                block_t=self.run.block_t, block_h=self.run.block_h,
+                block_w=self.run.block_w, budgets=self.run.budgets, prepared=prepared)
             rec = dict(spec)
             rec.update({
-                "layer": layer,
-                "step": self.step,
-                "sigma": self.sigma,
-                "cond_or_uncond": self.cond_or_uncond,
-                "moba3d": result,
+                "layer": layer, "step": self.step, "sigma": self.sigma,
+                "cond_or_uncond": self.cond_or_uncond, "moba3d": result,
             })
             self.run.records.append(rec)
 
@@ -155,7 +143,6 @@ def make_wrapper(session):
         x = args[0]
         context = args[2]
         payload = kwargs.get("minimax_payload") or {}
-
         try:
             layout = h3_layout.resolve_layout(x, context, payload)
         except Exception:
@@ -164,7 +151,6 @@ def make_wrapper(session):
 
         transformer_options["minimax_h3_token_layout"] = layout
         transformer_options["minimax_h3_token_ranges"] = layout.as_dict()
-
         if run is None:
             return executor(*args, **kwargs)
 
@@ -177,15 +163,13 @@ def make_wrapper(session):
             run.layers = set(capture.resolve_indices(run.layers_spec, num_layers))
             run.steps = set(capture.resolve_indices(run.steps_spec, total_steps))
             run.notes.update({
-                "total_steps": int(total_steps),
-                "num_layers": int(num_layers),
+                "total_steps": int(total_steps), "num_layers": int(num_layers),
                 "mode": "probe-only parameter-free 3D mean-pooled routing",
             })
             logging.info(
                 "[H3 MoBA3D probe] layout=%s layers=%s steps=%s block=%dx%dx%d budgets=%s",
                 layout.describe(), sorted(run.layers), sorted(run.steps),
-                run.block_t, run.block_h, run.block_w, run.budgets,
-            )
+                run.block_t, run.block_h, run.block_w, run.budgets)
 
         step, sigma = capture._step_index(transformer_options)
         cu = transformer_options.get("cond_or_uncond") or [0]
@@ -203,5 +187,4 @@ def make_wrapper(session):
                 write_run(run)
             except Exception:
                 logging.exception("[H3 MoBA3D probe] report write failed")
-
     return wrapper
