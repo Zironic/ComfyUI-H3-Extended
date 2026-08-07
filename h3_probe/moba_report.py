@@ -5,9 +5,19 @@ from __future__ import annotations
 import json
 import os
 
+from . import latent_dynamics
+
 
 def _pct(x):
+    if x is None:
+        return "n/a"
     return "%5.1f%%" % (100.0 * float(x))
+
+
+def _corr(x):
+    if x is None:
+        return "n/a"
+    return "%+.3f" % float(x)
 
 
 def _budget_key(row):
@@ -95,7 +105,90 @@ def summarize(records):
     return {"overall": overall, "by_layer": by_layer}
 
 
-def render(run, summary):
+def _dynamics_region_map(run):
+    out = {}
+    for dyn in getattr(run, "latent_dynamics", ()):
+        step = int(dyn["step"])
+        for region in dyn.get("query_regions", ()):
+            out[(step, int(region["start"]), int(region["stop"]))] = region
+    return out
+
+
+def _render_dynamics(run, dynamics_summary):
+    dynamics = getattr(run, "latent_dynamics", ())
+    if not dynamics:
+        return []
+
+    lines = [
+        "LATENT DYNAMICS (sampler callback, target video)",
+        "-" * 92,
+        "  Metrics compare each callback with the immediately preceding callback.",
+        "  sample = sampler x trajectory; prediction = denoised x0 trajectory.",
+        "  Stable-patch fractions use H3's 1x2x2 DiT patch granularity.",
+        "  explicit anchor latent frames: %s" % (
+            getattr(run, "anchor_frames", []) or "none"
+        ),
+    ]
+    by_step = (dynamics_summary or {}).get("by_step", {})
+    for dyn in dynamics:
+        step = int(dyn["step"])
+        sample = (dyn.get("global", {}).get("sample") or {})
+        prediction = (dyn.get("global", {}).get("prediction") or {})
+        sample_stable = sample.get("stable_patch_fraction", {})
+        pred_stable = prediction.get("stable_patch_fraction", {})
+        summary = by_step.get(str(step), {})
+        lines.append(
+            "  step %-3d | sample Δ %-6s stable<=1%% %-6s <=2%% %-6s <=5%% %-6s | "
+            "x0 Δ %-6s stable<=1%% %-6s <=2%% %-6s <=5%% %-6s" % (
+                step,
+                _pct(sample.get("update_rel_l2")).strip(),
+                _pct(sample_stable.get("1%")).strip(),
+                _pct(sample_stable.get("2%")).strip(),
+                _pct(sample_stable.get("5%")).strip(),
+                _pct(prediction.get("update_rel_l2")).strip(),
+                _pct(pred_stable.get("1%")).strip(),
+                _pct(pred_stable.get("2%")).strip(),
+                _pct(pred_stable.get("5%")).strip(),
+            )
+        )
+        if getattr(run, "anchor_frames", []):
+            lines.append(
+                "           anchor distance correlation: sample Δ %s | x0 Δ %s" % (
+                    _corr(summary.get("anchor_distance_vs_sample_update_pearson")),
+                    _corr(summary.get("anchor_distance_vs_prediction_update_pearson")),
+                )
+            )
+
+    correlations = (dynamics_summary or {}).get("attention_correlations", {})
+    if correlations:
+        lines.extend([
+            "",
+            "  MATCHED UPDATE / SPARSE-ERROR CORRELATIONS (Pearson)",
+            "  Positive means less-converged regions tended to be more sparse-sensitive.",
+        ])
+        for layer in sorted(correlations, key=int):
+            for key in sorted(
+                correlations[layer],
+                key=lambda k: correlations[layer][k]["budget"],
+            ):
+                row = correlations[layer][key]
+                lines.append(
+                    "    L%-2s %-5s blocks n=%-2d | x Δ/error %s | x0 Δ/error %s | "
+                    "x0 Δ/oracle %s | anchor dist/error %s" % (
+                        layer,
+                        _pct(row["budget"]).strip(),
+                        row["samples"],
+                        _corr(row.get("sample_update_vs_sparse_error_pearson")),
+                        _corr(row.get("prediction_update_vs_sparse_error_pearson")),
+                        _corr(row.get("prediction_update_vs_oracle_error_pearson")),
+                        _corr(row.get("anchor_distance_vs_sparse_error_pearson")),
+                    )
+                )
+    lines.append("")
+    return lines
+
+
+def render(run, summary, dynamics_summary=None):
     lines = [
         "MiniMax H3 3D MoBA-style routing probe - %s" % run.tag,
         "=" * 92,
@@ -110,6 +203,9 @@ def render(run, summary):
         "budgets:      %s" % ", ".join(_pct(x).strip() for x in run.budgets),
         "query blocks: %d" % len(run.records),
         "routing:      per query token and per head",
+        "latent dyn:   %s" % (
+            "sampler x/x0 per-step" if getattr(run, "capture_latent_dynamics", False) else "off"
+        ),
         "",
         "Interpretation: non-video KV tokens are always retained. Each query token",
         "independently selects target-video 3D blocks using dot products against",
@@ -181,7 +277,10 @@ def render(run, summary):
                 )
         lines.append("")
 
+    lines.extend(_render_dynamics(run, dynamics_summary or {}))
+
     lines.extend(["PER QUERY BLOCK", "-" * 92])
+    dyn_regions = _dynamics_region_map(run)
     for rec in run.records:
         frame = rec.get("frame")
         label = "%s query" % rec["kind"] if frame is None else "video query t=%d" % frame
@@ -199,6 +298,15 @@ def render(run, summary):
                 _pct(m["dense_nonvideo_mass_mean"]).strip(),
             )
         )
+        dyn = dyn_regions.get((int(rec["step"]), int(rec["start"]), int(rec["stop"])))
+        if dyn is not None:
+            lines.append(
+                "  latent dynamics: sample Δ %s | x0 Δ %s | anchor distance %s" % (
+                    _pct((dyn.get("sample") or {}).get("update_rel_l2")).strip(),
+                    _pct((dyn.get("prediction") or {}).get("update_rel_l2")).strip(),
+                    dyn.get("anchor_distance") if dyn.get("anchor_distance") is not None else "n/a",
+                )
+            )
         for row in m["budgets"]:
             worst = ", ".join(
                 "h%d=%s" % (item["head"], _pct(item["rel_l2"]).strip())
@@ -236,13 +344,16 @@ def render(run, summary):
 
 
 def write_run(run):
-    if not run.records:
+    if not run.records and not getattr(run, "latent_dynamics", None):
         return None
     os.makedirs(run.out_dir, exist_ok=True)
     summary = summarize(run.records)
+    dynamics_summary = latent_dynamics.summarize_dynamics(
+        getattr(run, "latent_dynamics", ()), run.records
+    )
     report_path = os.path.join(run.out_dir, "moba3d_report.txt")
     with open(report_path, "w", encoding="utf-8") as f:
-        f.write(render(run, summary))
+        f.write(render(run, summary, dynamics_summary))
     with open(
         os.path.join(run.out_dir, "moba3d_summary.json"),
         "w",
@@ -258,6 +369,8 @@ def write_run(run):
                 "budgets": list(run.budgets),
                 "notes": run.notes,
                 "summary": summary,
+                "dynamics_summary": dynamics_summary,
+                "latent_dynamics": list(getattr(run, "latent_dynamics", ())),
                 "records": run.records,
             },
             f,
