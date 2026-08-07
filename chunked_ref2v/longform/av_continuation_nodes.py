@@ -28,6 +28,7 @@ import torch
 from comfy_api.latest import ComfyExtension, InputImpl, io
 
 from .. import harness, memory, ref_builder
+from ..audio_boundary_profile import legal_reference_tail_frames
 from ..geometry import HarnessGeometry
 from ...cond_cache import MODES as COND_CACHE_MODES
 from .audio_output import (
@@ -37,16 +38,21 @@ from .audio_output import (
     decode_audio_chunk,
     mux_generated_audio,
 )
+from . import diagnostics
+from . import audio_runtime
 from .nplusone_chunk_prompt_timeline import (
     NPlusOneChunkPromptPlan,
     prompts_for_av_continuation_plan,
 )
 from .preview import (
+    CURRENT_FRAMES_TOOLTIP,
+    DECODER_AUTO,
     LongFormPreviewPublisher,
     PreviewOptions,
     activate,
     deactivate,
     current_publisher,
+    decoder_input,
     resolve_unique_id,
 )
 from .reference_nodes import _validate_canvas
@@ -63,6 +69,23 @@ def _chunk_count(target_frames, chunk_frames):
     if target_frames <= 0 or chunk_frames <= 0:
         raise ValueError("target_frames and chunk_frames must be positive")
     return int(math.ceil(target_frames / float(chunk_frames)))
+
+
+def _nearest(value, candidates, *, prefer_larger_on_tie=True):
+    if not candidates:
+        raise ValueError("no legal reference-tail candidate")
+    value = int(value)
+    if prefer_larger_on_tie:
+        return min(candidates, key=lambda item: (abs(item - value), -item))
+    return min(candidates, key=lambda item: (abs(item - value), item))
+
+
+def _resolve_reference_frames(chunk_frames, reference_frames):
+    return _nearest(
+        reference_frames,
+        legal_reference_tail_frames(chunk_frames),
+        prefer_larger_on_tie=True,
+    )
 
 
 def _count_items(items, kind):
@@ -170,6 +193,45 @@ def _dynamic_av_reference(previous_pixels, previous_video, previous_audio, canva
     return items, block
 
 
+def _slice_dynamic_av_reference(
+    previous_pixels,
+    previous_video,
+    previous_audio,
+    *,
+    reference_frames,
+    geometry,
+):
+    reference_frames = int(reference_frames)
+    if reference_frames <= 0:
+        raise ValueError("reference_frames must be positive")
+    if previous_pixels is None or previous_audio is None or previous_video is None:
+        raise ValueError("dynamic continuation reference is incomplete")
+    if reference_frames > int(previous_pixels.shape[0]):
+        raise ValueError(
+            "reference_frames=%d exceeds previous decoded chunk length=%d"
+            % (reference_frames, int(previous_pixels.shape[0]))
+        )
+    if geometry.overlap_frames != int(reference_frames):
+        raise ValueError(
+            "reference frames mismatch: geometry overlap=%d reference=%d"
+            % (geometry.overlap_frames, int(reference_frames))
+        )
+    video_overlap_start, video_overlap_count = geometry.overlap_slice()
+    audio_overlap_start, audio_overlap_count = audio_runtime.audio_overlap_slice(geometry)
+    return (
+        previous_pixels[-int(reference_frames):],
+        previous_video[
+            :,
+            :,
+            video_overlap_start:video_overlap_start + video_overlap_count,
+        ],
+        previous_audio[
+            ...,
+            audio_overlap_start:audio_overlap_start + audio_overlap_count,
+        ],
+    )
+
+
 def _resolve_root(run_directory, chunk_frames):
     if str(run_directory or "").strip():
         root = str(run_directory).strip()
@@ -201,8 +263,9 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
             is_experimental=True,
             description=(
                 "Generates long video as sequential native H3 audiovisual continuations. "
-                "Each chunk after the first receives the complete preceding generated "
-                "chunk as dynamic <Video N+1> and <Audio M+1> references. Connect the "
+                "Each chunk after the first receives the configured tail of the "
+                "preceding generated chunk as dynamic <Video N+1> and <Audio M+1> "
+                "references. Connect the "
                 "N+1 prompt timeline for per-chunk action instructions."
             ),
             inputs=[
@@ -313,10 +376,11 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
                 ),
                 io.Int.Input(
                     "current_preview_frames",
-                    default=17,
-                    min=1,
-                    max=17,
+                    default=0,
+                    min=0,
+                    max=1024,
                     step=1,
+                    tooltip=CURRENT_FRAMES_TOOLTIP,
                 ),
                 io.Boolean.Input("completed_chunks_preview", default=True),
                 io.Int.Input(
@@ -326,7 +390,18 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
                     max=1024,
                     step=32,
                 ),
-                io.Vae.Input("preview_vae", optional=True),
+                io.Vae.Input(
+                    "preview_vae",
+                    optional=True,
+                    tooltip=(
+                        "Optional exact-VAE preview, used only when TAEH3 is "
+                        "unavailable or its decode fails, or when "
+                        "current_preview_decoder is set to preview_vae. TAEH3 "
+                        "is the default backend and needs nothing connected "
+                        "here. The production video VAE is never loaded from "
+                        "inside the active sampler callback."
+                    ),
+                ),
                 io.Autogrow.Input(
                     "ref_images",
                     optional=True,
@@ -367,6 +442,36 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
                         max=3,
                     ),
                 ),
+                # Appended last on purpose. Comfy maps widgets_values by
+                # position, so inserting anywhere earlier shifts every saved
+                # value after it in existing workflows.
+                io.Boolean.Input(
+                    "diagnostic_dump_chunks",
+                    default=False,
+                    tooltip=(
+                        "Dump every complete generated chunk under "
+                        "diagnostics/chunk_NNNNNN/ - all decoded video frames "
+                        "plus the full generated audio, numbered locally to the "
+                        "chunk. This runner commits every frame it generates, so "
+                        "the dump differs from save_frames only on the final "
+                        "chunk, whose tail is truncated to the requested "
+                        "duration. Nothing is stored to replay from, so this "
+                        "captures only while the run is generating."
+                    ),
+                ),
+                # Same rule as diagnostic_dump_chunks above: appended, never
+                # inserted, so saved widgets_values keep their indices.
+                decoder_input(),
+                io.Int.Input(
+                    "reference_frames",
+                    default=90,
+                    min=1,
+                    max=362,
+                    tooltip=(
+                        "Tail frames from each generated chunk used as dynamic "
+                        "<Video N+1>/<Audio M+1> reference."
+                    ),
+                ),
             ],
             outputs=[
                 io.Video.Output(display_name="video"),
@@ -403,7 +508,7 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
         save_frames=False,
         current_chunk_preview=True,
         preview_every_steps=2,
-        current_preview_frames=17,
+        current_preview_frames=0,
         completed_chunks_preview=True,
         live_preview_width=512,
         preview_vae=None,
@@ -411,6 +516,9 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
         ref_videos=None,
         ref_video_audios=None,
         ref_audios=None,
+        diagnostic_dump_chunks=False,
+        current_preview_decoder=DECODER_AUTO,
+        reference_frames=90,
         unique_id=None,
     ) -> io.NodeOutput:
         # H3 target construction only needs a legal chunk length. The geometry
@@ -422,12 +530,21 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
         ).validate()
         canvas = _validate_canvas(width, height)
         target_frames = int(output_seconds * geometry.fps)
+        resolved_reference_frames = _resolve_reference_frames(
+            chunk_frames=geometry.chunk_frames,
+            reference_frames=reference_frames,
+        )
         chunk_prompts = prompts_for_av_continuation_plan(
             n_plus_one_prompt_plan,
             prompt,
             output_seconds=output_seconds,
             chunk_frames=geometry.chunk_frames,
+            reference_frames=resolved_reference_frames,
         )
+        reference_geometry = HarnessGeometry(
+            chunk_frames=int(chunk_frames),
+            overlap_frames=int(resolved_reference_frames),
+        ).validate()
         chunk_count = _chunk_count(target_frames, geometry.chunk_frames)
         if len(chunk_prompts) != chunk_count:
             raise RuntimeError(
@@ -438,6 +555,24 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
         root = _resolve_root(run_directory, geometry.chunk_frames)
         for path in ("frames", "output"):
             os.makedirs(os.path.join(root, path), exist_ok=True)
+
+        # geometry carries a placeholder O=4 that this runner never consumes, so
+        # the overlap-shaped metadata fields are corrected here rather than
+        # reported as a carry that does not exist.
+        diagnostic_sink = diagnostics.DiagnosticSink(
+            root,
+            geometry,
+            carry="none",
+            enabled=diagnostic_dump_chunks,
+            metadata_overrides={
+                "mode": "av_continuation",
+                "overlap_frames": 0,
+                "stride_frames": int(geometry.chunk_frames),
+                "carry_local_frames": None,
+                "previous_chunk_overlap_local_frames": None,
+                "video_overlap_latent": None,
+            },
+        )
 
         model, memory_status = memory.arm(
             model,
@@ -473,10 +608,27 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
                 every_steps=int(preview_every_steps),
                 current_frames=int(current_preview_frames),
                 width=int(live_preview_width),
+                decoder=str(current_preview_decoder or DECODER_AUTO),
             ),
+            # This runner always decodes a waveform per chunk, so the completed
+            # pane must wait for it instead of publishing a silent segment.
+            audio_expected=True,
         )
         preview_token = activate(publisher)
         publisher._announce("reset")
+        logging.info(
+            "%s preview: current=%s every=%d frames=%s decoder=%s taeh3=%s; "
+            "completed=%s width=%d exact_vae=%s",
+            LOG,
+            current_chunk_preview,
+            preview_every_steps,
+            current_preview_frames or "all",
+            current_preview_decoder,
+            publisher.taeh3 is not None,
+            completed_chunks_preview,
+            live_preview_width,
+            preview_vae is not None,
+        )
 
         video_writer = FFmpegVideoWriter(
             raw_video,
@@ -515,10 +667,19 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
                     active_prompt = str(base_prompt or "")
 
                     if index > 0:
+                        reference_pixels, reference_video, reference_audio = (
+                            _slice_dynamic_av_reference(
+                                previous_pixels,
+                                previous_video,
+                                previous_audio,
+                                reference_frames=resolved_reference_frames,
+                                geometry=reference_geometry,
+                            )
+                        )
                         dynamic_items, dynamic_block = _dynamic_av_reference(
-                            previous_pixels,
-                            previous_video,
-                            previous_audio,
+                            reference_pixels,
+                            reference_video,
+                            reference_audio,
                             canvas,
                         )
                         items.extend(dynamic_items)
@@ -561,6 +722,8 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
                     pixels = decode_chunk(video_vae, video_latent).to(
                         "cpu", torch.float32
                     )
+                    # Before the final-chunk truncation below.
+                    diagnostics.emit_video(diagnostic_sink, index, pixels)
                     remaining = target_frames - written_frames
                     take_frames = min(int(pixels.shape[0]), remaining)
                     if take_frames <= 0:
@@ -584,7 +747,11 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
 
                     if active_publisher is not None:
                         try:
-                            active_publisher.publish_completed_chunk(
+                            # Staged, not published: this chunk's waveform is
+                            # only decoded further down, so publishing here
+                            # could never produce a segment with sound. The
+                            # flush after the audio is trimmed releases it.
+                            active_publisher.stage_completed_chunk(
                                 chunk_index=index,
                                 frames_u8=frames_u8,
                                 completed_frames=written_frames + take_frames,
@@ -598,6 +765,25 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
                             )
 
                     waveform = decode_audio_chunk(audio_vae, audio_latent)
+
+                    if diagnostic_dump_chunks:
+                        dumped_samples = diagnostics.dump_chunk_audio(
+                            diagnostic_sink, index, waveform, sample_rate,
+                        )
+                        diagnostics.dump_chunk_metadata(
+                            diagnostic_sink,
+                            index,
+                            global_start_frame=written_frames,
+                            committed_frames=take_frames,
+                            video_frames=diagnostics.video_frames_dumped(
+                                diagnostic_sink, index,
+                            ),
+                            video_latent=video_latent,
+                            audio_latent=audio_latent,
+                            audio_samples=dumped_samples,
+                            audio_sample_rate=sample_rate,
+                        )
+
                     channels = int(waveform.shape[1])
                     if audio_writer is None:
                         audio_writer = FFmpegAudioWriter(
@@ -617,8 +803,26 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
                             "chunk %d decoded %d audio samples; need %d"
                             % (index, int(waveform.shape[-1]), take_audio)
                         )
-                    audio_writer.write(waveform[..., :take_audio])
+                    committed_audio = waveform[..., :take_audio]
+                    audio_writer.write(committed_audio)
                     written_audio += take_audio
+
+                    # Release the staged frames now that their sound exists.
+                    # Hand over exactly the committed samples so the preview
+                    # pane stays in step with the video it just wrote.
+                    if active_publisher is not None:
+                        try:
+                            active_publisher.flush_completed_chunk(
+                                waveform=committed_audio,
+                                sample_rate=sample_rate,
+                            )
+                        except Exception as exc:
+                            logging.warning(
+                                "%s completed preview audio failed for chunk %d: %s",
+                                LOG,
+                                index,
+                                exc,
+                            )
                     written_frames += take_frames
 
                     # Keep exactly one complete previous chunk on CPU. Qwen uses
@@ -648,6 +852,13 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
                     % (written_frames, target_frames)
                 )
         finally:
+            # A run that ended between staging a chunk and decoding its audio
+            # would otherwise strand those frames; publish them silently rather
+            # than lose the segment.
+            try:
+                publisher.flush_completed_chunk()
+            except Exception as exc:
+                logging.warning("%s final preview flush failed: %s", LOG, exc)
             deactivate(preview_token)
             video_writer.close(commit=True)
             if audio_writer is not None:
@@ -701,6 +912,11 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
             "run dir   %s" % root,
             "video     %s" % output_path,
         ]
+        if diagnostic_dump_chunks:
+            report_lines.append(
+                "diag      untrimmed chunk dumps in %s"
+                % os.path.join(root, "diagnostics")
+            )
         report_lines.extend("ref       %s" % note for note in reference_notes)
         return io.NodeOutput(
             video,

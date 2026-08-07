@@ -20,12 +20,14 @@ from .nodes import (
     _video_result,
 )
 from .preview import (
+    DECODER_AUTO,
     LongFormPreviewPublisher,
     PreviewOptions,
     activate,
     deactivate,
     resolve_unique_id,
 )
+from .preview_nodes import _decoder_input
 from .reference_nodes import (
     MiniMaxH3LongFormReferenceVideo,
     _resolve_root,
@@ -74,9 +76,9 @@ class MiniMaxH3LongFormReferenceVideoPreview(
                 "current_chunk_preview",
                 default=True,
                 tooltip=(
-                    "Show a lightweight approximation of the current "
-                    "denoised chunk while it is sampling. Connect "
-                    "preview_vae only for an exact bounded VAE animation."
+                    "Show the current denoised chunk while it is sampling. "
+                    "TAEH3 decodes the whole chunk by default; nothing needs "
+                    "to be connected for that."
                 ),
             ),
             io.Int.Input(
@@ -92,14 +94,17 @@ class MiniMaxH3LongFormReferenceVideoPreview(
             ),
             io.Int.Input(
                 "current_preview_frames",
-                default=17,
-                min=1,
-                max=17,
+                default=0,
+                min=0,
+                max=1024,
                 step=1,
                 tooltip=(
-                    "Maximum decoded frames when preview_vae is connected. "
-                    "The default lightweight mode shows up to five temporal "
-                    "latent positions instead."
+                    "TAEH3 only: frames in the current-chunk preview, 0 for "
+                    "the whole chunk. The preview_vae and latent paths ignore "
+                    "it because neither has a meaningful count to choose - the "
+                    "VAE decodes a whole 17-frame group for the cost of one "
+                    "frame, and the latent previewer emits one image per "
+                    "latent position."
                 ),
             ),
             io.Boolean.Input(
@@ -123,10 +128,12 @@ class MiniMaxH3LongFormReferenceVideoPreview(
                 "preview_vae",
                 optional=True,
                 tooltip=(
-                    "Optional VAE used only for an exact every-N-step "
-                    "animation. Leave disconnected for the lightweight "
-                    "latent preview. The production video VAE is never "
-                    "loaded from inside the active sampler callback."
+                    "Optional exact-VAE preview, used only when TAEH3 is "
+                    "unavailable or its decode fails, or when "
+                    "current_preview_decoder is set to preview_vae. TAEH3 is "
+                    "the default backend and needs nothing connected here. "
+                    "The production video VAE is never loaded from inside the "
+                    "active sampler callback."
                 ),
             ),
         ]
@@ -144,6 +151,10 @@ class MiniMaxH3LongFormReferenceVideoPreview(
             len(inputs),
         )
         inputs[insert_at:insert_at] = preview_inputs
+        # Appended past the anchors on purpose. Inserting here would shift
+        # align_audio_chunks and break every saved workflow's widgets_values;
+        # appending leaves every existing index alone.
+        inputs.append(_decoder_input())
         return _replace_inputs(schema, inputs)
 
     @classmethod
@@ -172,10 +183,11 @@ class MiniMaxH3LongFormReferenceVideoPreview(
         ffmpeg_location="",
         output_video=True,
         save_frames=False,
+        diagnostic_dump_chunks=False,
         chunk_align_audio_references=False,
         current_chunk_preview=True,
         preview_every_steps=1,
-        current_preview_frames=17,
+        current_preview_frames=0,
         completed_chunks_preview=True,
         live_preview_width=512,
         preview_vae=None,
@@ -183,6 +195,7 @@ class MiniMaxH3LongFormReferenceVideoPreview(
         ref_videos=None,
         ref_video_audios=None,
         ref_audios=None,
+        current_preview_decoder=DECODER_AUTO,
         unique_id=None,
     ) -> io.NodeOutput:
         overlap_frames, alignment_note = resolve_audio_aligned_overlap(
@@ -227,6 +240,7 @@ class MiniMaxH3LongFormReferenceVideoPreview(
                 every_steps=int(preview_every_steps),
                 current_frames=int(current_preview_frames),
                 width=int(live_preview_width),
+                decoder=str(current_preview_decoder or DECODER_AUTO),
             ),
             # This runtime decodes a waveform per chunk, but only when it is
             # writing a video; without one there is nothing to wait for.
@@ -235,13 +249,15 @@ class MiniMaxH3LongFormReferenceVideoPreview(
         token = activate(publisher)
         publisher._announce("reset")
         logging.info(
-            "%s enabled for node %s: current=%s every=%d frames=%d; "
-            "completed=%s width=%d exact_vae=%s audio_refs=%s",
+            "%s enabled for node %s: current=%s every=%d frames=%s decoder=%s "
+            "taeh3=%s; completed=%s width=%d exact_vae=%s audio_refs=%s",
             LOG,
             unique_id,
             current_chunk_preview,
             preview_every_steps,
-            current_preview_frames,
+            current_preview_frames or "all",
+            current_preview_decoder,
+            publisher.taeh3 is not None,
             completed_chunks_preview,
             live_preview_width,
             preview_vae is not None,
@@ -273,6 +289,7 @@ class MiniMaxH3LongFormReferenceVideoPreview(
                 cond_cache=cond_cache,
                 save_frames=save_frames,
                 output_video=output_video,
+                diagnostic_dump_chunks=diagnostic_dump_chunks,
                 ffmpeg_location=ffmpeg_location.strip() or None,
                 runtime_config={
                     "attention": attention,

@@ -29,6 +29,7 @@ from .chunked_ref2v.longform import (
 )
 from .chunked_ref2v.nodes import MiniMaxH3HarnessExtension
 from . import cond_cache_diagnostics
+from . import taeh3_latent_preview
 from .diagnostics.nodes import MiniMaxH3DiagnosticsExtension
 from .h3_activation_memory.nodes import MiniMaxH3ActivationMemoryExtension
 from .h3_attention.nodes import MiniMaxH3AttentionExtension
@@ -55,6 +56,11 @@ audio_boundary_nodes.install()
 # Keep finalized MP4 segments as the primary completed-output preview, but make
 # that channel failure-safe: GIF fallback first, explicit browser error second.
 completed_preview_runtime.install()
+
+# Give every other way of sampling H3 the same fast decoder the long-form nodes
+# use. Core cannot find taeh3 by itself and would mis-build it if it did, so the
+# patch lives here rather than in the auto-updating checkout.
+taeh3_latent_preview.install()
 
 # Optional long-form reference continuity: retain the decoded frame that maps
 # to the next chunk's frame zero and inject it as the next <Picture N> reference

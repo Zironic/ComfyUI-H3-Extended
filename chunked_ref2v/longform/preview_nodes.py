@@ -9,14 +9,22 @@ from comfy_api.latest import ComfyExtension, io
 
 from .nodes import MiniMaxH3LongFormRef2V
 from .preview import (
+    CURRENT_FRAMES_TOOLTIP,
+    DECODER_AUTO,
     LongFormPreviewPublisher,
     PreviewOptions,
     activate,
     deactivate,
+    decoder_input,
     resolve_unique_id,
 )
 
 LOG = "[H3 Extended] longform preview"
+
+
+#: Kept as a module-local alias: the definition moved to ``preview`` so every
+#: node with a current-chunk pane can share it without importing this module.
+_decoder_input = decoder_input
 
 
 def _replace_inputs(schema, inputs):
@@ -40,9 +48,9 @@ class MiniMaxH3LongFormRef2VPreview(MiniMaxH3LongFormRef2V):
                 "current_chunk_preview",
                 default=True,
                 tooltip=(
-                    "Show a lightweight approximation of the current denoised "
-                    "chunk while it is sampling. Connect preview_vae only when "
-                    "an exact bounded VAE animation is required."
+                    "Show the current denoised chunk while it is sampling. "
+                    "TAEH3 decodes the whole chunk by default; nothing needs "
+                    "to be connected for that."
                 ),
             ),
             io.Int.Input(
@@ -58,14 +66,17 @@ class MiniMaxH3LongFormRef2VPreview(MiniMaxH3LongFormRef2V):
             ),
             io.Int.Input(
                 "current_preview_frames",
-                default=17,
-                min=1,
-                max=17,
+                default=0,
+                min=0,
+                max=1024,
                 step=1,
                 tooltip=(
-                    "Maximum decoded frames when preview_vae is connected. "
-                    "The default lightweight mode shows up to five temporal "
-                    "latent positions instead."
+                    "TAEH3 only: frames in the current-chunk preview, 0 for "
+                    "the whole chunk. The preview_vae and latent paths ignore "
+                    "it because neither has a meaningful count to choose - the "
+                    "VAE decodes a whole 17-frame group for the cost of one "
+                    "frame, and the latent previewer emits one image per "
+                    "latent position."
                 ),
             ),
             io.Boolean.Input(
@@ -89,10 +100,12 @@ class MiniMaxH3LongFormRef2VPreview(MiniMaxH3LongFormRef2V):
                 "preview_vae",
                 optional=True,
                 tooltip=(
-                    "Optional VAE used only for an exact every-N-step "
-                    "animation. Leave disconnected for the lightweight "
-                    "latent preview. The production video VAE is never "
-                    "loaded from inside the active sampler callback."
+                    "Optional exact-VAE preview, used only when TAEH3 is "
+                    "unavailable or its decode fails, or when "
+                    "current_preview_decoder is set to preview_vae. TAEH3 is "
+                    "the default backend and needs nothing connected here. "
+                    "The production video VAE is never loaded from inside the "
+                    "active sampler callback."
                 ),
             ),
         ]
@@ -107,6 +120,10 @@ class MiniMaxH3LongFormRef2VPreview(MiniMaxH3LongFormRef2V):
             len(inputs),
         )
         inputs[insert_at:insert_at] = preview_inputs
+        # Appended, never inserted: Comfy maps widgets_values positionally, so a
+        # new widget is only safe at the very end where it cannot shift the
+        # indices a saved workflow already stores.
+        inputs.append(_decoder_input())
         return _replace_inputs(schema, inputs)
 
     @classmethod
@@ -141,11 +158,12 @@ class MiniMaxH3LongFormRef2VPreview(MiniMaxH3LongFormRef2V):
         save_frames=False,
         current_chunk_preview=True,
         preview_every_steps=2,
-        current_preview_frames=17,
+        current_preview_frames=0,
         completed_chunks_preview=True,
         live_preview_width=512,
         preview_vae=None,
         ref_images=None,
+        current_preview_decoder=DECODER_AUTO,
         unique_id=None,
     ) -> io.NodeOutput:
         # See resolve_unique_id: hidden inputs reach V3 nodes through the class
@@ -164,18 +182,21 @@ class MiniMaxH3LongFormRef2VPreview(MiniMaxH3LongFormRef2V):
                 every_steps=int(preview_every_steps),
                 current_frames=int(current_preview_frames),
                 width=int(live_preview_width),
+                decoder=str(current_preview_decoder or DECODER_AUTO),
             ),
         )
         token = activate(publisher)
         publisher._announce("reset")
         logging.info(
-            "%s enabled for node %s: current=%s every=%d frames=%d; "
-            "completed=%s width=%d exact_vae=%s",
+            "%s enabled for node %s: current=%s every=%d frames=%s decoder=%s "
+            "taeh3=%s; completed=%s width=%d exact_vae=%s",
             LOG,
             unique_id,
             current_chunk_preview,
             preview_every_steps,
-            current_preview_frames,
+            current_preview_frames or "all",
+            current_preview_decoder,
+            publisher.taeh3 is not None,
             completed_chunks_preview,
             live_preview_width,
             preview_vae is not None,

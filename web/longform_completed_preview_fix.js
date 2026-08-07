@@ -2,9 +2,12 @@ import { app } from "/scripts/app.js";
 import { api } from "/scripts/api.js";
 
 const EVENT_NAME = "h3_longform_preview";
+// Keep in step with longform_preview.js: any node with a preview pane needs the
+// same completed-channel handling.
 const NODE_NAMES = new Set([
     "MiniMaxH3LongFormRef2VZi",
     "MiniMaxH3LongFormReferenceVideoZi",
+    "MiniMaxH3LongFormAVContinuationZi",
 ]);
 
 function assetUrl(asset, revision) {

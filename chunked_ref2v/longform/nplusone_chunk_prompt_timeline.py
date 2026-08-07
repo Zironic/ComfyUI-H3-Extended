@@ -13,11 +13,30 @@ import json
 import math
 
 from comfy_api.latest import ComfyExtension, io
+from ..audio_boundary_profile import legal_reference_tail_frames
 
 FPS = 24
 PLAN_VERSION = 2
 POLICY_AV_CONTINUATION = "previous_av_continuation"
+
 NPlusOneChunkPromptPlan = io.Custom("H3_N_PLUS_ONE_CHUNK_PROMPT_PLAN")
+
+
+def _nearest(value, candidates, *, prefer_larger_on_tie=True):
+    if not candidates:
+        raise ValueError("no legal reference-tail candidate")
+    value = int(value)
+    if prefer_larger_on_tie:
+        return min(candidates, key=lambda item: (abs(item - value), -item))
+    return min(candidates, key=lambda item: (abs(item - value), item))
+
+
+def _resolve_reference_frames(chunk_frames, reference_frames):
+    return _nearest(
+        reference_frames,
+        legal_reference_tail_frames(chunk_frames),
+        prefer_larger_on_tie=True,
+    )
 
 
 def _parse_prompt_store(value):
@@ -49,14 +68,18 @@ def build_nplusone_chunk_prompt_plan(
     chunk_frames,
     global_prompt="",
     chunk_prompts_json="",
+    reference_frames=90,
     continuation_policy=POLICY_AV_CONTINUATION,
 ):
     output_seconds = int(output_seconds)
     chunk_frames = int(chunk_frames)
+    reference_frames = int(reference_frames)
     if output_seconds <= 0:
         raise ValueError("output_seconds must be positive")
     if chunk_frames <= 0:
         raise ValueError("chunk_frames must be positive")
+    if reference_frames <= 0:
+        raise ValueError("reference_frames must be positive")
     if continuation_policy != POLICY_AV_CONTINUATION:
         raise ValueError("unsupported N+1 continuation policy %r" % continuation_policy)
 
@@ -65,6 +88,7 @@ def build_nplusone_chunk_prompt_plan(
     stored = _parse_prompt_store(chunk_prompts_json)
     prompts = stored[:chunk_count]
     prompts.extend("" for _ in range(chunk_count - len(prompts)))
+    resolved_reference_frames = _resolve_reference_frames(chunk_frames, reference_frames)
     return {
         "version": PLAN_VERSION,
         "schedule": "full_chunks",
@@ -76,6 +100,7 @@ def build_nplusone_chunk_prompt_plan(
         "chunk_count": chunk_count,
         "global_prompt": str(global_prompt or ""),
         "chunk_prompts": prompts,
+        "reference_frames": resolved_reference_frames,
     }
 
 
@@ -84,6 +109,7 @@ def validate_nplusone_chunk_prompt_plan(
     *,
     output_seconds,
     chunk_frames,
+    reference_frames=90,
     continuation_policy=POLICY_AV_CONTINUATION,
 ):
     if not isinstance(plan, dict):
@@ -103,9 +129,17 @@ def validate_nplusone_chunk_prompt_plan(
     expected = build_nplusone_chunk_prompt_plan(
         output_seconds=output_seconds,
         chunk_frames=chunk_frames,
+        reference_frames=reference_frames,
         continuation_policy=continuation_policy,
     )
-    for key in ("fps", "output_seconds", "target_frames", "chunk_frames", "chunk_count"):
+    for key in (
+        "fps",
+        "output_seconds",
+        "target_frames",
+        "chunk_frames",
+        "chunk_count",
+        "reference_frames",
+    ):
         if int(plan.get(key, -1)) != int(expected[key]):
             raise ValueError(
                 "N+1 chunk prompt plan %s=%r does not match downstream node %s=%r"
@@ -148,14 +182,17 @@ def prompts_for_av_continuation_plan(
     *,
     output_seconds,
     chunk_frames,
+    reference_frames=90,
 ):
     if plan is None:
         count = _chunk_count(int(output_seconds) * FPS, int(chunk_frames))
+        _resolve_reference_frames(chunk_frames, reference_frames)
         return [str(fallback_prompt or "")] * count
     normalized = validate_nplusone_chunk_prompt_plan(
         plan,
         output_seconds=output_seconds,
         chunk_frames=chunk_frames,
+        reference_frames=reference_frames,
         continuation_policy=POLICY_AV_CONTINUATION,
     )
     return compile_nplusone_chunk_prompts(normalized, fallback_prompt)
@@ -206,6 +243,16 @@ class MiniMaxH3NPlusOneChunkPromptTimeline(io.ComfyNode):
                         "continuation node adds those dynamic references at runtime."
                     ),
                 ),
+                io.Int.Input(
+                    "reference_frames",
+                    default=90,
+                    min=1,
+                    max=362,
+                    tooltip=(
+                        "Tail frames from each generated chunk used as dynamic "
+                        "references for the next chunk."
+                    ),
+                ),
                 io.String.Input(
                     "chunk_prompts_json",
                     default='{"version":2,"prompts":[]}',
@@ -221,6 +268,7 @@ class MiniMaxH3NPlusOneChunkPromptTimeline(io.ComfyNode):
                 ),
                 io.Int.Output("output_seconds", display_name="output seconds"),
                 io.Int.Output("chunk_frames", display_name="chunk frames"),
+                io.Int.Output("reference_frames", display_name="reference frames"),
                 io.String.Output("report", display_name="report"),
             ],
         )
@@ -231,11 +279,13 @@ class MiniMaxH3NPlusOneChunkPromptTimeline(io.ComfyNode):
         output_seconds=30,
         chunk_frames=141,
         global_prompt="",
+        reference_frames=90,
         chunk_prompts_json="",
     ) -> io.NodeOutput:
         plan = build_nplusone_chunk_prompt_plan(
             output_seconds=output_seconds,
             chunk_frames=chunk_frames,
+            reference_frames=reference_frames,
             global_prompt=global_prompt,
             chunk_prompts_json=chunk_prompts_json,
         )
@@ -244,8 +294,12 @@ class MiniMaxH3NPlusOneChunkPromptTimeline(io.ComfyNode):
             "mode      previous <Video N+1> + <Audio M+1> AV continuation",
             "output    %d s / %d frames at %d fps"
             % (plan["output_seconds"], plan["target_frames"], plan["fps"]),
-            "profile   C=%d; no overlap; stride=%d"
-            % (plan["chunk_frames"], plan["chunk_frames"]),
+            "profile   C=%d; no overlap; stride=%d; R=%d"
+            % (
+                plan["chunk_frames"],
+                plan["chunk_frames"],
+                plan["reference_frames"],
+            ),
             "chunks    %d" % plan["chunk_count"],
         ]
         for index, prompt in enumerate(plan["chunk_prompts"]):
@@ -271,6 +325,7 @@ class MiniMaxH3NPlusOneChunkPromptTimeline(io.ComfyNode):
             plan,
             int(output_seconds),
             int(chunk_frames),
+            int(plan["reference_frames"]),
             "\n".join(lines),
         )
 

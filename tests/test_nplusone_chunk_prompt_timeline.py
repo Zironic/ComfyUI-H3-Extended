@@ -23,10 +23,20 @@ class NPlusOneChunkPromptTimelineTests(unittest.TestCase):
         self.assertEqual(plan["target_frames"], 288)
         self.assertEqual(plan["chunk_count"], 3)
         self.assertEqual(plan["chunk_prompts"], ["a", "b", "c"])
+        self.assertIn("reference_frames", plan)
         self.assertEqual(plan["schedule"], "full_chunks")
         self.assertEqual(plan["continuation_policy"], POLICY_AV_CONTINUATION)
+        self.assertEqual(plan["reference_frames"], 90)
         self.assertNotIn("overlap_frames", plan)
         self.assertNotIn("stride_frames", plan)
+
+    def test_reference_frames_snap_to_legal_if_not_exact(self):
+        plan = build_nplusone_chunk_prompt_plan(
+            output_seconds=10,
+            chunk_frames=141,
+            reference_frames=80,
+        )
+        self.assertEqual(plan["reference_frames"], 81)
 
     def test_global_prompt_is_compiled_with_each_local_instruction(self):
         plan = build_nplusone_chunk_prompt_plan(
@@ -64,6 +74,35 @@ class NPlusOneChunkPromptTimelineTests(unittest.TestCase):
                 plan,
                 output_seconds=12,
                 chunk_frames=90,
+            )
+
+    def test_reference_frames_mismatch_is_rejected(self):
+        plan = build_nplusone_chunk_prompt_plan(
+            output_seconds=12,
+            chunk_frames=141,
+            reference_frames=72,
+        )
+        with self.assertRaises(ValueError):
+            validate_nplusone_chunk_prompt_plan(
+                plan,
+                output_seconds=12,
+                chunk_frames=141,
+                reference_frames=81,
+            )
+
+    def test_prompts_function_rejects_reference_frame_mismatch(self):
+        plan = build_nplusone_chunk_prompt_plan(
+            output_seconds=12,
+            chunk_frames=141,
+            reference_frames=72,
+        )
+        with self.assertRaises(ValueError):
+            prompts_for_av_continuation_plan(
+                plan,
+                "fallback",
+                output_seconds=12,
+                chunk_frames=141,
+                reference_frames=81,
             )
 
     def test_av_consumer_receives_compiled_prompts(self):

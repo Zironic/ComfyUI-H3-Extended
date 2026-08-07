@@ -15,9 +15,10 @@ from .geometry import (
     AUDIO_LATENT_FPS,
     FPS,
     HarnessGeometry,
+    find_exact_overlap_slice,
     UnalignedProfileError,
-    aligned_overlap_frames,
     audio_boundary_is_exact,
+    video_latent_t,
 )
 
 MIN_LONGFORM_CHUNK_FRAMES = 22
@@ -74,6 +75,59 @@ def _nearest(value, candidates, *, prefer_larger_on_tie=True):
     if prefer_larger_on_tie:
         return min(candidates, key=lambda item: (abs(item - value), -item))
     return min(candidates, key=lambda item: (abs(item - value), item))
+
+
+def aligned_overlap_frames(
+    chunk_frames,
+    overlap_frames,
+    fps=FPS,
+):
+    """Nearest aligned overlap for continuation that stays exact on shared boundaries."""
+    chunk_frames = int(chunk_frames)
+    overlap_frames = int(overlap_frames)
+    candidates = legal_reference_tail_frames(chunk_frames, fps=fps)
+    if overlap_frames in candidates:
+        return overlap_frames
+    if not candidates:
+        raise UnalignedProfileError(
+            "no overlap aligns video and audio for chunk_frames=%d" % chunk_frames
+        )
+    # Prefer a larger overlap when tied to preserve context.
+    return min(candidates, key=lambda c: (abs(c - overlap_frames), -c))
+
+
+def legal_reference_tail_frames(chunk_frames, *, fps=FPS):
+    """Legal continuation-tail lengths for dynamic AV slicing.
+
+    Candidates are valid overlap widths from which all of the following hold:
+
+    * the stride is exact on the shared video/audio boundary
+    * the stride and overlap align on H3 latent boundaries
+    """
+    chunk_frames = int(chunk_frames)
+    latent_t = video_latent_t(chunk_frames)
+    candidates = []
+    for overlap_frames in range(1, chunk_frames):
+        stride_frames = chunk_frames - overlap_frames
+        if stride_frames <= 0:
+            continue
+        if not audio_boundary_is_exact(stride_frames, fps=fps):
+            continue
+        try:
+            find_exact_overlap_slice(
+                latent_t,
+                stride_frames,
+                overlap_frames,
+            )
+        except UnalignedProfileError:
+            continue
+        candidates.append(overlap_frames)
+
+    if not candidates:
+        raise UnalignedProfileError(
+            "no legal reference-tail candidates for chunk_frames=%d" % chunk_frames
+        )
+    return candidates
 
 
 def resolve_audio_boundary_profile(
@@ -160,6 +214,8 @@ __all__ = [
     "MAX_LONGFORM_CHUNK_FRAMES",
     "MIN_LONGFORM_CHUNK_FRAMES",
     "audio_aligned_chunk_frames",
+    "aligned_overlap_frames",
+    "legal_reference_tail_frames",
     "profile_audio_boundaries_are_exact",
     "resolve_audio_boundary_profile",
 ]

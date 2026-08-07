@@ -121,9 +121,6 @@ class MiniMaxH3LongFormReferenceVideo(io.ComfyNode):
                     "save_frames", default=False,
                     tooltip="Save a diagnostic PNG sequence in addition to the video.",
                 ),
-                # Must stay the LAST widget. Comfy maps widgets_values by
-                # position, so a new widget inserted anywhere earlier shifts
-                # every saved value after it in existing workflows.
                 io.Boolean.Input(
                     "align_audio_chunks", default=False,
                     tooltip=(
@@ -136,6 +133,23 @@ class MiniMaxH3LongFormReferenceVideo(io.ComfyNode):
                         "C=90 the aligned overlaps are 9, 21, 30, 39, 51, 60, 72 "
                         "and 81. Snapping changes the generated result and the "
                         "run directory, so it is off by default."
+                    ),
+                ),
+                # Must stay the LAST widget. Comfy maps widgets_values by
+                # position, so a new widget inserted anywhere earlier shifts
+                # every saved value after it in existing workflows; appending
+                # here leaves older workflows on the default.
+                io.Boolean.Input(
+                    "diagnostic_dump_chunks", default=False,
+                    tooltip=(
+                        "Dump every complete generated chunk before overlap "
+                        "trimming - all decoded video frames plus the generated "
+                        "audio - under diagnostics/chunk_NNNNNN/. Frame numbers "
+                        "are local to the chunk, so frame 0 is the first carried "
+                        "frame and frame overlap_frames is the first frame past "
+                        "the carry. This does not change what is generated, so "
+                        "it can be switched on against a finished run directory "
+                        "to dump the stored chunks without resampling."
                     ),
                 ),
                 io.Autogrow.Input(
@@ -191,7 +205,7 @@ class MiniMaxH3LongFormReferenceVideo(io.ComfyNode):
         ref_image_size="native", cond_cache="auto", attention="auto",
         activation="mlp_chunked_native", run_directory="",
         ffmpeg_location="", output_video=True, save_frames=False,
-        ref_images=None, ref_videos=None, ref_video_audios=None,
+        diagnostic_dump_chunks=False, ref_images=None, ref_videos=None, ref_video_audios=None,
         ref_audios=None,
     ) -> io.NodeOutput:
         overlap_frames, alignment_note = resolve_audio_aligned_overlap(
@@ -238,6 +252,7 @@ class MiniMaxH3LongFormReferenceVideo(io.ComfyNode):
             cond_cache=cond_cache,
             save_frames=save_frames,
             output_video=output_video,
+            diagnostic_dump_chunks=diagnostic_dump_chunks,
             ffmpeg_location=ffmpeg_location.strip() or None,
             runtime_config={"attention": attention, "activation": activation},
         )

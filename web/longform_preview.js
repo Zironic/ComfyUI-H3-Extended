@@ -1,9 +1,12 @@
 import { app } from "/scripts/app.js";
 import { api } from "/scripts/api.js";
 
+// Every node that builds a LongFormPreviewPublisher has to be listed here, or
+// it publishes preview events that no pane exists to receive.
 const NODE_NAMES = new Set([
     "MiniMaxH3LongFormRef2VZi",
     "MiniMaxH3LongFormReferenceVideoZi",
+    "MiniMaxH3LongFormAVContinuationZi",
 ]);
 const EVENT_NAME = "h3_longform_preview";
 const STATE_KEY = "__h3LongFormPreviewState";
@@ -76,6 +79,11 @@ function buildPreviewWidget(node) {
 
     const currentPanel = panel();
     const currentTitle = title("Current chunk — waiting");
+    // Two elements, one visible at a time. TAEH3 can decode a whole chunk per
+    // update, and only MP4 makes that affordable to encode - Pillow needs ~9 s
+    // to palettize a 105-frame GIF where ffmpeg needs ~0.08 s. GIF is still the
+    // fallback when ffmpeg cannot be resolved, and an <img> is the only thing
+    // that plays one.
     const currentImage = document.createElement("img");
     currentImage.alt = "Current chunk preview";
     currentImage.style.width = "100%";
@@ -83,7 +91,20 @@ function buildPreviewWidget(node) {
     currentImage.style.objectFit = "contain";
     currentImage.style.background = "#111";
     currentImage.style.borderRadius = "3px";
-    currentPanel.append(currentTitle, currentImage);
+    currentImage.style.display = "none";
+
+    const currentVideo = document.createElement("video");
+    currentVideo.autoplay = true;
+    currentVideo.loop = true;
+    currentVideo.muted = true;
+    currentVideo.playsInline = true;
+    currentVideo.preload = "auto";
+    currentVideo.style.width = "100%";
+    currentVideo.style.minHeight = "120px";
+    currentVideo.style.objectFit = "contain";
+    currentVideo.style.background = "#111";
+    currentVideo.style.borderRadius = "3px";
+    currentPanel.append(currentTitle, currentVideo, currentImage);
 
     const completedPanel = panel();
     const completedTitle = title("Completed output — waiting");
@@ -112,6 +133,7 @@ function buildPreviewWidget(node) {
         node,
         currentTitle,
         currentImage,
+        currentVideo,
         completedTitle,
         completedVideo,
         segments: [],
@@ -137,6 +159,9 @@ function resetState(state) {
     state.currentTitle.textContent = "Current chunk — waiting";
     state.currentTitle.removeAttribute("title");
     state.currentImage.removeAttribute("src");
+    state.currentVideo.pause();
+    state.currentVideo.removeAttribute("src");
+    state.currentVideo.load();
     state.completedTitle.textContent = "Completed output — waiting";
     state.completedVideo.pause();
     state.completedVideo.removeAttribute("src");
@@ -160,13 +185,36 @@ function playSegment(state, index, autoplay) {
     }
 }
 
+const CURRENT_MODES = {
+    taeh3: "TAEH3",
+    preview_vae: "VAE",
+    vae: "VAE",
+    latent: "latent approx",
+};
+
 function onCurrent(state, detail) {
-    const mode = detail.mode === "vae" ? "VAE" : "latent approx";
+    const mode = CURRENT_MODES[detail.mode] || "latent approx";
     const rate = detail.preview_fps ? ` @ ${detail.preview_fps} fps` : "";
+    const count = detail.frames ? ` — ${detail.frames}f` : "";
     state.currentTitle.textContent =
-        `Current chunk ${detail.chunk_index + 1} — step ${detail.step}/${detail.total_steps} — ${mode}${rate}`;
+        `Current chunk ${detail.chunk_index + 1} — step ${detail.step}/${detail.total_steps} — ${mode}${count}${rate}`;
     state.currentTitle.title = detail.fallback_reason || "";
-    state.currentImage.src = assetUrl(detail.asset, detail.revision);
+
+    const url = assetUrl(detail.asset, detail.revision);
+    const isVideo = (detail.format || "gif") === "mp4";
+    state.currentVideo.style.display = isVideo ? "" : "none";
+    state.currentImage.style.display = isVideo ? "none" : "";
+    if (isVideo) {
+        state.currentImage.removeAttribute("src");
+        state.currentVideo.src = url;
+        state.currentVideo.load();
+        state.currentVideo.play().catch(() => {
+            // Autoplay policy can still require a click despite muted.
+        });
+    } else {
+        state.currentVideo.removeAttribute("src");
+        state.currentImage.src = url;
+    }
 }
 
 function onCurrentError(state, detail) {
@@ -175,6 +223,7 @@ function onCurrentError(state, detail) {
         `Current chunk ${detail.chunk_index + 1} — preview failed`;
     state.currentTitle.title = message;
     state.currentImage.removeAttribute("src");
+    state.currentVideo.removeAttribute("src");
     console.warn("[H3 Extended] current chunk preview failed:", message);
 }
 

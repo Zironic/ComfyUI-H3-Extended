@@ -2,11 +2,15 @@
 
 Two independent channels are published while a node is running:
 
-* ``current_chunk`` is a lightweight approximation of the current denoised H3
-  latent. It uses Comfy's normal latent previewer by default, so it does not try
-  to load the full video VAE from inside the sampler callback. If an explicit
-  ``preview_vae`` is connected, an exact bounded VAE animation is attempted
-  first and the latent preview remains the failure-safe fallback.
+* ``current_chunk`` shows the current denoised H3 latent. TAEH3 is the default
+  backend: it is a 23 MB decoder that runs ~40x faster than the full VAE at the
+  same resolution, so the whole chunk can be shown every few steps instead of a
+  bounded 17-frame window. The order is TAEH3 -> ``preview_vae`` (only when one
+  is connected and TAEH3 is unavailable or fails) -> Comfy's latent previewer ->
+  a raw channel view. The production VAE is still never loaded from inside the
+  sampler callback; ``preview_vae`` stays an explicit, separately connected
+  diagnostic, and its decode stays bounded to five latent positions because the
+  VAE decodes a whole 1+4*4 group at a time.
 * ``completed_chunk`` writes the already-decoded committed frames of each
   completed chunk as a small MP4 segment, then stream-copies every segment
   produced so far into one growing ``completed_all`` MP4. The browser gets that
@@ -47,7 +51,8 @@ from .. import harness
 from ..geometry import FRAME_PER_TOKEN
 from ..layout_ops import TargetAlignedCondition
 from ..model_patch import patch_target_conditions
-from . import runner
+from . import diagnostics, runner
+from . import taeh3 as taeh3_backend
 from .frame_source import resolve_ffmpeg
 from .writer import FFmpegVideoWriter
 
@@ -56,6 +61,18 @@ EVENT = "h3_longform_preview"
 # One temporal latent position stands for this many pixel frames, so a latent
 # preview image has to be held that many frame periods to run at real speed.
 LATENT_FRAME_STRIDE = max(FRAME_PER_TOKEN)
+#: Frames per slice when downscaling a decoded batch for the pane.
+_RESIZE_BATCH = 32
+#: Latent positions in one whole H3 group. Below this the model stops behaving
+#: like a video model at all: asked for fewer than 17 frames it renders one real
+#: frame and then up to fifteen variously corrupted restatements of it. Only
+#: frame one is worth looking at, so a short chunk previews as a single still.
+GROUP_LATENTS = 5
+
+
+def _short_chunk(video) -> bool:
+    """True when the chunk is too short for the model to generate real motion."""
+    return int(video.shape[2]) < GROUP_LATENTS
 _ACTIVE = contextvars.ContextVar("h3_longform_preview_publisher", default=None)
 _PATCHED = False
 
@@ -103,20 +120,39 @@ def _resize_frames_u8(frames_u8: torch.Tensor, max_width: int) -> torch.Tensor:
     out_h = max(16, int(round(height * scale)) // 2 * 2)
     if (out_h, out_w) == (height, width):
         return frames_u8.contiguous()
-    nchw = frames_u8.permute(0, 3, 1, 2).to(torch.float32)
-    resized = F.interpolate(
-        nchw,
-        size=(out_h, out_w),
-        mode="bilinear",
-        align_corners=False,
-        antialias=True,
-    )
-    return (
-        resized.round_()
-        .clamp_(0, 255)
-        .to(torch.uint8)
-        .permute(0, 2, 3, 1)
-        .contiguous()
+    # Resize in slices. A whole TAEH3 chunk is ~105 frames at 768x1344, and
+    # upcasting all of that to float32 at once costs 1.3 GB of host RAM for a
+    # preview; 32 frames at a time costs ~400 MB and is no slower.
+    out = []
+    for start in range(0, int(frames_u8.shape[0]), _RESIZE_BATCH):
+        nchw = frames_u8[start:start + _RESIZE_BATCH].permute(0, 3, 1, 2).to(
+            torch.float32
+        )
+        resized = F.interpolate(
+            nchw,
+            size=(out_h, out_w),
+            mode="bilinear",
+            align_corners=False,
+            antialias=True,
+        )
+        out.append(
+            resized.round_()
+            .clamp_(0, 255)
+            .to(torch.uint8)
+            .permute(0, 2, 3, 1)
+        )
+        del nchw, resized
+    return torch.cat(out).contiguous()
+
+
+def _images_to_u8(images) -> torch.Tensor:
+    """Stack PIL previews into the uint8 NHWC batch the writers expect."""
+    import numpy as np
+
+    if not images:
+        raise ValueError("preview produced no images")
+    return torch.from_numpy(
+        np.stack([np.asarray(image.convert("RGB")) for image in images])
     )
 
 
@@ -183,13 +219,60 @@ def _latent_process_out(model):
     return processor if callable(processor) else None
 
 
+#: ``current_preview_decoder`` values. ``auto`` is TAEH3 first, then a connected
+#: preview VAE, then the latent previewer.
+DECODER_AUTO = "auto"
+DECODER_TAEH3 = "taeh3"
+DECODER_VAE = "preview_vae"
+DECODER_LATENT = "latent"
+DECODER_CHOICES = (DECODER_AUTO, DECODER_TAEH3, DECODER_VAE, DECODER_LATENT)
+
+#: Shared by every node that owns a current-chunk pane. The frame count that
+#: goes with it is TAEH3-only; see ``PreviewOptions.current_frames``.
+CURRENT_FRAMES_TOOLTIP = (
+    "TAEH3 only: frames in the current-chunk preview, 0 for the whole chunk. "
+    "The preview_vae and latent paths ignore it because neither has a "
+    "meaningful count to choose - the VAE decodes a whole 17-frame group for "
+    "the cost of one frame, and the latent previewer emits one image per "
+    "latent position. A chunk shorter than one group previews as a single "
+    "still, because below 17 frames the model renders one real frame and then "
+    "corrupted copies of it."
+)
+
+
+def decoder_input():
+    """The current-chunk backend selector, shared by all preview nodes.
+
+    ``io`` is imported lazily so this module stays usable from the runners and
+    tests, which never touch the node schema layer.
+    """
+    from comfy_api.latest import io
+
+    return io.Combo.Input(
+        "current_preview_decoder",
+        options=list(DECODER_CHOICES),
+        default=DECODER_AUTO,
+        tooltip=(
+            "Which decoder draws the current-chunk pane. auto prefers TAEH3, "
+            "then a connected preview_vae, then the latent previewer. taeh3 "
+            "shows the whole chunk cheaply; preview_vae is the exact but "
+            "bounded diagnostic; latent never decodes at all."
+        ),
+    )
+
+
 @dataclass
 class PreviewOptions:
     current_enabled: bool = True
     completed_enabled: bool = True
     every_steps: int = 2
-    current_frames: int = 17
+    #: TAEH3 only. 0 means every frame the chunk covers. The VAE and latent
+    #: paths have no meaningful frame count to pick: the VAE decodes a whole
+    #: 1+4*4 group atomically (17 frames for the same cost as one) and the
+    #: latent previewer emits exactly one image per latent position.
+    current_frames: int = 0
     width: int = 512
+    decoder: str = DECODER_AUTO
 
 
 def resolve_unique_id(cls, fallback=None):
@@ -213,10 +296,15 @@ def resolve_unique_id(cls, fallback=None):
 class LongFormPreviewPublisher:
     """Persist and announce both live-preview channels.
 
-    ``video_vae`` is deliberately optional. A disconnected preview VAE means
-    "use the lightweight latent preview", not "reuse the production VAE inside
-    the active sampler". Loading the production VAE during a DiT callback is
-    exactly the model-switching path that left the panel stuck at waiting.
+    The current-chunk backend is chosen once, here, outside the sampler. TAEH3
+    is loaded eagerly when it is wanted so the weights are resident before the
+    first callback fires and are never reloaded between updates.
+
+    ``video_vae`` is deliberately optional and no longer the preferred backend.
+    A connected preview VAE now means "use this if TAEH3 cannot", not "reuse the
+    production VAE inside the active sampler". Loading the production VAE during
+    a DiT callback is exactly the model-switching path that left the panel stuck
+    at waiting.
     """
 
     def __init__(
@@ -243,6 +331,16 @@ class LongFormPreviewPublisher:
         self.fps = int(fps)
         self.ffmpeg_location = ffmpeg_location
         self.options = options or PreviewOptions()
+        # One instance for the whole run. Built here, outside the sampler.
+        self.taeh3 = None
+        if self.options.decoder in (DECODER_AUTO, DECODER_TAEH3):
+            self.taeh3 = taeh3_backend.TAEH3Previewer.load()
+            if self.taeh3 is None and self.options.decoder == DECODER_TAEH3:
+                logging.warning(
+                    "%s decoder=taeh3 requested but TAEH3 is unavailable; "
+                    "falling back to the latent preview",
+                    LOG,
+                )
         self.revision = 0
         self.completed_frames = 0
         self.segment_paths = []
@@ -329,93 +427,195 @@ class LongFormPreviewPublisher:
     ):
         """Publish the current denoised latent without risking the generation.
 
-        An explicitly connected preview VAE gets first refusal. Any VAE load,
-        decode or animation error falls back to the model's lightweight latent
-        previewer. The default path never loads a VAE inside the sampler.
+        Backends are tried in order and every one of them may fail without
+        costing the generation: TAEH3, then a connected preview VAE, then
+        Comfy's latent previewer, then a raw channel view.
         """
         source = denoised if denoised is not None else current
         video = _video_latent(source)
         fallback_reason = None
-        images = None
+        frames_u8 = None
         mode = "latent"
 
-        if self.video_vae is not None:
+        for candidate, produce in self._decoder_chain():
             try:
-                images = self._exact_vae_images(video)
-                mode = "vae"
+                frames_u8 = produce(video)
+                mode = candidate
+                break
             except Exception as exc:
-                fallback_reason = "%s: %s" % (type(exc).__name__, exc)
+                reason = "%s (%s: %s)" % (candidate, type(exc).__name__, exc)
+                fallback_reason = reason if fallback_reason is None else (
+                    "%s; %s" % (fallback_reason, reason)
+                )
                 logging.warning(
-                    "%s exact current preview failed; using latent preview: %s",
+                    "%s current preview backend %s failed, trying the next: %s",
                     LOG,
-                    fallback_reason,
+                    candidate,
+                    exc,
                 )
 
-        if images is None:
-            images = self._latent_images(video)
+        if frames_u8 is None:
+            frames_u8 = _images_to_u8(self._latent_images(video))
+            mode = "latent"
 
-        # The VAE path decodes real consecutive frames, so it plays at the
-        # production rate. A latent image covers LATENT_FRAME_STRIDE frames and
-        # has to be held that much longer, or the pane runs at 4x speed.
+        # TAEH3 and the VAE both emit real consecutive frames at the run's rate.
+        # A latent image covers LATENT_FRAME_STRIDE frames and has to be held
+        # that much longer, or the pane runs at 4x speed.
         preview_fps = (
             self.fps
-            if mode == "vae"
+            if mode in (DECODER_TAEH3, DECODER_VAE)
             else max(1, round(self.fps / LATENT_FRAME_STRIDE))
         )
-        path = os.path.join(self.temp_root, "current.gif")
-        self._write_animation(path, images, fps=preview_fps)
+        path, fmt = self._write_current(frames_u8, preview_fps)
         fields = {
             "chunk_index": int(chunk_index),
             "step": int(step),
             "total_steps": int(total_steps),
-            "frames": len(images),
+            "frames": int(frames_u8.shape[0]),
             "mode": mode,
+            "format": fmt,
             "preview_fps": int(preview_fps),
             "asset": _asset_payload(path, "temp"),
         }
         if fallback_reason:
             fields["fallback_reason"] = fallback_reason[:500]
         self._announce("current_chunk", **fields)
-        del images, video
+        del frames_u8, video
         gc.collect()
 
-    def _exact_vae_images(self, video):
-        """Decode the first five H3 temporal positions to at most 17 frames.
+    def _taeh3_backend(self):
+        # Tests and older callers may build a publisher without __init__.
+        return getattr(self, "taeh3", None)
 
-        Five is the free tier, not a display preference. The VAE decodes a whole
-        1+4*4 group at once, so one frame and seventeen frames cost the same
-        wall-clock; a sixth latent position starts a second group and doubles
-        the decode inside the sampler callback. Keep this at five.
+    def _decoder_chain(self):
+        """Backends to try, in order, for the configured decoder setting."""
+        wanted = getattr(self.options, "decoder", DECODER_AUTO) or DECODER_AUTO
+        chain = []
+        if wanted in (DECODER_AUTO, DECODER_TAEH3) and self._taeh3_backend():
+            chain.append((DECODER_TAEH3, self._taeh3_frames))
+        if wanted in (DECODER_AUTO, DECODER_VAE) and self.video_vae is not None:
+            chain.append((DECODER_VAE, self._exact_vae_frames))
+        return chain
+
+    def _taeh3_frames(self, video):
+        """Decode the whole chunk with TAEH3, resized for the pane.
+
+        A chunk shorter than one group previews as its first frame only; see
+        ``_short_chunk``. Asking TAEH3 for one frame also costs one latent
+        position instead of the whole chunk.
+
+        ``process_latent_out`` is deliberately not applied: TAEHV is trained on
+        raw diffusion latents and ``MiniMaxH3Video.scale_factor`` is 1.0, so it
+        would be the identity anyway.
         """
-        latent_t = min(5, int(video.shape[2]))
+        limit = 1 if _short_chunk(video) else max(0, int(self.options.current_frames))
+        frames_u8 = self._taeh3_backend().frames(video, limit=limit)
+        if int(frames_u8.shape[0]) == 0:
+            raise ValueError("TAEH3 decoded no frames")
+        return _resize_frames_u8(frames_u8, self.options.width)
+
+    def _write_current(self, frames_u8, fps):
+        """Write the current-chunk asset, preferring MP4.
+
+        MP4 is not a nicety here. Pillow needs ~9 s to palettize a 105-frame GIF
+        and ffmpeg needs ~0.08 s for the same frames at a third of the size, so
+        showing a whole chunk every few steps is only affordable as video. GIF
+        stays as the fallback for when ffmpeg cannot be resolved.
+
+        A single frame goes out as a GIF regardless: a one-frame MP4 has no real
+        duration and players disagree about whether to show it at all, whereas an
+        <img> displays a still exactly as intended.
+        """
+        if int(frames_u8.shape[0]) == 1:
+            return self._write_current_still(frames_u8, fps)
+        try:
+            path = os.path.join(self.temp_root, "current_%06d.mp4" % (self.revision + 1))
+            writer = FFmpegVideoWriter(
+                path,
+                width=int(frames_u8.shape[2]),
+                height=int(frames_u8.shape[1]),
+                fps=max(1, int(fps)),
+                ffmpeg_location=self.ffmpeg_location,
+                crf=28,
+                preset="ultrafast",
+            ).open()
+            try:
+                writer.write(frames_u8)
+            finally:
+                writer.close(commit=True)
+        except Exception as exc:
+            logging.warning(
+                "%s current preview MP4 failed, writing a GIF instead: %s", LOG, exc
+            )
+            from PIL import Image
+
+            images = [
+                Image.fromarray(frame.numpy(), "RGB") for frame in frames_u8
+            ]
+            path = os.path.join(self.temp_root, "current.gif")
+            self._write_animation(path, images, fps=fps)
+            return path, "gif"
+
+        # The browser may still be streaming the previous file, and on Windows
+        # overwriting a file open for reading fails, so each revision is a new
+        # name and the old one is dropped afterwards.
+        previous = getattr(self, "current_path", None)
+        self.current_path = path
+        if previous and previous != path:
+            try:
+                os.remove(previous)
+            except OSError:
+                pass
+        return path, "mp4"
+
+    def _write_current_still(self, frames_u8, fps):
+        """Write a one-frame preview as a GIF so the pane shows it as a still."""
+        from PIL import Image
+
+        path = os.path.join(self.temp_root, "current.gif")
+        self._write_animation(
+            path, [Image.fromarray(frames_u8[0].numpy(), "RGB")], fps=fps
+        )
+        return path, "gif"
+
+    def _exact_vae_frames(self, video):
+        """Decode one whole H3 group: five temporal positions, 17 frames.
+
+        There is deliberately no frame count to choose here. The VAE decodes a
+        whole 1+4*4 group atomically, so one frame and seventeen frames cost the
+        same wall-clock, and a sixth latent position starts a second group and
+        doubles the decode inside the sampler callback. Seventeen is therefore
+        the only figure that makes sense; ``current_frames`` is a TAEH3 setting
+        and is ignored on this path.
+
+        The one exception is a chunk shorter than a whole group, which the model
+        renders as one real frame plus corrupted copies. That previews as the
+        first frame alone; see ``_short_chunk``.
+        """
+        latent_t = min(GROUP_LATENTS, int(video.shape[2]))
         preview_latent = video[:, :, :latent_t].detach().to(torch.float32)
         if self.latent_process_out is not None:
             preview_latent = self.latent_process_out(preview_latent)
         pixels = runner.decode_chunk(self.video_vae, preview_latent).to(
             "cpu", torch.float32
         )
-        requested = max(1, int(self.options.current_frames))
-        pixels = pixels[:requested]
         frames_u8 = (pixels.clamp(0, 1) * 255.0 + 0.5).to(torch.uint8)
-        frames_u8 = _resize_frames_u8(frames_u8, self.options.width)
-        from PIL import Image
-
-        images = [
-            Image.fromarray(frame.numpy(), "RGB")
-            for frame in frames_u8
-        ]
-        del preview_latent, pixels, frames_u8
-        if not images:
+        del preview_latent, pixels
+        if int(frames_u8.shape[0]) == 0:
             raise ValueError("preview VAE decoded no frames")
-        return images
+        if _short_chunk(video):
+            frames_u8 = frames_u8[:1]
+        return _resize_frames_u8(frames_u8, self.options.width)
 
     def _latent_images(self, video):
-        """Render up to five temporal positions with Comfy's latent previewer."""
-        count = min(
-            max(1, int(self.options.current_frames)),
-            5,
-            int(video.shape[2]),
-        )
+        """Render up to five temporal positions with Comfy's latent previewer.
+
+        Like the VAE path this takes no frame count: one image per latent
+        position is all this previewer can express, and five is the whole group.
+        A short chunk shows only its first position, for the same reason the
+        decoded paths do; see ``_short_chunk``.
+        """
+        count = 1 if _short_chunk(video) else min(GROUP_LATENTS, int(video.shape[2]))
         images = []
         preview_error = None
         if self.latent_previewer is not None:
@@ -915,6 +1115,8 @@ def _emit_chunk_with_preview(
 ):
     geometry = self.geometry
     pixels = runner.decode_chunk(video_vae, latent).to("cpu", torch.float32)
+    # Before any trimming: the assembled output never contains the overlap.
+    diagnostics.emit_video(self, index, pixels)
     remaining = self.target_frames - written
     if remaining <= 0:
         return 0

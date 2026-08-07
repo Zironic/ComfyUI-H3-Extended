@@ -5,6 +5,7 @@ from __future__ import annotations
 import unittest
 
 from chunked_ref2v.audio_boundary_profile import (
+    legal_reference_tail_frames,
     audio_aligned_chunk_frames,
     profile_audio_boundaries_are_exact,
     resolve_audio_boundary_profile,
@@ -27,6 +28,16 @@ class AudioBoundaryProfileTests(unittest.TestCase):
         self.assertTrue(profile_audio_boundaries_are_exact(141, 21))
         self.assertFalse(profile_audio_boundaries_are_exact(90, 17))
         self.assertFalse(profile_audio_boundaries_are_exact(73, 22))
+
+    def test_legal_reference_tail_frames(self):
+        self.assertEqual(
+            legal_reference_tail_frames(90),
+            [9, 21, 30, 39, 51, 60, 72, 81],
+        )
+        self.assertEqual(
+            legal_reference_tail_frames(141),
+            [9, 21, 30, 39, 51, 60, 72, 81, 90, 102, 111, 123, 132],
+        )
 
     def test_default_90_4_profile_snaps_to_90_9(self):
         chunk, overlap, note = resolve_audio_boundary_profile(90, 4, True)

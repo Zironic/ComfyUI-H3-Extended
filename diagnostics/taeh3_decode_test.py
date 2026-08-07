@@ -23,9 +23,10 @@ layers, which is also what makes the spatial arithmetic work out: three 2x
 upsamples times a 2x pixel-shuffle is 16x, matching H3's
 ``spacial_downscale_ratio == 16``. TAEH3 decodes at *full* resolution, not half.
 
-Temporally the stock defaults are already right - ``t_upscale == 4`` matches
-``temporal_downscale_ratio == 4``, and ``frames_to_trim == 3`` turns 5 latent
-positions into 17 frames, the same 17 the full VAE emits for one decode group.
+Temporally the two disagree. TAEHV is a fixed **4x** upscaler, so ``L`` latents
+give ``4L - 3`` frames, but the real H3 VAE is **17k+5 frames <-> 5k+2 latents**
+(see ``comfy/sd.py``), i.e. 3.4 frames per latent. They coincide only at
+``L == 2``. Frame counts are reported natively here and never silently matched.
 
 No latent scaling is applied anywhere. TAEHV is trained directly on diffusion
 latents, and ``MiniMaxH3Video.scale_factor`` is 1.0 regardless.
@@ -43,168 +44,28 @@ import torch
 
 import comfy.model_management
 import comfy.utils
-from comfy.taesd.taehv import TAEHV, conv as taehv_conv
 
 from ..chunked_ref2v import ref_builder
 from ..chunked_ref2v.longform import runner
+from ..chunked_ref2v.longform.taeh3 import (
+    LATENT_CHANNELS,
+    WEIGHT_NAMES,
+    TAEH3Error,
+    load_taeh3,
+    resolve_taeh3_path,
+)
 from ..chunked_ref2v.longform.writer import FFmpegVideoWriter
 
 LOG = "[H3 Extended] taeh3 decode test"
 
-#: MiniMaxH3Video latents. Anything else is a different model and must not load.
-LATENT_CHANNELS = 24
-#: One decode group: ``1 + 4 * 4`` pixel frames behind 5 temporal latents.
-GROUP_FRAMES = 17
-GROUP_LATENTS = 5
-WEIGHT_NAMES = ("taeh3.safetensors", "taeh3.pth")
+#: The VAE's smallest useful group above the 5-frame minimum: ``17*1 + 5``
+#: frames behind ``5*1 + 2`` latents.
+GROUP_FRAMES = 22
+GROUP_LATENTS = 7
 
-
-class TAEH3TestError(RuntimeError):
-    pass
-
-
-# --------------------------------------------------------------------------
-# model loading
-# --------------------------------------------------------------------------
-
-
-def resolve_taeh3_path(explicit=None):
-    """Find the TAEH3 weights, preferring an explicit path."""
-    if explicit:
-        if os.path.isfile(explicit):
-            return explicit
-        found = None
-        try:
-            import folder_paths
-
-            found = folder_paths.get_full_path("vae_approx", explicit)
-        except Exception:
-            found = None
-        if found:
-            return found
-        raise TAEH3TestError("taeh3 weights not found at %r" % (explicit,))
-
-    import folder_paths
-
-    for name in WEIGHT_NAMES:
-        found = folder_paths.get_full_path("vae_approx", name)
-        if found:
-            return found
-    raise TAEH3TestError(
-        "no taeh3 weights in models/vae_approx (looked for %s); fetch "
-        "safetensors/taeh3.safetensors from github.com/madebyollin/taehv"
-        % ", ".join(WEIGHT_NAMES)
-    )
-
-
-def _repatch_patch_size(model, patch_size):
-    """Rebuild the two convs that depend on ``patch_size``.
-
-    ``TAEHV.__init__`` hard-codes which latent widths use pixel-shuffle, and 24
-    is not on that list. Only the first encoder conv and the last decoder conv
-    change shape, so replacing them in place is enough to make a strict load
-    succeed - every other layer is already correct.
-    """
-    pixels = 3 * patch_size ** 2
-    encoder_first = model.encoder[0]
-    decoder_last = model.decoder[-1]
-    model.encoder[0] = taehv_conv(pixels, encoder_first.out_channels)
-    model.decoder[-1] = taehv_conv(decoder_last.in_channels, pixels)
-    model.patch_size = patch_size
-    return model
-
-
-def load_taeh3(path=None, *, device=None, dtype=None, parallel=False):
-    """Load TAEH3 for H3 latents and return ``(model, metadata)``.
-
-    Fails loudly on any missing or unexpected key: a smoke test that silently
-    ran on a partly random decoder would answer the wrong question.
-    """
-    path = resolve_taeh3_path(path)
-    state = comfy.utils.load_torch_file(path, safe_load=True)
-
-    if "decoder.1.weight" not in state or "encoder.0.weight" not in state:
-        raise TAEH3TestError("%s is not a TAEHV checkpoint" % path)
-
-    latent_channels = int(state["decoder.1.weight"].shape[1])
-    if latent_channels != LATENT_CHANNELS:
-        raise TAEH3TestError(
-            "expected %d-channel H3 latents, weights are %d-channel"
-            % (LATENT_CHANNELS, latent_channels)
-        )
-    # The first encoder conv takes ``3 * patch_size**2`` pixel-shuffled channels,
-    # so the patch size is the square root of a third of its input width.
-    pixel_channels = int(state["encoder.0.weight"].shape[1])
-    patch_size = round((pixel_channels / 3) ** 0.5)
-    if patch_size < 1 or 3 * patch_size ** 2 != pixel_channels:
-        raise TAEH3TestError(
-            "encoder input %d channels is not 3 * patch^2" % pixel_channels
-        )
-
-    if device is None:
-        device = comfy.model_management.vae_device()
-    device = torch.device(device)
-    if dtype is None:
-        # The checkpoint ships fp16 and the decoder is 11 M params; keeping the
-        # native dtype avoids an upcast that buys a preview nothing.
-        weight_dtype = state["decoder.1.weight"].dtype
-        dtype = torch.float32 if device.type == "cpu" else weight_dtype
-
-    model = TAEHV(latent_channels=latent_channels, parallel=parallel)
-    if model.patch_size != patch_size:
-        logging.info(
-            "%s: rebuilding patch_size %d -> %d for %d-channel weights",
-            LOG,
-            model.patch_size,
-            patch_size,
-            latent_channels,
-        )
-        _repatch_patch_size(model, patch_size)
-
-    missing, unexpected = model.load_state_dict(state, strict=False)
-    if missing or unexpected:
-        raise TAEH3TestError(
-            "TAEH3 weights do not match the architecture: missing=%s unexpected=%s"
-            % (sorted(missing)[:10], sorted(unexpected)[:10])
-        )
-
-    model.eval()
-    model.show_progress_bar = False
-    model.to(device=device, dtype=dtype)
-
-    metadata = {
-        "path": path,
-        "weight_dtype": str(state["decoder.1.weight"].dtype),
-        "runtime_dtype": str(dtype),
-        "device": str(device),
-        "parameters": int(sum(p.numel() for p in model.parameters())),
-        "latent_channels": latent_channels,
-        "patch_size": patch_size,
-        "t_downscale": int(model.t_downscale),
-        "t_upscale": int(model.t_upscale),
-        "frames_to_trim": int(model.frames_to_trim),
-        "spatial_upscale": 8 * patch_size,
-        "parallel": bool(parallel),
-        "missing_keys": sorted(missing),
-        "unexpected_keys": sorted(unexpected),
-    }
-    logging.info(
-        "%s: loaded %s | %s weights -> %s on %s | %.2f M params | %d ch, patch %d, "
-        "t_up %d, trim %d, spatial %dx",
-        LOG,
-        os.path.basename(path),
-        metadata["weight_dtype"],
-        metadata["runtime_dtype"],
-        metadata["device"],
-        metadata["parameters"] / 1e6,
-        latent_channels,
-        patch_size,
-        metadata["t_upscale"],
-        metadata["frames_to_trim"],
-        metadata["spatial_upscale"],
-    )
-    del state
-    return model, metadata
+#: Loading lives in ``chunked_ref2v.longform.taeh3`` so the production preview
+#: backend and this diagnostic share one copy of the architecture repair.
+TAEH3TestError = TAEH3Error
 
 
 # --------------------------------------------------------------------------
@@ -266,17 +127,18 @@ def _tensor_stats(tensor):
 
 
 def _snap_encode_frames(count, requested):
-    """Largest ``1 + 4k`` frame count at or below both bounds.
+    """Largest ``17k + 5`` frame count at or below both bounds.
 
-    The H3 VAE consumes whole ``1 + 4k`` groups; 17 frames is ``1 + 4*4`` and
-    encodes to the 5 temporal latents this test is built around.
+    This is the VAE's real grid, not a guess: ``comfy/sd.py`` maps ``17k+5``
+    frames to ``5k+2`` latents, and the encoder snaps anything off it. Feeding
+    it 17 frames returns 2 latents and silently discards 12 frames.
     """
     limit = min(int(count), int(requested))
     if limit < 5:
         raise TAEH3TestError(
             "need at least 5 frames to exercise temporal decoding, got %d" % limit
         )
-    return ((limit - 1) // 4) * 4 + 1
+    return ((limit - 5) // 17) * 17 + 5
 
 
 def prepare_frames(frames, *, canvas=None, frame_count=GROUP_FRAMES):
@@ -438,6 +300,7 @@ def run_taeh3_decode_test(
     parallel=False,
     save_latent=True,
     ffmpeg_location=None,
+    device=None,
 ):
     """Encode once with the H3 VAE, decode with both decoders, save everything.
 
@@ -476,7 +339,9 @@ def run_taeh3_decode_test(
         os.path.join(output_dir, "source.mp4"), source_u8, fps, ffmpeg_location
     )
 
-    device = comfy.model_management.get_torch_device()
+    device = torch.device(
+        device if device is not None else comfy.model_management.get_torch_device()
+    )
 
     # --- encode exactly once ---------------------------------------------
     # Deliberately not latent_cache.encode: a cache hit would return the right
@@ -591,6 +456,7 @@ def run_taeh3_decode_test(
         )
         if sheet:
             sheets.append(sheet)
+            results["artifacts"]["contact_%s" % name] = sheet["path"]
     results["contact_sheets"] = sheets
 
     if results["full_vae"]["seconds"] > 0:

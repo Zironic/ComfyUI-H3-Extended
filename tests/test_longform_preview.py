@@ -45,10 +45,32 @@ class FakeLatentPreviewer:
         return Image.new("RGB", (32, 24), (value, 32, 64))
 
 
-def make_publisher(temp, *, video_vae=None, latent_previewer=None):
+class FakeTAEH3:
+    """Stands in for TAEH3: whole-chunk decode at the VAE's frame rate."""
+
+    def __init__(self, per_latent=22):
+        self.per_latent = per_latent
+        self.calls = []
+
+    def frames(self, latent, *, limit=0):
+        self.calls.append((int(latent.shape[2]), limit))
+        count = self.per_latent if limit <= 0 else min(self.per_latent, limit)
+        return torch.zeros(count, 24, 32, 3, dtype=torch.uint8)
+
+
+def make_publisher(
+    temp,
+    *,
+    video_vae=None,
+    latent_previewer=None,
+    taeh3=None,
+    decoder=preview.DECODER_AUTO,
+    current_frames=0,
+):
     publisher = object.__new__(preview.LongFormPreviewPublisher)
     publisher.node_id = "12"
     publisher.video_vae = video_vae
+    publisher.taeh3 = taeh3
     publisher.latent_previewer = latent_previewer
     publisher.latent_process_out = None
     publisher.root = temp
@@ -58,8 +80,9 @@ def make_publisher(temp, *, video_vae=None, latent_previewer=None):
         current_enabled=True,
         completed_enabled=True,
         every_steps=2,
-        current_frames=17,
+        current_frames=current_frames,
         width=128,
+        decoder=decoder,
     )
     publisher.revision = 0
     publisher.completed_frames = 0
@@ -208,7 +231,7 @@ class LongFormPreviewTests(unittest.TestCase):
                     denoised=nested,
                 )
 
-            self.assertEqual(events[0][1]["mode"], "vae")
+            self.assertEqual(events[0][1]["mode"], preview.DECODER_VAE)
             self.assertEqual(events[0][1]["frames"], 17)
 
     def test_failed_explicit_vae_falls_back_to_latent_preview(self):
@@ -319,7 +342,7 @@ class PreviewRateTests(unittest.TestCase):
             video_vae=FakeVAE(),
             latent_previewer=FakeLatentPreviewer(),
         )
-        self.assertEqual(fields["mode"], "vae")
+        self.assertEqual(fields["mode"], preview.DECODER_VAE)
         self.assertEqual(fields["preview_fps"], 24)
 
     def test_requested_rate_becomes_the_gif_frame_duration(self):
@@ -600,6 +623,160 @@ class CompletedStitchTests(unittest.TestCase):
         self.assertFalse(fields["stitched"])
         self.assertEqual(fields["asset"], fields["segment_asset"])
         self.assertIn("concat demuxer refused", fields["stitch_error"])
+
+
+class TAEH3BackendTests(unittest.TestCase):
+    """TAEH3 is the default current-chunk backend."""
+
+    def publish(self, publisher):
+        events = []
+        nested = FakeNested(torch.zeros(1, 24, 27, 8, 14))
+        with mock.patch.object(preview, "_send_event", lambda p: events.append(p)), \
+                mock.patch.object(
+                    preview, "_asset_payload",
+                    lambda path, kind: {"filename": os.path.basename(path)},
+                ):
+            publisher.publish_current_chunk(
+                chunk_index=0, step=2, total_steps=20, denoised=nested,
+            )
+        return events[0]
+
+    def test_taeh3_wins_over_a_connected_preview_vae(self):
+        with tempfile.TemporaryDirectory() as temp:
+            vae = FakeVAE()
+            taeh3 = FakeTAEH3()
+            fields = self.publish(
+                make_publisher(temp, video_vae=vae, taeh3=taeh3)
+            )
+        self.assertEqual(fields["mode"], preview.DECODER_TAEH3)
+        # The whole chunk, and the VAE was never asked.
+        self.assertEqual(fields["frames"], 22)
+        self.assertEqual(taeh3.calls, [(27, 0)])
+
+    def test_zero_frames_requests_the_whole_chunk(self):
+        with tempfile.TemporaryDirectory() as temp:
+            taeh3 = FakeTAEH3()
+            make_and_publish = make_publisher(
+                temp, taeh3=taeh3, current_frames=0
+            )
+            self.publish(make_and_publish)
+        self.assertEqual(taeh3.calls[0][1], 0)
+
+    def test_frame_limit_reaches_taeh3_only(self):
+        with tempfile.TemporaryDirectory() as temp:
+            taeh3 = FakeTAEH3()
+            fields = self.publish(
+                make_publisher(temp, taeh3=taeh3, current_frames=17)
+            )
+        self.assertEqual(taeh3.calls[0][1], 17)
+        self.assertEqual(fields["frames"], 17)
+
+    def test_vae_ignores_the_frame_limit_and_decodes_a_whole_group(self):
+        """17 is the only count that makes sense: the group is atomic."""
+        with tempfile.TemporaryDirectory() as temp:
+            fields = self.publish(
+                make_publisher(
+                    temp,
+                    video_vae=FakeVAE(),
+                    decoder=preview.DECODER_VAE,
+                    current_frames=3,
+                )
+            )
+        self.assertEqual(fields["mode"], preview.DECODER_VAE)
+        self.assertEqual(fields["frames"], 17)
+
+    def test_failed_taeh3_falls_back_to_the_connected_vae(self):
+        class BrokenTAEH3:
+            def frames(self, latent, *, limit=0):
+                raise RuntimeError("taeh3 exploded")
+
+        with tempfile.TemporaryDirectory() as temp:
+            fields = self.publish(
+                make_publisher(temp, video_vae=FakeVAE(), taeh3=BrokenTAEH3())
+            )
+        self.assertEqual(fields["mode"], preview.DECODER_VAE)
+        self.assertIn("taeh3 exploded", fields["fallback_reason"])
+
+    def test_missing_taeh3_falls_back_to_the_latent_preview(self):
+        with tempfile.TemporaryDirectory() as temp:
+            fields = self.publish(
+                make_publisher(temp, taeh3=None,
+                               latent_previewer=FakeLatentPreviewer())
+            )
+        self.assertEqual(fields["mode"], preview.DECODER_LATENT)
+
+    def test_taeh3_preview_plays_at_the_production_rate(self):
+        with tempfile.TemporaryDirectory() as temp:
+            fields = self.publish(make_publisher(temp, taeh3=FakeTAEH3()))
+        self.assertEqual(fields["preview_fps"], 24)
+
+
+class ShortChunkTests(unittest.TestCase):
+    """Below one whole group the model is not a video model.
+
+    Asked for fewer than 17 frames it renders one real frame and then up to
+    fifteen corrupted restatements of it, so only frame one is worth showing.
+    """
+
+    def publish(self, publisher, latent_t):
+        events = []
+        nested = FakeNested(torch.zeros(1, 24, latent_t, 8, 14))
+        with mock.patch.object(preview, "_send_event", lambda p: events.append(p)), \
+                mock.patch.object(
+                    preview, "_asset_payload",
+                    lambda path, kind: {"filename": os.path.basename(path)},
+                ):
+            publisher.publish_current_chunk(
+                chunk_index=0, step=2, total_steps=20, denoised=nested,
+            )
+        return events[0]
+
+    def test_short_chunk_previews_one_taeh3_frame(self):
+        with tempfile.TemporaryDirectory() as temp:
+            taeh3 = FakeTAEH3()
+            fields = self.publish(make_publisher(temp, taeh3=taeh3), latent_t=2)
+        self.assertEqual(fields["frames"], 1)
+        # Asked for one frame, so TAEH3 decodes one latent, not the chunk.
+        self.assertEqual(taeh3.calls[0][1], 1)
+
+    def test_short_chunk_previews_one_vae_frame(self):
+        with tempfile.TemporaryDirectory() as temp:
+            fields = self.publish(
+                make_publisher(
+                    temp, video_vae=FakeVAE(), decoder=preview.DECODER_VAE
+                ),
+                latent_t=2,
+            )
+        self.assertEqual(fields["mode"], preview.DECODER_VAE)
+        self.assertEqual(fields["frames"], 1)
+
+    def test_short_chunk_previews_one_latent_position(self):
+        with tempfile.TemporaryDirectory() as temp:
+            fields = self.publish(
+                make_publisher(
+                    temp,
+                    latent_previewer=FakeLatentPreviewer(),
+                    decoder=preview.DECODER_LATENT,
+                ),
+                latent_t=3,
+            )
+        self.assertEqual(fields["frames"], 1)
+
+    def test_a_single_frame_is_published_as_a_still(self):
+        """A one-frame MP4 has no duration; players disagree about it."""
+        with tempfile.TemporaryDirectory() as temp:
+            fields = self.publish(
+                make_publisher(temp, taeh3=FakeTAEH3()), latent_t=2
+            )
+        self.assertEqual(fields["format"], "gif")
+
+    def test_a_whole_group_still_previews_every_frame(self):
+        with tempfile.TemporaryDirectory() as temp:
+            taeh3 = FakeTAEH3()
+            fields = self.publish(make_publisher(temp, taeh3=taeh3), latent_t=5)
+        self.assertEqual(fields["frames"], 22)
+        self.assertEqual(taeh3.calls[0][1], 0)
+        self.assertEqual(fields["format"], "mp4")
 
 
 if __name__ == "__main__":

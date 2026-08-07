@@ -24,7 +24,7 @@ from ..geometry import (
 )
 from ..layout_ops import TargetAlignedCondition
 from ..model_patch import patch_target_conditions
-from . import preview, reference_runner
+from . import diagnostics, preview, reference_runner
 from .audio_conditions import (
     TargetAlignedAudioCondition,
     patch_target_audio_conditions,
@@ -273,7 +273,10 @@ def _sample_and_write_av(
     ffmpeg_location,
 ):
     audio_vae = _ACTIVE_AUDIO_VAE.get()
-    if output_video and audio_vae is None:
+    # Diagnostics need the generated audio whether or not a video was asked for.
+    dump_diagnostics = diagnostics.enabled(self)
+    need_audio = output_video or dump_diagnostics
+    if need_audio and audio_vae is None:
         raise RuntimeError("LongFormReferenceVideo audio VAE is not active")
 
     out_dir = os.path.join(self.root, "frames")
@@ -341,12 +344,33 @@ def _sample_and_write_av(
             out_dir=out_dir,
             pbar=pbar,
         )
+
+        # One decode serves both the diagnostic dump and the assembly below.
+        waveform = sample_rate = None
+        if need_audio:
+            waveform = decode_audio_chunk(audio_vae, audio_latent)
+            sample_rate = audio_sample_rate(audio_vae)
+
+        if dump_diagnostics:
+            samples = diagnostics.dump_chunk_audio(
+                self, index, waveform, sample_rate
+            )
+            diagnostics.dump_chunk_metadata(
+                self,
+                index,
+                global_start_frame=state["frames"],
+                committed_frames=max(take_frames, 0),
+                video_frames=diagnostics.video_frames_dumped(self, index),
+                video_latent=video_latent,
+                audio_latent=audio_latent,
+                audio_samples=samples,
+                audio_sample_rate=sample_rate,
+            )
+
         if take_frames <= 0:
             return
 
         if output_video:
-            waveform = decode_audio_chunk(audio_vae, audio_latent)
-            sample_rate = audio_sample_rate(audio_vae)
             channels = int(waveform.shape[1])
             if state["audio_sample_rate"] is None:
                 state["audio_sample_rate"] = sample_rate

@@ -10,12 +10,15 @@ from chunked_ref2v.longform.av_continuation_nodes import (
     MiniMaxH3LongFormAVContinuation,
     _chunk_count,
     _dynamic_av_reference,
+    _slice_dynamic_av_reference,
+    _resolve_reference_frames,
     continuation_prompt,
 )
 from chunked_ref2v.longform.nplusone_chunk_prompt_timeline import (
     build_nplusone_chunk_prompt_plan,
     prompts_for_av_continuation_plan,
 )
+from chunked_ref2v.geometry import HarnessGeometry
 
 
 class LongFormAVContinuationTests(unittest.TestCase):
@@ -48,6 +51,50 @@ class LongFormAVContinuationTests(unittest.TestCase):
         self.assertEqual(block["latent_h"], 4)
         self.assertEqual(block["latent_w"], 6)
         self.assertEqual(block["ref_audio_t"], 235)
+
+    def test_dynamic_reference_tail_is_sliced_to_reference_frames(self):
+        geometry = HarnessGeometry(chunk_frames=141, overlap_frames=81).validate()
+        _, overlap_count = geometry.overlap_slice()
+        pixels = torch.arange(141 * 64 * 96 * 3, dtype=torch.float32).reshape(
+            141, 64, 96, 3,
+        )
+        video = torch.arange(
+            1 * 24 * 42 * 4 * 6,
+            dtype=torch.float32,
+        ).reshape(1, 24, 42, 4, 6)
+        audio = torch.arange(1 * 32 * 2 * 235, dtype=torch.float32).reshape(
+            1, 32, 2, 235
+        )
+
+        sliced_pixels, sliced_video, sliced_audio = _slice_dynamic_av_reference(
+            pixels,
+            video,
+            audio,
+            reference_frames=81,
+            geometry=geometry,
+        )
+        self.assertEqual(sliced_pixels.shape, (81, 64, 96, 3))
+        self.assertTrue(torch.equal(sliced_pixels, pixels[-81:]))
+        self.assertEqual(sliced_video.shape, (1, 24, overlap_count, 4, 6))
+        self.assertEqual(sliced_audio.shape, (1, 32, 2, 135))
+        self.assertEqual(int(sliced_video.shape[2]), int(overlap_count))
+
+    def test_reference_frames_are_snapped_to_legal_values(self):
+        self.assertEqual(_resolve_reference_frames(141, 80), 81)
+
+    def test_reference_frames_cannot_exceed_previous_chunk(self):
+        geometry = HarnessGeometry(chunk_frames=141, overlap_frames=81).validate()
+        pixels = torch.zeros(141, 64, 96, 3)
+        video = torch.zeros(1, 24, 42, 4, 6)
+        audio = torch.zeros(1, 32, 2, 235)
+        with self.assertRaises(ValueError):
+            _slice_dynamic_av_reference(
+                pixels,
+                video,
+                audio,
+                reference_frames=200,
+                geometry=geometry,
+            )
 
     def test_dynamic_reference_requires_complete_av_source(self):
         pixels = torch.zeros(141, 64, 96, 3)

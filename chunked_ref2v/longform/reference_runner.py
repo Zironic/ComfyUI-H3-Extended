@@ -280,7 +280,8 @@ def run(*, chunk_frames, overlap_frames, chunk_count, target_frames, model,
         canvas, root, ref_images=None, ref_videos=None,
         ref_video_audios=None, ref_audios=None, ref_image_size="native",
         cond_cache="auto", save_frames=False, output_video=True,
-        ffmpeg_location=None, runtime_config=None):
+        ffmpeg_location=None, runtime_config=None,
+        diagnostic_dump_chunks=False):
     geometry = HarnessGeometry(
         chunk_frames=chunk_frames, overlap_frames=overlap_frames).validate()
     if carry not in CARRY_MODES:
@@ -316,6 +317,10 @@ def run(*, chunk_frames, overlap_frames, chunk_count, target_frames, model,
     run_obj = LongFormReferenceRun(
         root, geometry, canvas, carry=carry, seed=seed,
         target_frames=target_frames, manifest=manifest)
+    # Deliberately not part of `identity`: dumping changes nothing about what is
+    # generated, so it can be switched on against an existing run directory and
+    # replay the stored chunk latents instead of resampling them.
+    run_obj.diagnostic_dump_chunks = bool(diagnostic_dump_chunks)
 
     with torch.inference_mode():
         conditioning, notes = run_obj.prepare_references(

@@ -22,6 +22,7 @@ except ImportError:  # pragma: no cover
     from layout_ops import TargetAlignedCondition
     from model_patch import patch_target_conditions
 
+from . import diagnostics
 from .chunk_stream import iter_source_chunks, actual_frames_for_chunk
 from .manifest import (
     RunManifest,
@@ -152,6 +153,8 @@ class LongFormRun:
         self.events = os.path.join(root, "events.jsonl")
         self.static_blocks = []
         self.static_items = []
+        # Set by the caller; see longform/diagnostics.py.
+        self.diagnostic_dump_chunks = False
 
     def path(self, kind, index, suffix=".safetensors"):
         return os.path.join(self.root, kind, "chunk_%06d%s" % (index, suffix))
@@ -377,6 +380,8 @@ class LongFormRun:
         """
         geometry = self.geometry
         pixels = decode_chunk(video_vae, latent).to("cpu", torch.float32)
+        # Before any trimming: the assembled output never contains the overlap.
+        diagnostics.emit_video(self, index, pixels)
         remaining = self.target_frames - written
         if remaining <= 0:
             return 0
