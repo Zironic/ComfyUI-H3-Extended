@@ -17,6 +17,7 @@ from .chunked_ref2v.longform.chunk_prompt_timeline import (
 )
 from .chunked_ref2v.longform import (
     completed_preview_runtime,
+    opening_picture_runtime,
     v2v_audio_runtime,
 )
 from .chunked_ref2v.nodes import MiniMaxH3HarnessExtension
@@ -42,6 +43,12 @@ v2v_audio_runtime.install()
 # Keep finalized MP4 segments as the primary completed-output preview, but make
 # that channel failure-safe: GIF fallback first, explicit browser error second.
 completed_preview_runtime.install()
+
+# Optional long-form reference continuity: retain the decoded frame that maps
+# to the next chunk's frame zero and inject it as the next <Picture N> reference
+# for a just-in-time Qwen conditioning pass. This installs after the prompt,
+# audio-reference, and preview patches so it composes with all three.
+opening_picture_runtime.install()
 
 # Install the diagnostic wrapper at `cond_cache.encode` itself. Rebinding only
 # `nodes_minimax_h3.encode_conditioning` covered the (Zi) nodes but silently
