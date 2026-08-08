@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import os
 
+import numpy as np
+
 from . import latent_dynamics
 
 
@@ -63,6 +65,7 @@ def summarize(records):
     for key, rows in by_budget.items():
         overall[key] = {
             "budget": rows[0]["budget"],
+            "execution_geometry": rows[0].get("execution_geometry", "logical"),
             "video_block_density": rows[0]["video_block_density"],
             "routed_mass_min": min(r["routed_mass_min"] for r in rows),
             "routed_mass_mean_min": min(r["routed_mass_mean"] for r in rows),
@@ -83,6 +86,20 @@ def summarize(records):
                 r["oracle_output_rel_l2_max_head"] for r in rows
             ),
         }
+        if overall[key]["execution_geometry"] == "sage_sparse":
+            overall[key].update(
+                {
+                    "executable_effective_token_density_max": max(
+                        r["executable_effective_token_density_max"] for r in rows
+                    ),
+                    "executable_sparse_output_rel_l2_mean_head_max": max(
+                        r["executable_sparse_output_rel_l2_mean_head"] for r in rows
+                    ),
+                    "executable_sparse_output_rel_l2_max_head": max(
+                        r["executable_sparse_output_rel_l2_max_head"] for r in rows
+                    ),
+                }
+            )
 
     by_layer = {}
     for (layer, key), rows in by_layer_budget.items():
@@ -90,6 +107,7 @@ def summarize(records):
         oracle_maxima = _head_maxima(rows, "oracle_head_rel_l2")
         by_layer.setdefault(str(layer), {})[key] = {
             "budget": rows[0]["budget"],
+            "execution_geometry": rows[0].get("execution_geometry", "logical"),
             "sparse_output_rel_l2_mean_head_max": max(
                 r["sparse_output_rel_l2_mean_head"] for r in rows
             ),
@@ -101,6 +119,22 @@ def summarize(records):
             "worst_heads": _worst_head_list(maxima),
             "oracle_worst_heads": _worst_head_list(oracle_maxima),
         }
+        if by_layer[str(layer)][key]["execution_geometry"] == "sage_sparse":
+            executable_maxima = _head_maxima(rows, "executable_head_rel_l2")
+            by_layer[str(layer)][key].update(
+                {
+                    "executable_effective_token_density_max": max(
+                        r["executable_effective_token_density_max"] for r in rows
+                    ),
+                    "executable_sparse_output_rel_l2_max_head": max(
+                        executable_maxima, default=0.0
+                    ),
+                    "executable_heads_rel_l2_gt_1pct": _threshold_list(executable_maxima, 0.01),
+                    "executable_heads_rel_l2_gt_2pct": _threshold_list(executable_maxima, 0.02),
+                    "executable_heads_rel_l2_gt_5pct": _threshold_list(executable_maxima, 0.05),
+                    "executable_worst_heads": _worst_head_list(executable_maxima),
+                }
+            )
 
     return {"overall": overall, "by_layer": by_layer}
 
@@ -129,6 +163,8 @@ def _render_dynamics(run, dynamics_summary):
             getattr(run, "anchor_frames", []) or "none"
         ),
     ]
+    if not getattr(run, "capture_attention", True):
+        lines.append("  attention: OFF (routing capture and interpretation disabled)")
     by_step = (dynamics_summary or {}).get("by_step", {})
     for dyn in dynamics:
         step = int(dyn["step"])
@@ -158,6 +194,22 @@ def _render_dynamics(run, dynamics_summary):
                     _corr(summary.get("anchor_distance_vs_prediction_update_pearson")),
                 )
             )
+        pred = dyn.get("predictability") or {}
+        rows = pred.get("rows", [])
+        if rows:
+            lines.append("           ACTIVE-SET PREDICTABILITY (x0) from step %s to %s" %
+                         (pred.get("from_step"), pred.get("to_step")))
+            for threshold in (0.02, 0.05):
+                selected = [r for r in rows if r["threshold"] == threshold and
+                            r["profile"] in (("exact", "spatial_1") if threshold == 0.02 else
+                                              ("exact", "spatial_1", "spatiotemporal_1"))]
+                for row in selected:
+                    lines.append("             %s %-16s coverage %5s | energy %5s | miss %5s | freeze rel %5s" %
+                                 (row["threshold_label"], row["profile"],
+                                  _pct(row["predicted_active_fraction"]).strip(),
+                                  _pct(row["captured_energy_fraction"]).strip(),
+                                  _pct(row["missed_energy_fraction"]).strip(),
+                                  _pct(row["freeze_surrogate_relative_l2"]).strip()))
 
     correlations = (dynamics_summary or {}).get("attention_correlations", {})
     if correlations:
@@ -189,34 +241,53 @@ def _render_dynamics(run, dynamics_summary):
 
 
 def render(run, summary, dynamics_summary=None):
+    attention_enabled = bool(getattr(run, "capture_attention", True))
     lines = [
-        "MiniMax H3 3D MoBA-style routing probe - %s" % run.tag,
+        ("MiniMax H3 3D MoBA-style routing probe - %s" if attention_enabled
+         else "MiniMax H3 latent-dynamics probe - %s") % run.tag,
         "=" * 92,
         "layout:       %s" % (run.layout.describe() if run.layout else "n/a"),
-        "layers:       %s of %s" % (sorted(run.layers), run.notes.get("num_layers")),
-        "steps:        %s of %s" % (sorted(run.steps), run.notes.get("total_steps")),
-        "3D block:     %dx%dx%d (latent-time x patch-height x patch-width)" % (
-            run.block_t,
-            run.block_h,
-            run.block_w,
+        "attention:    %s" % (
+            "OFF" if not attention_enabled
+            else ("OFF (no records)" if not run.records else "on")
         ),
-        "budgets:      %s" % ", ".join(_pct(x).strip() for x in run.budgets),
-        "query blocks: %d" % len(run.records),
-        "routing:      per query token and per head",
         "latent dyn:   %s" % (
             "sampler x/x0 per-step" if getattr(run, "capture_latent_dynamics", False) else "off"
         ),
         "",
-        "Interpretation: non-video KV tokens are always retained. Each query token",
-        "independently selects target-video 3D blocks using dot products against",
-        "mean-pooled block keys. 'Routed mass' is the original dense-softmax mass",
-        "inside that mask. 'Sparse output error' is more important: it compares the",
-        "dense attention output with the exact masked-and-renormalized output using V.",
-        "The oracle uses the same per-query block budget but selects blocks by their",
-        "true dense attention mass. This remains a probe of MiniMax's public description,",
-        "not a reproduction of their unreleased train-aware implementation.",
-        "",
     ]
+    if attention_enabled:
+        lines[3:3] = [
+            "layers:       %s of %s" % (sorted(run.layers), run.notes.get("num_layers")),
+            "steps:        %s of %s" % (sorted(run.steps), run.notes.get("total_steps")),
+            "3D block:     %dx%dx%d (latent-time x patch-height x patch-width)" % (
+                run.block_t, run.block_h, run.block_w
+            ),
+            "budgets:      %s" % ", ".join(_pct(x).strip() for x in run.budgets),
+            "query blocks: %d" % len(run.records),
+            "routing:      per query token and per head",
+            "execution:    %s" % (
+                getattr(run, "execution_geometry", "logical")
+                + (
+                    " (global Q/KV tiles q=%d kv=%d)" % (
+                        int(getattr(run, "sage_q_tile", 128)),
+                        int(getattr(run, "sage_kv_tile", 64)),
+                    )
+                    if getattr(run, "execution_geometry", "logical") == "sage_sparse"
+                    else " (per-token logical masks)"
+                )
+            ),
+        ]
+        lines.extend([
+            "Interpretation: non-video KV tokens are always retained. Each query token",
+            "independently selects target-video 3D blocks using dot products against",
+            "mean-pooled block keys. 'Routed mass' is the original dense-softmax mass",
+            "inside that logical mask. 'Logical sparse output error' compares the",
+            "dense attention output with the exact masked-and-renormalized output using V.",
+            "When sage_sparse is selected, executable metrics are tile-coarsened and",
+            "reported separately; logical metrics are never hardware estimates.",
+            "",
+        ])
 
     overall = summary.get("overall", {}) if summary else {}
     if overall:
@@ -227,9 +298,10 @@ def render(run, summary, dynamics_summary=None):
         for key in sorted(overall, key=lambda x: overall[x]["budget"]):
             s = overall[key]
             lines.append(
-                "  video blocks %-5s | effective KV <= %-5s | "
+                "  %s video blocks %-5s | logical effective KV <= %-5s | "
                 "sparse output rel-L2: record mean-head <= %-6s worst head %-6s | "
                 "oracle worst %-6s" % (
+                    s.get("execution_geometry", "logical"),
                     _pct(s["video_block_density"]).strip(),
                     _pct(s["effective_token_density_max"]).strip(),
                     _pct(s["sparse_output_rel_l2_mean_head_max"]).strip(),
@@ -246,6 +318,15 @@ def render(run, summary, dynamics_summary=None):
                     _pct(s["oracle_overlap_min"]).strip(),
                 )
             )
+            if s.get("execution_geometry") == "sage_sparse":
+                lines.append(
+                    "                    executable effective KV <= %-5s | "
+                    "executable sparse output mean-head <= %-6s worst head %-6s" % (
+                        _pct(s["executable_effective_token_density_max"]).strip(),
+                        _pct(s["executable_sparse_output_rel_l2_mean_head_max"]).strip(),
+                        _pct(s["executable_sparse_output_rel_l2_max_head"]).strip(),
+                    )
+                )
         lines.append("")
 
     by_layer = summary.get("by_layer", {}) if summary else {}
@@ -264,9 +345,10 @@ def render(run, summary, dynamics_summary=None):
                     for item in s["worst_heads"][:3]
                 )
                 lines.append(
-                    "    %-5s blocks: worst rel-L2 %-6s | oracle %-6s | "
+                    "    %-5s blocks (%s): logical worst rel-L2 %-6s | oracle %-6s | "
                     "heads >1%%/%s >2%%/%s >5%%/%s | %s" % (
                         _pct(s["budget"]).strip(),
+                        s.get("execution_geometry", "logical"),
                         _pct(s["sparse_output_rel_l2_max_head"]).strip(),
                         _pct(s["oracle_output_rel_l2_max_head"]).strip(),
                         len(s["heads_rel_l2_gt_1pct"]),
@@ -279,7 +361,8 @@ def render(run, summary, dynamics_summary=None):
 
     lines.extend(_render_dynamics(run, dynamics_summary or {}))
 
-    lines.extend(["PER QUERY BLOCK", "-" * 92])
+    if run.records:
+        lines.extend(["PER QUERY BLOCK", "-" * 92])
     dyn_regions = _dynamics_region_map(run)
     for rec in run.records:
         frame = rec.get("frame")
@@ -298,6 +381,16 @@ def render(run, summary, dynamics_summary=None):
                 _pct(m["dense_nonvideo_mass_mean"]).strip(),
             )
         )
+        if m.get("execution_geometry") == "sage_sparse":
+            requested = m.get("requested_q_range")
+            evaluated = m.get("evaluated_q_range") or m.get("execution_q_range")
+            if requested and evaluated:
+                lines.append(
+                    "  sage Q range: requested %d-%d | evaluated %d-%d | Q tiles %d" % (
+                        requested[0], requested[1], evaluated[0], evaluated[1],
+                        m.get("execution_q_tiles", 0),
+                    )
+                )
         dyn = dyn_regions.get((int(rec["step"]), int(rec["start"]), int(rec["stop"])))
         if dyn is not None:
             lines.append(
@@ -314,7 +407,7 @@ def render(run, summary, dynamics_summary=None):
             )
             lines.append(
                 "  %-5s video blocks (%d/%d): mass mean %s min %s | "
-                "oracle %s | regret mean %s max %s | overlap %s | effective KV %s" % (
+                "oracle %s | regret mean %s max %s | overlap %s | logical effective KV %s" % (
                     _pct(row["video_block_density"]).strip(),
                     row["keep_blocks"],
                     row["video_blocks"],
@@ -327,8 +420,22 @@ def render(run, summary, dynamics_summary=None):
                     _pct(row["effective_token_density_mean"]).strip(),
                 )
             )
+            if row.get("execution_geometry") == "sage_sparse":
+                exec_worst = ", ".join(
+                    "h%d=%s" % (item["head"], _pct(item["rel_l2"]).strip())
+                    for item in row.get("executable_worst_heads", [])[:3]
+                )
+                lines.append(
+                    "        executable effective KV %s | sparse output rel-L2 "
+                    "mean-head %s max-head %s | %s" % (
+                        _pct(row["executable_effective_token_density_mean"]).strip(),
+                        _pct(row["executable_sparse_output_rel_l2_mean_head"]).strip(),
+                        _pct(row["executable_sparse_output_rel_l2_max_head"]).strip(),
+                        exec_worst or "n/a",
+                    )
+                )
             lines.append(
-                "        sparse output rel-L2 mean-head %s max-head %s | "
+                "        logical sparse output rel-L2 mean-head %s max-head %s | "
                 "oracle max-head %s | heads >1%%/%d >2%%/%d >5%%/%d | %s" % (
                     _pct(row["sparse_output_rel_l2_mean_head"]).strip(),
                     _pct(row["sparse_output_rel_l2_max_head"]).strip(),
@@ -343,7 +450,7 @@ def render(run, summary, dynamics_summary=None):
     return "\n".join(lines)
 
 
-def write_run(run):
+def write_run(run, arrays=True):
     if not run.records and not getattr(run, "latent_dynamics", None):
         return None
     os.makedirs(run.out_dir, exist_ok=True)
@@ -354,6 +461,24 @@ def write_run(run):
     report_path = os.path.join(run.out_dir, "moba3d_report.txt")
     with open(report_path, "w", encoding="utf-8") as f:
         f.write(render(run, summary, dynamics_summary))
+    if arrays:
+        raw = {}
+        indices = []
+        steps = []
+        for item in getattr(run, "latent_activity_maps", ()):
+            label = "%04d_step%d" % (int(item["index"]), int(item["step"]))
+            value = item["activity"]
+            raw["activity_" + label] = (value.detach().cpu().numpy() if hasattr(value, "detach") else np.asarray(value)).astype(np.float32)
+            indices.append(int(item["index"]))
+            steps.append(int(item["step"]))
+        for item in getattr(run, "latent_energy_maps", ()):
+            label = "%04d_step%d" % (int(item["index"]), int(item["step"]))
+            value = item["energy"]
+            raw["energy_" + label] = (value.detach().cpu().numpy() if hasattr(value, "detach") else np.asarray(value)).astype(np.float32)
+        if raw:
+            raw["index"] = np.asarray(indices, dtype=np.int64)
+            raw["step"] = np.asarray(steps, dtype=np.int64)
+            np.savez_compressed(os.path.join(run.out_dir, "latent_dynamics.npz"), **raw)
     with open(
         os.path.join(run.out_dir, "moba3d_summary.json"),
         "w",
@@ -367,7 +492,11 @@ def write_run(run):
                 "steps": sorted(run.steps),
                 "block_shape": [run.block_t, run.block_h, run.block_w],
                 "budgets": list(run.budgets),
+                "execution_geometry": getattr(run, "execution_geometry", "logical"),
+                "sage_q_tile": int(getattr(run, "sage_q_tile", 128)),
+                "sage_kv_tile": int(getattr(run, "sage_kv_tile", 64)),
                 "notes": run.notes,
+                "capture_attention": bool(getattr(run, "capture_attention", True)),
                 "summary": summary,
                 "dynamics_summary": dynamics_summary,
                 "latent_dynamics": list(getattr(run, "latent_dynamics", ())),

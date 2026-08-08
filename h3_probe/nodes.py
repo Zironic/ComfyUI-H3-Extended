@@ -114,6 +114,14 @@ class MiniMaxH3Moba3DProbe(io.ComfyNode):
                     default=True,
                     tooltip="Measure target-video sampler x/x0 changes between every denoising callback at H3's 1x2x2 patch granularity, plus distance from explicit first/last keyframes. Adds moderate probe overhead but does not alter sampling.",
                 ),
+                io.Boolean.Input(
+                    "capture_attention",
+                    default=True,
+                    tooltip="Capture attention routing records; disable to keep only sampler latent dynamics and raw maps.",
+                ),
+                io.Combo.Input("execution_geometry", options=["logical", "sage_sparse"], default="logical", tooltip="Report logical per-token masks or coarsen them to globally aligned Sparse-Sage Q/KV tiles."),
+                io.Int.Input("sage_q_tile", default=128, min=1, max=4096, tooltip="Global packed-sequence Q tile size for sage_sparse execution."),
+                io.Int.Input("sage_kv_tile", default=64, min=1, max=4096, tooltip="Global packed-sequence KV tile size for sage_sparse execution."),
             ],
             outputs=[io.Model.Output()],
         )
@@ -122,13 +130,15 @@ class MiniMaxH3Moba3DProbe(io.ComfyNode):
     def execute(cls, model, enabled, run_tag, layers, steps, query_time_positions,
                 query_spatial_positions, query_block, block_t, block_h, block_w,
                 video_budgets, include_audio_query, include_text_query,
-                capture_uncond, capture_latent_dynamics=True) -> io.NodeOutput:
+                capture_uncond, capture_latent_dynamics=True,
+                capture_attention=True, execution_geometry="logical",
+                sage_q_tile=128, sage_kv_tile=64) -> io.NodeOutput:
         if not enabled:
             return io.NodeOutput(model)
 
-        # The legacy attention path still needs the H3-only interception. The
-        # H3-owned custom forward publishes to the same observer seam directly.
-        capture.install()
+        if capture_attention:
+            # The legacy attention path still needs the H3-only interception.
+            capture.install()
         session = moba_capture.MobaProbeSession(
             tag=run_tag or "h3_moba3d",
             layers_spec=layers,
@@ -145,6 +155,10 @@ class MiniMaxH3Moba3DProbe(io.ComfyNode):
             block_w=block_w,
             budgets=video_budgets,
             base_dir=_probe_dir(),
+            capture_attention=capture_attention,
+            execution_geometry=execution_geometry,
+            sage_q_tile=sage_q_tile,
+            sage_kv_tile=sage_kv_tile,
         )
 
         m = model.clone()
@@ -155,9 +169,10 @@ class MiniMaxH3Moba3DProbe(io.ComfyNode):
             comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, "h3_moba3d_probe",
             moba_capture.make_wrapper(session), m.model_options, is_model_options=True)
         logging.info(
-            "[H3 MoBA3D probe] armed: tag=%s layers=%s steps=%s block=%dx%dx%d budgets=%s latent_dynamics=%s",
+            "[H3 MoBA3D probe] armed: tag=%s layers=%s steps=%s block=%dx%dx%d budgets=%s execution=%s q_tile=%d kv_tile=%d latent_dynamics=%s attention=%s",
             run_tag, layers, steps, block_t, block_h, block_w, video_budgets,
-            capture_latent_dynamics,
+            execution_geometry, sage_q_tile, sage_kv_tile,
+            capture_latent_dynamics, capture_attention,
         )
         return io.NodeOutput(m)
 

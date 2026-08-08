@@ -26,10 +26,14 @@ class MobaProbeRun:
         self.include_text = session.include_text
         self.capture_uncond = session.capture_uncond
         self.capture_latent_dynamics = session.capture_latent_dynamics
+        self.capture_attention = session.capture_attention
         self.block_t = session.block_t
         self.block_h = session.block_h
         self.block_w = session.block_w
         self.budgets = session.budgets
+        self.execution_geometry = session.execution_geometry
+        self.sage_q_tile = session.sage_q_tile
+        self.sage_kv_tile = session.sage_kv_tile
         self.layers = set()
         self.steps = set()
         self.records = []
@@ -38,6 +42,8 @@ class MobaProbeRun:
         self.anchor_frames = []
         self.dynamics_queries = []
         self.latent_dynamics = []
+        self.latent_activity_maps = []
+        self.latent_energy_maps = []
         self.dynamics_tracker = latent_dynamics.LatentDynamicsTracker()
 
 
@@ -59,6 +65,10 @@ class MobaProbeSession:
         block_w,
         budgets,
         base_dir,
+        capture_attention=True,
+        execution_geometry="logical",
+        sage_q_tile=128,
+        sage_kv_tile=64,
     ):
         self.tag = tag
         self.layers_spec = layers_spec
@@ -70,11 +80,17 @@ class MobaProbeSession:
         self.include_text = bool(include_text)
         self.capture_uncond = bool(capture_uncond)
         self.capture_latent_dynamics = bool(capture_latent_dynamics)
+        self.capture_attention = bool(capture_attention)
         self.block_t = int(block_t)
         self.block_h = int(block_h)
         self.block_w = int(block_w)
         self.budgets = moba3d.parse_budgets(budgets)
         self.base_dir = base_dir
+        self.execution_geometry = str(execution_geometry or "logical").strip().lower()
+        if self.execution_geometry not in ("logical", "sage_sparse"):
+            raise ValueError("execution_geometry must be logical or sage_sparse")
+        self.sage_q_tile = max(1, int(sage_q_tile))
+        self.sage_kv_tile = max(1, int(sage_kv_tile))
         self.run = None
 
     def begin(self):
@@ -171,6 +187,9 @@ class ForwardMobaProbe:
                 block_w=self.run.block_w,
                 budgets=self.run.budgets,
                 prepared=prepared,
+                execution_geometry=self.run.execution_geometry,
+                sage_q_tile=self.run.sage_q_tile,
+                sage_kv_tile=self.run.sage_kv_tile,
             )
             rec = dict(spec)
             rec.update(
@@ -204,6 +223,7 @@ def make_outer_wrapper(session):
 
         if run.capture_latent_dynamics:
             def probe_callback(step, x0, x, total_steps):
+                checkpoint_arrays = False
                 try:
                     rec = run.dynamics_tracker.capture(
                         run,
@@ -216,6 +236,10 @@ def make_outer_wrapper(session):
                     )
                     if rec is not None:
                         run.latent_dynamics.append(rec)
+                        checkpoint_arrays = (
+                            bool(run.latent_activity_maps)
+                            and len(run.latent_activity_maps) % 10 == 0
+                        )
                 except Exception:
                     # Diagnostics must never break sampling or the user's preview
                     # callback. The attention probe follows the same policy.
@@ -223,6 +247,16 @@ def make_outer_wrapper(session):
                         "[H3 MoBA3D probe] latent dynamics capture failed at step %s",
                         step,
                     )
+                if checkpoint_arrays:
+                    try:
+                        from .moba_report import write_run
+
+                        write_run(run, arrays=True)
+                    except Exception:
+                        logging.exception(
+                            "[H3 MoBA3D probe] latent dynamics checkpoint failed at step %s",
+                            step,
+                        )
                 if original_callback is not None:
                     return original_callback(step, x0, x, total_steps)
                 return None
@@ -287,10 +321,16 @@ def make_wrapper(session):
                     "total_steps": int(total_steps),
                     "num_layers": int(num_layers),
                     "mode": (
-                        "probe-only per-query-token 3D mean-pooled routing "
-                        "with exact sparse-output comparison"
+                        "latent-dynamics-only"
+                        if not run.capture_attention
+                        else "probe-only per-query-token 3D mean-pooled routing "
+                             "with exact sparse-output comparison"
                     ),
                     "latent_dynamics": bool(run.capture_latent_dynamics),
+                    "capture_attention": bool(run.capture_attention),
+                    "execution_geometry": run.execution_geometry,
+                    "sage_q_tile": int(run.sage_q_tile),
+                    "sage_kv_tile": int(run.sage_kv_tile),
                     "latent_dynamics_source": "sampler callback x/x0",
                     "latent_dynamics_patch": [1, 2, 2],
                     "anchor_frames": list(run.anchor_frames),
@@ -298,8 +338,8 @@ def make_wrapper(session):
             )
             logging.info(
                 "[H3 MoBA3D probe] layout=%s layers=%s steps=%s "
-                "block=%dx%dx%d budgets=%s per-query-token routing "
-                "latent_dynamics=%s anchors=%s",
+                "block=%dx%dx%d budgets=%s execution=%s q_tile=%d kv_tile=%d per-query-token routing "
+                "latent_dynamics=%s attention=%s anchors=%s",
                 layout.describe(),
                 sorted(run.layers),
                 sorted(run.steps),
@@ -307,9 +347,16 @@ def make_wrapper(session):
                 run.block_h,
                 run.block_w,
                 run.budgets,
+                run.execution_geometry,
+                run.sage_q_tile,
+                run.sage_kv_tile,
                 run.capture_latent_dynamics,
+                run.capture_attention,
                 run.anchor_frames,
             )
+
+        if not run.capture_attention:
+            return executor(*args, **kwargs)
 
         step, sigma = capture._step_index(transformer_options)
         cu = transformer_options.get("cond_or_uncond") or [0]
@@ -327,7 +374,7 @@ def make_wrapper(session):
             try:
                 from .moba_report import write_run
 
-                write_run(run)
+                write_run(run, arrays=False)
             except Exception:
                 logging.exception("[H3 MoBA3D probe] report write failed")
 

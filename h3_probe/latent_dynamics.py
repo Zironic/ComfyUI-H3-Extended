@@ -17,6 +17,11 @@ import math
 
 import torch
 
+try:
+    from h3_mask.predictor import evaluate_predictability
+except ImportError:
+    from ..h3_mask.predictor import evaluate_predictability
+
 
 EPS = 1e-12
 STABLE_THRESHOLDS = (0.01, 0.02, 0.05)
@@ -179,6 +184,7 @@ def _stream_update(previous, current, thresholds=STABLE_THRESHOLDS):
         "patch_delta_ss": patch_delta_ss,
         "patch_base_ss": patch_base_ss,
         "patch_shape": (int(latent_t), int(patch_h), int(patch_w)),
+        "total_values": int(total_values),
     }
 
 
@@ -221,6 +227,14 @@ def _strip_transient(stream):
         "global": stream["global"],
         "patch_shape": list(stream["patch_shape"]),
     }
+
+
+def _activity_map(stream):
+    if stream is None:
+        return None
+    dss = stream["patch_delta_ss"].float().reshape(stream["patch_shape"])
+    bss = stream["patch_base_ss"].float().reshape(stream["patch_shape"])
+    return torch.sqrt(dss / torch.clamp(bss, min=EPS))
 
 
 def _pearson(xs, ys):
@@ -343,11 +357,13 @@ class LatentDynamicsTracker:
         self.previous_sample = None
         self.previous_prediction = None
         self.previous_step = None
+        self.previous_prediction_activity = None
 
     def close(self):
         self.previous_sample = None
         self.previous_prediction = None
         self.previous_step = None
+        self.previous_prediction_activity = None
 
     def capture(self, run, step, x0, x, total_steps, latent_shapes, queries):
         step = int(step)
@@ -365,6 +381,36 @@ class LatentDynamicsTracker:
         prediction_now = prediction.detach() if prediction is not None else None
         sample_update = _stream_update(self.previous_sample, sample_now)
         prediction_update = _stream_update(self.previous_prediction, prediction_now)
+
+        current_activity = _activity_map(prediction_update)
+        predictability = None
+        from_step = self.previous_step
+        if current_activity is not None:
+            raw_index = len(getattr(run, "latent_activity_maps", []))
+            if hasattr(run, "latent_activity_maps") and hasattr(run, "latent_energy_maps"):
+                run.latent_activity_maps.append({
+                    "index": int(raw_index),
+                    "step": int(step),
+                    "activity": current_activity.detach().cpu().to(torch.float32),
+                })
+                run.latent_energy_maps.append({
+                    "index": int(raw_index),
+                    "step": int(step),
+                    "energy": prediction_update["patch_delta_ss"].reshape(current_activity.shape).detach().cpu().to(torch.float32),
+                })
+            if self.previous_prediction_activity is not None:
+                predictability = evaluate_predictability(
+                    self.previous_prediction_activity,
+                    current_activity,
+                    prediction_update["patch_delta_ss"].reshape(current_activity.shape),
+                    prediction_update["patch_base_ss"].reshape(current_activity.shape),
+                    total_values=prediction_update.get("total_values"),
+                )
+                predictability["from_step"] = int(from_step)
+                predictability["to_step"] = int(step)
+            self.previous_prediction_activity = current_activity.detach().to(torch.float32)
+        else:
+            self.previous_prediction_activity = None
 
         self.previous_sample = sample_now.to(dtype=torch.float16).clone()
         self.previous_prediction = (
@@ -422,7 +468,7 @@ class LatentDynamicsTracker:
             if sample_update
             else prediction_update["patch_shape"]
         )
-        return {
+        result = {
             "step": step,
             "total_steps": int(total_steps),
             "anchor_frames": anchors,
@@ -437,4 +483,9 @@ class LatentDynamicsTracker:
                 else None,
             },
             "patch_shape": list(patch_shape),
+            "predictability": predictability,
         }
+        if predictability is not None:
+            result["from_step"] = int(predictability["from_step"])
+            result["to_step"] = int(predictability["to_step"])
+        return result

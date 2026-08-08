@@ -1,12 +1,24 @@
 """Build and analyse conservative H3 Ref2V edit masks.
 
-The measurement stage stores the raw per-cell error and source magnitude in
-float32. Relative scores, floors, token pooling, thresholds, tiles and halos can
-therefore be recalibrated offline without rerunning an expensive generation.
+Source-relative scoring remains owned by the masked-cache package; generic
+mask operations live in :mod:`h3_mask.ops` and are re-exported here for the
+existing public imports.
 """
 
 import torch
-import torch.nn.functional as F
+
+try:
+    from h3_mask.ops import (active_fraction, build_mask, captured_energy_fraction,
+                             coverage_fraction, dilate_spatial, dilate_temporal,
+                             escaped_fraction, from_tiles, jaccard, missed_score_mass,
+                             quantiles, threshold_sweep, tile_grid, to_tiles,
+                             token_score)
+except ImportError:
+    from ..h3_mask.ops import (active_fraction, build_mask, captured_energy_fraction,
+                               coverage_fraction, dilate_spatial, dilate_temporal,
+                               escaped_fraction, from_tiles, jaccard, missed_score_mass,
+                               quantiles, threshold_sweep, tile_grid, to_tiles,
+                               token_score)
 
 PATCH_H = 2
 PATCH_W = 2
@@ -20,8 +32,8 @@ def rms_channels(t):
 def score_components(x0, source):
     """Return float32 ``(error_rms, source_rms)`` maps."""
     if x0.shape != source.shape:
-        raise ValueError("x0 %s and source %s must have the same shape"
-                         % (list(x0.shape), list(source.shape)))
+        raise ValueError("x0 %s and source %s must have the same shape" %
+                         (list(x0.shape), list(source.shape)))
     return rms_channels(x0 - source), rms_channels(source)
 
 
@@ -37,11 +49,7 @@ def latent_score(x0, source, absolute_floor):
 
 
 def spatial_saliency(token_scores, eps=1e-6):
-    """Robust per-frame excess over ordinary full-frame reconstruction drift.
-
-    Returns ``(score - median) / (MAD + eps)`` at token resolution. This is a
-    diagnostic only; Stage 0 does not use it to alter inference.
-    """
+    """Robust per-frame excess over ordinary full-frame reconstruction drift."""
     if token_scores.ndim != 3:
         raise ValueError("token_scores must be [T,H,W]")
     flat = token_scores.float().reshape(token_scores.shape[0], -1)
@@ -50,134 +58,10 @@ def spatial_saliency(token_scores, eps=1e-6):
     return ((flat - med) / (mad + float(eps))).reshape_as(token_scores)
 
 
-def token_score(score, patch_h=PATCH_H, patch_w=PATCH_W):
-    """Latent-cell scores -> one score per H3 target-video row."""
-    if score.ndim != 3:
-        raise ValueError("score must be [T,H,W], got %s" % list(score.shape))
-    t, h, w = score.shape
-    pad_h = (-h) % patch_h
-    pad_w = (-w) % patch_w
-    x = score.reshape(t, 1, h, w)
-    if pad_h or pad_w:
-        x = F.pad(x, (0, pad_w, 0, pad_h), value=float(score.min()))
-    pooled = F.max_pool2d(x, kernel_size=(patch_h, patch_w), stride=(patch_h, patch_w))
-    return pooled.reshape(t, (h + pad_h) // patch_h, (w + pad_w) // patch_w)
-
-
-def tile_grid(patch_h, patch_w, tile_h, tile_w):
-    return (patch_h + tile_h - 1) // tile_h, (patch_w + tile_w - 1) // tile_w
-
-
-def to_tiles(token_mask, tile_h, tile_w):
-    if tile_h == 1 and tile_w == 1:
-        return token_mask.clone()
-    t, ph, pw = token_mask.shape
-    pad_h = (-ph) % tile_h
-    pad_w = (-pw) % tile_w
-    x = token_mask.float().reshape(t, 1, ph, pw)
-    if pad_h or pad_w:
-        x = F.pad(x, (0, pad_w, 0, pad_h), value=0.0)
-    pooled = F.max_pool2d(x, kernel_size=(tile_h, tile_w), stride=(tile_h, tile_w))
-    nth, ntw = tile_grid(ph, pw, tile_h, tile_w)
-    return pooled.reshape(t, nth, ntw) > 0.5
-
-
-def from_tiles(tile_mask, tile_h, tile_w, patch_h, patch_w):
-    if tile_h == 1 and tile_w == 1:
-        return tile_mask[:, :patch_h, :patch_w].clone()
-    expanded = tile_mask.repeat_interleave(tile_h, dim=1).repeat_interleave(tile_w, dim=2)
-    return expanded[:, :patch_h, :patch_w].contiguous()
-
-
-def dilate_spatial(mask, halo):
-    if halo <= 0:
-        return mask
-    t = mask.shape[0]
-    x = mask.float().reshape(t, 1, mask.shape[1], mask.shape[2])
-    x = F.max_pool2d(x, kernel_size=2 * halo + 1, stride=1, padding=halo)
-    return x.reshape(mask.shape) > 0.5
-
-
-def dilate_temporal(mask, halo):
-    if halo <= 0:
-        return mask
-    t, a, b = mask.shape
-    x = mask.float().permute(1, 2, 0).reshape(1, a * b, t)
-    x = F.max_pool1d(x, kernel_size=2 * halo + 1, stride=1, padding=halo)
-    return x.reshape(a, b, t).permute(2, 0, 1).contiguous() > 0.5
-
-
-def build_mask(token_scores, threshold, tile_h, tile_w, spatial_halo, temporal_halo):
-    core = token_scores >= float(threshold)
-    _, ph, pw = token_scores.shape
-    tiles = to_tiles(core, tile_h, tile_w)
-    tiles = dilate_spatial(tiles, spatial_halo)
-    tiles = dilate_temporal(tiles, temporal_halo)
-    return core, from_tiles(tiles, tile_h, tile_w, ph, pw), tiles
-
-
-def active_fraction(mask):
-    n = mask.numel()
-    return float(mask.sum().item()) / n if n else 0.0
-
-
-def jaccard(a, b):
-    if a is None or b is None or a.shape != b.shape:
-        return None
-    union = float((a | b).sum().item())
-    if union == 0.0:
-        return 1.0
-    return float((a & b).sum().item()) / union
-
-
-def escaped_fraction(later, earlier):
-    if later is None or earlier is None or later.shape != earlier.shape:
-        return None
-    n = float(later.sum().item())
-    if n == 0.0:
-        return 0.0
-    return float((later & ~earlier).sum().item()) / n
-
-
-def coverage_fraction(reference, candidate):
-    """Fraction of ``reference`` active cells covered by ``candidate``."""
-    escaped = escaped_fraction(reference, candidate)
-    return None if escaped is None else 1.0 - escaped
-
-
-def missed_score_mass(scores, candidate, threshold=0.0):
-    """Share of above-threshold edit-score excess outside ``candidate``.
-
-    Summing the complete relative score makes the metric mostly measure the
-    broad reconstruction-drift baseline. Only ``max(score - threshold, 0)`` is
-    attributable to the mask decision at that threshold.
-    """
-    if scores is None or candidate is None or scores.shape != candidate.shape:
-        return None
-    excess = (scores.float() - float(threshold)).clamp_min(0)
-    total = float(excess.sum().item())
-    if total == 0.0:
-        return 0.0
-    return float(excess[~candidate].sum().item()) / total
-
-
-def quantiles(t, qs):
-    flat = t.detach().float().reshape(-1).cpu()
-    if flat.numel() == 0:
-        return {str(q): None for q in qs}
-    qt = torch.tensor(list(qs), dtype=torch.float32)
-    vals = torch.quantile(flat, qt)
-    return {"%g" % q: float(v) for q, v in zip(qs, vals)}
-
-
-def threshold_sweep(token_scores, thresholds, tile_h, tile_w, spatial_halo, temporal_halo):
-    out = []
-    for thr in thresholds:
-        core, expanded, _ = build_mask(token_scores, thr, tile_h, tile_w,
-                                       spatial_halo, temporal_halo)
-        out.append({
-            "threshold": float(thr),
-            "active_core": active_fraction(core),
-            "active_expanded": active_fraction(expanded),
-        })
-    return out
+__all__ = [
+    "PATCH_H", "PATCH_W", "rms_channels", "score_components", "relative_score",
+    "latent_score", "spatial_saliency", "token_score", "tile_grid", "to_tiles",
+    "from_tiles", "dilate_spatial", "dilate_temporal", "build_mask",
+    "active_fraction", "jaccard", "escaped_fraction", "coverage_fraction",
+    "missed_score_mass", "quantiles", "threshold_sweep", "captured_energy_fraction",
+]

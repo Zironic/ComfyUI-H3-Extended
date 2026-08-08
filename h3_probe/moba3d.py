@@ -5,9 +5,10 @@ router against exact dense attention on selected H3 query tokens. Only target-
 video KV tokens are sparsification candidates; non-video context stays dense.
 
 The public H3 description says block importance is probed with mean pooling and
-3D sparsification is applied to video tokens. This probe intentionally stops
-there: it does not claim to reproduce MiniMax's unreleased training-aware
-backend, block geometry, or kernel implementation.
+3D sparsification is applied to video tokens. The optional ``sage_sparse``
+execution geometry coarsens those logical masks to globally aligned packed
+Q/KV tiles for measurement; it does not claim to reproduce MiniMax's
+unreleased training-aware backend or kernel implementation.
 """
 
 from __future__ import annotations
@@ -145,6 +146,76 @@ def _renormalized_sparse_output(probs, values, video_keep, video_range):
     return retained, numerator / retained.unsqueeze(-1)
 
 
+def _renormalized_masked_output(probs, values, keep):
+    """Exact masked-and-renormalized output for a full packed KV mask."""
+    masked = probs * keep.to(probs.dtype)
+    retained = masked.sum(-1).clamp_min(1e-12)
+    return retained, torch.matmul(masked, values) / retained.unsqueeze(-1)
+
+
+def _execution_mask(
+    logical_video_keep,
+    qs,
+    qe,
+    seq_len,
+    video_range,
+    q_tile,
+    kv_tile,
+    aligned_start,
+    aligned_end,
+):
+    """Coarsen logical per-query video masks to global Q/KV tile masks."""
+    heads, aligned_queries, video_tokens = logical_video_keep.shape
+    v0, v1 = video_range
+    if aligned_queries != aligned_end - aligned_start:
+        raise ValueError("aligned query mask does not match execution range")
+
+    q_tile = max(1, int(q_tile))
+    kv_tile = max(1, int(kv_tile))
+    q_tile_count = (aligned_queries + q_tile - 1) // q_tile
+    kv_tile_count = (seq_len + kv_tile - 1) // kv_tile
+    video_global = torch.arange(v0, v1, device=logical_video_keep.device)
+    kv_video_ids = torch.div(video_global, kv_tile, rounding_mode="floor")
+    tile_enabled = torch.zeros(
+        heads, q_tile_count, kv_tile_count,
+        dtype=torch.bool,
+        device=logical_video_keep.device,
+    )
+    for q_index in range(q_tile_count):
+        a = q_index * q_tile
+        b = min(aligned_queries, a + q_tile)
+        selected = logical_video_keep[:, a:b].any(dim=1)
+        for head in range(heads):
+            tile_enabled[head, q_index, kv_video_ids[selected[head]]] = True
+
+    # A KV tile containing any context token is fully dense, including video
+    # rows that happen to share that global tile.
+    global_k = torch.arange(seq_len, device=logical_video_keep.device)
+    kv_ids = torch.div(global_k, kv_tile, rounding_mode="floor")
+    nonvideo = (global_k < v0) | (global_k >= v1)
+    tile_has_nonvideo = torch.zeros(
+        kv_tile_count, dtype=torch.bool, device=logical_video_keep.device
+    )
+    tile_has_nonvideo[kv_ids[nonvideo]] = True
+    tile_enabled |= tile_has_nonvideo.view(1, 1, -1)
+
+    q_global = torch.arange(qs, qe, device=logical_video_keep.device)
+    q_tile_ids = torch.div(q_global, q_tile, rounding_mode="floor") - (
+        aligned_start // q_tile
+    )
+    per_query_tiles = tile_enabled.index_select(1, q_tile_ids)
+    full_keep = per_query_tiles.gather(
+        2, kv_ids.view(1, 1, -1).expand(heads, qe - qs, -1)
+    )
+    return full_keep, {
+        "q_range": [int(aligned_start), int(aligned_end)],
+        "q_tiles": int(q_tile_count),
+        "q_tile": int(q_tile),
+        "kv_tile": int(kv_tile),
+        "kv_tiles": int(kv_tile_count),
+    }
+
+
 def _per_head_error(got, want):
     """Return per-head relative-L2, mean-absolute, and max-absolute errors."""
     diff = got - want
@@ -190,6 +261,9 @@ def analyze_routing(
     budgets=DEFAULT_BUDGETS,
     head_chunk=4,
     prepared=None,
+    execution_geometry="logical",
+    sage_q_tile=128,
+    sage_kv_tile=64,
 ):
     """Evaluate per-query-token 3D routing and exact sparse-output error.
 
@@ -215,6 +289,11 @@ def analyze_routing(
     if not (0 <= qs < qe <= layout.seq_len):
         raise ValueError("query range is outside the packed sequence")
 
+    execution_geometry = str(execution_geometry or "logical").strip().lower()
+    if execution_geometry not in ("logical", "sage_sparse"):
+        raise ValueError("execution_geometry must be logical or sage_sparse")
+    sage_q_tile = max(1, int(sage_q_tile))
+    sage_kv_tile = max(1, int(sage_kv_tile))
     budgets = parse_budgets(budgets)
     prepared = prepared or prepare_video_router(
         k,
@@ -238,7 +317,18 @@ def analyze_routing(
     scale = q.shape[-1] ** -0.5
     heads = q.shape[1]
     head_chunk = max(1, int(head_chunk))
-    q_sel_all = q[0, :, qs:qe, :]
+    if execution_geometry == "sage_sparse":
+        requested_width = qe - qs
+        execution_q_tiles = max(1, (requested_width + sage_q_tile - 1) // sage_q_tile)
+        evaluated_start = (qs // sage_q_tile) * sage_q_tile
+        evaluated_end = min(
+            layout.seq_len,
+            evaluated_start + execution_q_tiles * sage_q_tile,
+        )
+    else:
+        evaluated_start, evaluated_end = qs, qe
+        execution_q_tiles = None
+    q_eval_all = q[0, :, evaluated_start:evaluated_end, :]
 
     accum = {
         frac: {
@@ -252,6 +342,10 @@ def analyze_routing(
             "oracle_rel_l2": [],
             "oracle_mean_abs": [],
             "oracle_max_abs": [],
+            "executable_density": [],
+            "executable_rel_l2": [],
+            "executable_mean_abs": [],
+            "executable_max_abs": [],
         }
         for frac in budgets
     }
@@ -260,7 +354,7 @@ def analyze_routing(
 
     for h0 in range(0, heads, head_chunk):
         h1 = min(heads, h0 + head_chunk)
-        qh = q_sel_all[h0:h1].float()
+        qh = q_eval_all[h0:h1].float()
         kh = k[0, h0:h1].float()
         vh = v[0, h0:h1].float()
 
@@ -277,21 +371,29 @@ def analyze_routing(
         dense_nonvideo.append(nonvideo_mass.detach().cpu())
         dense_video.append(video_probs.sum(-1).detach().cpu())
 
-        route_scores = torch.einsum(
+        route_scores_all = torch.einsum(
             "hqd,hbd->hqb", qh, pooled[h0:h1]
         ) * scale
 
         for frac in budgets:
             keep = max(1, min(n_blocks, int(math.ceil(float(frac) * n_blocks))))
-            routed_idx = torch.topk(route_scores, k=keep, dim=-1).indices
+            routed_idx_all = torch.topk(
+                route_scores_all, k=keep, dim=-1
+            ).indices
             oracle_idx = torch.topk(exact_blocks, k=keep, dim=-1).indices
 
-            routed_blocks = torch.zeros_like(exact_blocks, dtype=torch.bool)
+            routed_blocks_all = torch.zeros(
+                route_scores_all.shape,
+                dtype=torch.bool,
+                device=route_scores_all.device,
+            )
+            routed_blocks_all.scatter_(2, routed_idx_all, True)
+            routed_keep_all = routed_blocks_all.index_select(2, ids)
+            routed_blocks = routed_blocks_all
+            routed_keep = routed_keep_all
             oracle_blocks = torch.zeros_like(exact_blocks, dtype=torch.bool)
-            routed_blocks.scatter_(2, routed_idx, True)
             oracle_blocks.scatter_(2, oracle_idx, True)
 
-            routed_keep = routed_blocks.index_select(2, ids)
             oracle_keep = oracle_blocks.index_select(2, ids)
 
             routed_mass, routed_out = _renormalized_sparse_output(
@@ -307,7 +409,7 @@ def analyze_routing(
             )
 
             overlap = (routed_blocks & oracle_blocks).sum(-1).float() / keep
-            selected_tokens = counts[routed_idx].sum(-1).float()
+            selected_tokens = counts[routed_idx_all].sum(-1).float()
             effective_density = (
                 layout.seq_len - (v1 - v0) + selected_tokens
             ) / layout.seq_len
@@ -324,6 +426,37 @@ def analyze_routing(
             bucket["oracle_mean_abs"].append(oracle_mean_abs.detach().cpu())
             bucket["oracle_max_abs"].append(oracle_max_abs.detach().cpu())
 
+            if execution_geometry == "sage_sparse":
+                executable_keep, _execution_meta = _execution_mask(
+                    routed_keep_all,
+                    evaluated_start,
+                    evaluated_end,
+                    layout.seq_len,
+                    (v0, v1),
+                    sage_q_tile,
+                    sage_kv_tile,
+                    evaluated_start,
+                    evaluated_end,
+                )
+                _exec_mass, executable_out = _renormalized_masked_output(
+                    probs, vh, executable_keep
+                )
+                executable_rel_l2, executable_mean_abs, executable_max_abs = _per_head_error(
+                    executable_out, dense_out
+                )
+                bucket["executable_density"].append(
+                    executable_keep.float().mean(-1).detach().cpu()
+                )
+                bucket["executable_rel_l2"].append(
+                    executable_rel_l2.detach().cpu()
+                )
+                bucket["executable_mean_abs"].append(
+                    executable_mean_abs.detach().cpu()
+                )
+                bucket["executable_max_abs"].append(
+                    executable_max_abs.detach().cpu()
+                )
+
             del (
                 routed_blocks,
                 oracle_blocks,
@@ -333,9 +466,11 @@ def analyze_routing(
                 routed_out,
                 oracle_mass,
                 oracle_out,
+                routed_blocks_all,
+                routed_keep_all,
             )
 
-        del probs, dense_out, video_probs, exact_blocks, route_scores
+        del probs, dense_out, video_probs, exact_blocks, route_scores_all
 
     dense_nonvideo = torch.cat(dense_nonvideo, dim=0)
     dense_video = torch.cat(dense_video, dim=0)
@@ -384,12 +519,46 @@ def analyze_routing(
             "head_rel_l2": [float(x) for x in rel_l2.tolist()],
             "oracle_head_rel_l2": [float(x) for x in oracle_rel_l2.tolist()],
             "worst_heads": _worst_heads(rel_l2),
+            "execution_geometry": execution_geometry,
+            "execution_q_tile": int(sage_q_tile) if execution_geometry == "sage_sparse" else None,
+            "execution_kv_tile": int(sage_kv_tile) if execution_geometry == "sage_sparse" else None,
         }
+        if execution_geometry == "sage_sparse":
+            executable_density = torch.cat(bucket["executable_density"], dim=0)
+            executable_rel_l2 = torch.cat(bucket["executable_rel_l2"], dim=0)
+            executable_mean_abs = torch.cat(bucket["executable_mean_abs"], dim=0)
+            executable_max_abs = torch.cat(bucket["executable_max_abs"], dim=0)
+            row.update(
+                {
+                    "executable_effective_token_density_mean": float(executable_density.mean()),
+                    "executable_effective_token_density_max": float(executable_density.max()),
+                    "executable_sparse_output_rel_l2_mean_head": float(executable_rel_l2.mean()),
+                    "executable_sparse_output_rel_l2_median_head": float(executable_rel_l2.median()),
+                    "executable_sparse_output_rel_l2_max_head": float(executable_rel_l2.max()),
+                    "executable_sparse_output_mean_abs_mean_head": float(executable_mean_abs.mean()),
+                    "executable_sparse_output_max_abs": float(executable_max_abs.max()),
+                    "executable_head_rel_l2": [float(x) for x in executable_rel_l2.tolist()],
+                    "executable_heads_rel_l2_gt_1pct": _threshold_heads(executable_rel_l2)["heads_rel_l2_gt_1pct"],
+                    "executable_heads_rel_l2_gt_2pct": _threshold_heads(executable_rel_l2)["heads_rel_l2_gt_2pct"],
+                    "executable_heads_rel_l2_gt_5pct": _threshold_heads(executable_rel_l2)["heads_rel_l2_gt_5pct"],
+                    "executable_worst_heads": _worst_heads(executable_rel_l2),
+                }
+            )
+        else:
+            row["executable_metrics"] = None
         row.update(_threshold_heads(rel_l2))
         rows.append(row)
 
-    return {
+    result = {
         "routing_granularity": "per-query-token",
+        "execution_geometry": execution_geometry,
+        "execution_q_tile": int(sage_q_tile) if execution_geometry == "sage_sparse" else None,
+        "execution_kv_tile": int(sage_kv_tile) if execution_geometry == "sage_sparse" else None,
+        "sage_q_tile": int(sage_q_tile) if execution_geometry == "sage_sparse" else None,
+        "sage_kv_tile": int(sage_kv_tile) if execution_geometry == "sage_sparse" else None,
+        "execution_q_range": [int(evaluated_start), int(evaluated_end)] if execution_geometry == "sage_sparse" else None,
+        "execution_q_tiles": int(execution_q_tiles) if execution_geometry == "sage_sparse" else None,
+        "execution_kv_tiles": int((layout.seq_len + sage_kv_tile - 1) // sage_kv_tile) if execution_geometry == "sage_sparse" else None,
         "block_shape": list(prepared["block_shape"]),
         "block_grid": [int(x) for x in grid],
         "video_blocks": int(n_blocks),
@@ -399,3 +568,11 @@ def analyze_routing(
         "dense_video_mass_mean": float(dense_video.mean()),
         "budgets": rows,
     }
+    if execution_geometry == "sage_sparse":
+        result.update(
+            {
+                "requested_q_range": [int(qs), int(qe)],
+                "evaluated_q_range": [int(evaluated_start), int(evaluated_end)],
+            }
+        )
+    return result

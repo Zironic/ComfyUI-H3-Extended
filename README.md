@@ -19,11 +19,24 @@ can be loaded at the same time:
 | `MiniMaxH3ReferenceToVideoZi` | MiniMax H3 Reference to Video (Zi) |
 | `MiniMaxH3SigmaShiftZi` | MiniMax H3 Sigma Shift (Zi) |
 | `MiniMaxH3AttentionProbeZi` | MiniMax H3 Attention Probe (Zi) |
+| `MiniMaxH3Moba3DProbeZi` | MiniMax H3 MoBA 3D Probe (Zi) |
 | `MiniMaxH3Ref2VExperimentHarnessZi` | MiniMax H3 Ref2V Experiment Harness (Zi) |
 | `MiniMaxH3MaskedRef2VCacheZi` | MiniMax H3 Masked Ref2V Cache (Zi) |
 
 Existing workflows still point at the stock ids; re-add the `(Zi)` nodes to use
 this copy.
+
+## MoBA 3D probe execution geometry
+
+`MiniMaxH3Moba3DProbeZi` defaults to `logical`, preserving independent
+per-query-token routing and the existing metrics. Set `execution_geometry` to
+`sage_sparse` to simulate globally packed Sparse-Sage tiles: sampled queries
+expand to aligned `sage_q_tile` ranges (default 128), selected video keys are
+unioned per head and Q tile, and global `sage_kv_tile` ranges (default 64) are
+expanded back to packed-token masks. Reports retain the logical density/output
+metrics and add separately labelled executable density and sparse-output error;
+this remains a CPU-safe measurement probe and does not alter production
+attention.
 
 ---
 
