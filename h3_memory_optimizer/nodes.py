@@ -3,12 +3,12 @@
 from comfy_api.latest import ComfyExtension, io
 
 try:
-    from ..h3_activation_memory.config import DEFAULT_CHUNK_ROWS
+    from ..h3_activation_memory.config import DEFAULT_CHUNK_ROWS, DEFAULT_MODE
     from ..h3_adaln.config import MODES as ADALN_MODES
     from ..h3_block_cache.config import MODES as BLOCK_CACHE_MODES
     from ..h3_runtime.layout import SINK_MODES
 except ImportError:
-    from h3_activation_memory.config import DEFAULT_CHUNK_ROWS
+    from h3_activation_memory.config import DEFAULT_CHUNK_ROWS, DEFAULT_MODE
     from h3_adaln.config import MODES as ADALN_MODES
     from h3_block_cache.config import MODES as BLOCK_CACHE_MODES
     from h3_runtime.layout import SINK_MODES
@@ -53,7 +53,7 @@ class MiniMaxH3MemoryOptimizer(io.ComfyNode):
                 io.Combo.Input(
                     "activation",
                     options=list(ACTIVATION_MODES),
-                    default="mlp_chunked_bf16",
+                    default=DEFAULT_MODE,
                 ),
                 io.Int.Input(
                     "chunk_rows",
@@ -73,7 +73,7 @@ class MiniMaxH3MemoryOptimizer(io.ComfyNode):
         model,
         enabled=True,
         attention="auto",
-        activation="mlp_chunked_bf16",
+        activation=DEFAULT_MODE,
         chunk_rows=DEFAULT_CHUNK_ROWS,
         prefer_held_weights=True,
     ):

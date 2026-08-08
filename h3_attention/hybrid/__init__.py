@@ -1,7 +1,18 @@
 """Incremental mixed-dispatch attention backend for MiniMax H3."""
 
 from .backend import HybridSparseBackend, PreparedHybrid
-from .config import HybridSparseConfig, IMPLEMENTED_MODES, MODE_SAGE128
+from .config import (
+    HybridSparseConfig,
+    IMPLEMENTED_MODES,
+    MODE_SAGE128,
+    MODE_SAGE128_FUSED_QKV,
+)
+from .fused_qkv import (
+    FusedQKVError,
+    FusedQKVProjector,
+    PreparedFusedQKV,
+    validate_prepared_fused_qkv,
+)
 from .router import (
     KV_TILE,
     Q_TILE,
@@ -26,6 +37,11 @@ __all__ = [
     "HybridSparseConfig",
     "IMPLEMENTED_MODES",
     "MODE_SAGE128",
+    "MODE_SAGE128_FUSED_QKV",
+    "FusedQKVError",
+    "FusedQKVProjector",
+    "PreparedFusedQKV",
+    "validate_prepared_fused_qkv",
     "KV_TILE",
     "Q_TILE",
     "SparseMaskMetadata",

@@ -26,6 +26,7 @@ explains.
 import logging
 
 try:
+    from ..h3_activation_memory.config import DEFAULT_MODE
     from ..h3_memory_optimizer.attention import (
         ATTENTION_AUTO,
         ATTENTION_EXISTING,
@@ -42,6 +43,7 @@ try:
     from ..h3_memory_optimizer.cuda_pool import configure_cuda_async_soft_gc
     from ..h3_memory_optimizer.patch import STATUS_KEY, apply
 except ImportError:  # self-tests import the pack as top-level modules
+    from h3_activation_memory.config import DEFAULT_MODE
     from h3_memory_optimizer.attention import (
         ATTENTION_AUTO,
         ATTENTION_EXISTING,
@@ -63,6 +65,7 @@ LOG_PREFIX = "[H3 Extended] harness"
 __all__ = [
     "ATTENTION_MODES", "ACTIVATION_MODES", "FALLBACK_MODES",
     "ATTENTION_AUTO", "ATTENTION_EXISTING", "ACTIVATION_OFF", "FALLBACK_ALLOW",
+    "DEFAULT_MODE",
     "STATUS_KEY", "arm", "existing_status", "describe",
 ]
 
@@ -76,7 +79,7 @@ def existing_status(model):
 
 
 def arm(model, *, attention=ATTENTION_AUTO, attention_fallback=FALLBACK_ALLOW,
-        activation="mlp_chunked_bf16", chunk_rows=None,
+        activation=DEFAULT_MODE, chunk_rows=None,
         cuda_async_soft_gc=False, cuda_async_release_threshold_gib=11.0,
         resolver=resolve_attention, applier=apply,
         pool_configurer=configure_cuda_async_soft_gc, environment=None):

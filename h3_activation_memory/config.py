@@ -6,10 +6,11 @@ MODE_BF16 = "mlp_chunked_bf16"
 MODE_NATIVE = "mlp_chunked_native"
 MODES = (MODE_BF16, MODE_NATIVE)
 IMPLEMENTED_MODES = frozenset(MODES)
+DEFAULT_MODE = MODE_NATIVE
 
 MIN_CHUNK_ROWS = 256
 MAX_CHUNK_ROWS = 65_536
-DEFAULT_CHUNK_ROWS = 4_096
+DEFAULT_CHUNK_ROWS = 2_048
 DEFAULT_ALIGNMENT = 256
 
 
@@ -23,7 +24,7 @@ class ActivationMemoryConfig:
     available, and otherwise follows Comfy's eager fallback.
     """
 
-    mode: str = MODE_BF16
+    mode: str = DEFAULT_MODE
     chunk_rows: int = DEFAULT_CHUNK_ROWS
     alignment: int = DEFAULT_ALIGNMENT
     strict: bool = True

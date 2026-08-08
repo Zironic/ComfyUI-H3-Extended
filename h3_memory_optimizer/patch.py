@@ -145,9 +145,14 @@ def apply(
     # forward, and FirstBlockCache must wrap the final activation-memory block.
     attention_blocks = 0
     if decision.backend is not None:
-        _backend, attention_blocks = attention_configurer(
-            model_patcher, decision.backend
-        )
+        if decision.projector is None:
+            _backend, attention_blocks = attention_configurer(
+                model_patcher, decision.backend
+            )
+        else:
+            _backend, attention_blocks = attention_configurer(
+                model_patcher, decision.backend, projector=decision.projector
+            )
 
     activation_blocks = 0
     activation_config = config.activation_config()

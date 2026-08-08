@@ -41,6 +41,7 @@ import logging
 import os
 import re
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 
@@ -53,6 +54,7 @@ from ..layout_ops import TargetAlignedCondition
 from ..model_patch import patch_target_conditions
 from . import diagnostics, runner
 from . import taeh3 as taeh3_backend
+from .taeh3_preview_worker import AsyncTAEH3PreviewWorker
 from .frame_source import resolve_ffmpeg
 from .writer import FFmpegVideoWriter, close_writers
 
@@ -331,6 +333,11 @@ class LongFormPreviewPublisher:
         self.fps = int(fps)
         self.ffmpeg_location = ffmpeg_location
         self.options = options or PreviewOptions()
+        self._revision_lock = threading.Lock()
+        self._asset_counter = 0
+        self._taeh3_async_worker = None
+        self._taeh3_async_failed = False
+        self.revision = 0
         # One instance for the whole run. Built here, outside the sampler.
         self.taeh3 = None
         if self.options.decoder in (DECODER_AUTO, DECODER_TAEH3):
@@ -341,7 +348,7 @@ class LongFormPreviewPublisher:
                     "falling back to the latent preview",
                     LOG,
                 )
-        self.revision = 0
+        self._maybe_start_taeh3_worker()
         self.completed_frames = 0
         self.segment_paths = []
         self.stitched_path = None
@@ -367,14 +374,69 @@ class LongFormPreviewPublisher:
             pass
 
     def _announce(self, kind, **fields):
-        self.revision += 1
-        payload = {
-            "node_id": self.node_id,
-            "kind": kind,
-            "revision": self.revision,
+        lock = getattr(self, "_revision_lock", None)
+        if lock is None:
+            lock = self._revision_lock = threading.Lock()
+        with lock:
+            self.revision += 1
+            payload = {
+                "node_id": self.node_id,
+                "kind": kind,
+                "revision": self.revision,
+            }
+            payload.update(fields)
+            _send_event(payload)
+
+    def _maybe_start_taeh3_worker(self):
+        if not self.options.current_enabled:
+            return
+        if self.options.decoder not in (DECODER_AUTO, DECODER_TAEH3):
+            return
+        backend = self._taeh3_backend()
+        device = getattr(backend, "device", None)
+        if backend is None or device is None or torch.device(device).type != "cuda":
+            return
+        try:
+            self._taeh3_async_worker = AsyncTAEH3PreviewWorker(
+                backend,
+                self._publish_async_taeh3,
+                self._async_taeh3_failed,
+            )
+        except Exception as exc:
+            logging.warning("%s CUDA worker unavailable: %s", LOG, exc)
+            self._taeh3_async_worker = None
+
+    def _taeh3_limit(self, video):
+        return 1 if _short_chunk(video) else max(0, int(self.options.current_frames))
+
+    def _async_taeh3_failed(self, exc):
+        if self._taeh3_async_failed:
+            return
+        self._taeh3_async_failed = True
+        self.taeh3 = None
+        message = "%s: %s" % (type(exc).__name__, exc)
+        logging.warning("%s asynchronous TAEH3 preview stopped: %s", LOG, message)
+        self._announce("current_chunk_error", message=message[:500])
+
+    def _publish_async_taeh3(self, job, frames_u8):
+        frames_u8 = _resize_frames_u8(frames_u8, self.options.width)
+        if int(frames_u8.shape[0]) == 0:
+            raise ValueError("TAEH3 decoded no frames")
+        preview_fps = self.fps
+        path, fmt = self._write_current(frames_u8, preview_fps)
+        fields = {
+            "chunk_index": job.chunk_index,
+            "step": job.step,
+            "total_steps": job.total_steps,
+            "frames": int(frames_u8.shape[0]),
+            "mode": DECODER_TAEH3,
+            "format": fmt,
+            "preview_fps": int(preview_fps),
+            "asset": _asset_payload(path, "temp"),
         }
-        payload.update(fields)
-        _send_event(payload)
+        self._announce("current_chunk", **fields)
+        del frames_u8
+        gc.collect()
 
     def sampler_callback(self, chunk_index: int):
         if not self.options.current_enabled:
@@ -389,13 +451,36 @@ class LongFormPreviewPublisher:
             ):
                 return
             try:
-                self.publish_current_chunk(
-                    chunk_index=int(chunk_index),
-                    step=completed_step,
-                    total_steps=int(total_steps),
-                    denoised=denoised,
-                    current=current,
-                )
+                worker = getattr(self, "_taeh3_async_worker", None)
+                backend = self._taeh3_backend()
+                if (
+                    worker is not None
+                    and backend is not None
+                    and not self._taeh3_async_failed
+                    and worker.accepting
+                ):
+                    video = _video_latent(denoised if denoised is not None else current)
+                    limit = self._taeh3_limit(video)
+                    needed = backend.latents_for_frames(limit)
+                    snapshot = video[:1] if needed is None else video[:1, :, :needed]
+                    snapshot = snapshot.detach().clone()
+                    producer_event = worker.record_producer_event(video.device)
+                    worker.submit_snapshot(
+                        snapshot,
+                        producer_event,
+                        chunk_index=int(chunk_index),
+                        step=completed_step,
+                        total_steps=int(total_steps),
+                        limit=limit,
+                    )
+                else:
+                    self.publish_current_chunk(
+                        chunk_index=int(chunk_index),
+                        step=completed_step,
+                        total_steps=int(total_steps),
+                        denoised=denoised,
+                        current=current,
+                    )
             except Exception as exc:
                 message = "%s: %s" % (type(exc).__name__, exc)
                 logging.warning(
@@ -487,6 +572,13 @@ class LongFormPreviewPublisher:
         # Tests and older callers may build a publisher without __init__.
         return getattr(self, "taeh3", None)
 
+    def close(self):
+        worker = getattr(self, "_taeh3_async_worker", None)
+        if worker is None:
+            return
+        self._taeh3_async_worker = None
+        worker.close()
+
     def _decoder_chain(self):
         """Backends to try, in order, for the configured decoder setting."""
         wanted = getattr(self.options, "decoder", DECODER_AUTO) or DECODER_AUTO
@@ -529,7 +621,13 @@ class LongFormPreviewPublisher:
         if int(frames_u8.shape[0]) == 1:
             return self._write_current_still(frames_u8, fps)
         try:
-            path = os.path.join(self.temp_root, "current_%06d.mp4" % (self.revision + 1))
+            lock = getattr(self, "_revision_lock", None)
+            if lock is None:
+                lock = self._revision_lock = threading.Lock()
+            with lock:
+                self._asset_counter = getattr(self, "_asset_counter", 0) + 1
+                asset_number = self._asset_counter
+            path = os.path.join(self.temp_root, "current_%06d.mp4" % asset_number)
             writer = FFmpegVideoWriter(
                 path,
                 width=int(frames_u8.shape[2]),

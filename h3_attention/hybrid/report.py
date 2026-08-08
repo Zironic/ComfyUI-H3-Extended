@@ -49,6 +49,8 @@ def summarize(records, seconds=None, timing=None):
             "total_measured_attention_cuda_seconds": 0.0,
             "request_wall_seconds": None if seconds is None else float(seconds),
             "attention_cuda_to_request_wall_ratio": None,
+            "total_measured_dit_block_cuda_seconds": 0.0,
+            "dit_block_cuda_to_request_wall_ratio": None,
             "ratio_caveat": (
                 "CUDA event timing was disabled; no attention CUDA time was measured."
             ),
@@ -83,14 +85,16 @@ def render(payload):
         "",
         "Phase A uses direct 128Q x 64KV Sparse Sage routing.",
         "Flex, compatibility fallback, and Sol head dispatch are not enabled.",
-        "Timing stages cover direct LUT construction, V FP8 preparation, Q/K "
+        "Timing stages cover the DiT block, activation/MLP stages, attention "
+        "projection stages (including fused QKV when selected), direct LUT "
+        "construction, V FP8 preparation, Q/K "
         "int8 quantization, and the low-level Sparse Sage kernel.",
     ])
     timing = summary.get("timing") or {}
-    if timing.get("call_count", 0):
+    if timing.get("enabled") and timing.get("stages"):
         lines.extend([
             "",
-            "CUDA timing (deferred): %d attention calls" % timing["call_count"],
+            "CUDA timing (deferred): %d attention calls" % timing.get("call_count", 0),
             *[
                 "%s: %d calls, sum %.3f ms, mean %.3f ms" % (
                     stage, values["count"], values["sum_ms"], values["mean_ms"]
@@ -105,8 +109,13 @@ def render(payload):
             "attention-CUDA/request-wall ratio: %s" % (
                 "unknown" if timing.get("attention_cuda_to_request_wall_ratio") is None
                 else "%.3f" % timing["attention_cuda_to_request_wall_ratio"]),
+            "measured DiT block CUDA seconds: %.6f" % (
+                timing.get("total_measured_dit_block_cuda_seconds", 0.0)),
+            "DiT-block-CUDA/request-wall ratio: %s" % (
+                "unknown" if timing.get("dit_block_cuda_to_request_wall_ratio") is None
+                else "%.3f" % timing["dit_block_cuda_to_request_wall_ratio"]),
             timing.get("ratio_caveat", ""),
-            "Stage times are nested; do not add them to total_hybrid_attention.",
+            "Stage times are nested/overlapping; do not sum stage totals.",
         ])
     return "\n".join(lines) + "\n"
 

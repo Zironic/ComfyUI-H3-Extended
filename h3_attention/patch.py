@@ -76,12 +76,13 @@ def key_for(index):
     return "%s.%d.attn.forward" % (BLOCKS_ATTR, index)
 
 
-def install(model_patcher, backend=None, attention=None):
+def install(model_patcher, backend=None, attention=None, projector=None):
     """Patch every main block. Idempotent; foreign ownership is an error."""
     modules = validate(model_patcher)
     existing = getattr(model_patcher, "object_patches", {})
 
     desired_backend = getattr(backend, "name", None)
+    desired_projector = getattr(projector, "name", None)
     ours = [
         index for index in range(len(modules))
         if getattr(existing.get(key_for(index)), "_h3_attention", False)
@@ -91,7 +92,12 @@ def install(model_patcher, backend=None, attention=None):
             getattr(existing[key_for(index)], "_h3_backend", None)
             for index in ours
         }
-        if installed_backends == {desired_backend}:
+        installed_projectors = {
+            getattr(existing[key_for(index)], "_h3_projector", None)
+            for index in ours
+        }
+        if (installed_backends == {desired_backend}
+                and installed_projectors == {desired_projector}):
             logging.info("[H3 attention] block forwards already patched (%d)", len(modules))
             return 0
         raise H3PatchError(
@@ -115,7 +121,13 @@ def install(model_patcher, backend=None, attention=None):
     for index, attn in enumerate(modules):
         model_patcher.add_object_patch(
             key_for(index),
-            make_forward(attn, index, backend=backend, attention=attention),
+            make_forward(
+                attn,
+                index,
+                backend=backend,
+                attention=attention,
+                projector=projector,
+            ),
         )
 
     logging.info(

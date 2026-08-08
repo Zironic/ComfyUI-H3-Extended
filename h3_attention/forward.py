@@ -15,39 +15,46 @@ import comfy.ldm.minimax.model as h3_model
 import comfy.model_management
 import comfy.quant_ops
 
-from .observer import notify_attention, marked_observed
+from .observer import OBSERVER_KEY, notify_attention, marked_observed
+
+try:
+    from ..h3_runtime.timing import timed_stage
+except ImportError:
+    from h3_runtime.timing import timed_stage
 
 
-def project_qkv(module, x, rope_freqs):
+def project_qkv(module, x, rope_freqs, transformer_options=None):
     """Mirror core's fused projection plus fused RMSNorm/RoPE."""
     seq = x.shape[0]
     inner = module.heads * module.head_dim
 
     # Do not bind the fused output separately. These three views are the only
     # Python references keeping the full allocation alive.
-    q, k, v = module.qkv_proj(x).split(inner, dim=-1)
+    with timed_stage(transformer_options, "qkv_proj"):
+        q, k, v = module.qkv_proj(x).split(inner, dim=-1)
     v = v.view(seq, module.heads, module.head_dim)
 
-    if rope_freqs is not None:
-        if comfy.model_management.in_training:
-            raise RuntimeError(
-                "h3_attention.forward is inference-only; core training uses an "
-                "out-of-place RMSNorm/RoPE path that defeats lifetime control.")
-        q = q.view(1, seq, module.heads, module.head_dim)
-        k = k.view(1, seq, module.heads, module.head_dim)
-        qw = comfy.model_management.cast_to(module.q_norm.weight, device=x.device)
-        kw = comfy.model_management.cast_to(module.k_norm.weight, device=x.device)
-        rot = rope_freqs.shape[-3] * 2
-        comfy.quant_ops.ck.rms_rope_split_half_(
-            q, k, rope_freqs, qw, kw,
-            epsilon=module.q_norm.eps,
-            rot_dim=rot,
-        )
-        q = q[0]
-        k = k[0]
-    else:
-        q = module.q_norm(q.view(seq, module.heads, module.head_dim))
-        k = module.k_norm(k.view(seq, module.heads, module.head_dim))
+    with timed_stage(transformer_options, "qk_rmsnorm_rope"):
+        if rope_freqs is not None:
+            if comfy.model_management.in_training:
+                raise RuntimeError(
+                    "h3_attention.forward is inference-only; core training uses an "
+                    "out-of-place RMSNorm/RoPE path that defeats lifetime control.")
+            q = q.view(1, seq, module.heads, module.head_dim)
+            k = k.view(1, seq, module.heads, module.head_dim)
+            qw = comfy.model_management.cast_to(module.q_norm.weight, device=x.device)
+            kw = comfy.model_management.cast_to(module.k_norm.weight, device=x.device)
+            rot = rope_freqs.shape[-3] * 2
+            comfy.quant_ops.ck.rms_rope_split_half_(
+                q, k, rope_freqs, qw, kw,
+                epsilon=module.q_norm.eps,
+                rot_dim=rot,
+            )
+            q = q[0]
+            k = k[0]
+        else:
+            q = module.q_norm(q.view(seq, module.heads, module.head_dim))
+            k = module.k_norm(k.view(seq, module.heads, module.head_dim))
 
     return q, k, v
 
@@ -73,7 +80,7 @@ def _legacy_attention(module, q, k, v, transformer_options, attention=None):
         )
 
 
-def make_forward(module, layer_index, backend=None, attention=None):
+def make_forward(module, layer_index, backend=None, attention=None, projector=None):
     """Build one reversible block-forward replacement.
 
     ``backend`` is the production two-stage backend. ``attention`` is retained
@@ -81,10 +88,42 @@ def make_forward(module, layer_index, backend=None, attention=None):
     """
     if backend is not None and attention is not None:
         raise ValueError("pass either backend or attention, not both")
+    if projector is not None and backend is None:
+        raise ValueError("a fused QKV projector requires a consuming backend")
 
     def forward(x, rope_freqs=None, transformer_options=None):
         transformer_options = transformer_options if transformer_options is not None else {}
-        q, k, v = project_qkv(module, x, rope_freqs)
+        use_projector = (
+            projector is not None
+            and not transformer_options.get(OBSERVER_KEY)
+        )
+        if use_projector:
+            with timed_stage(transformer_options, "fused_qkv_projection"):
+                projected = projector.project(
+                    module,
+                    x,
+                    rope_freqs,
+                    layer_index=layer_index,
+                    transformer_options=transformer_options,
+                )
+            prepared = backend.prepare_projected(
+                projected,
+                layer_index=layer_index,
+                transformer_options=transformer_options,
+            )
+            del projected
+            out_hnd = backend.execute(prepared)
+            del prepared
+            if out_hnd.ndim != 4:
+                raise RuntimeError(
+                    "%s returned rank-%d output; expected HND rank 4"
+                    % (getattr(backend, "name", type(backend).__name__), out_hnd.ndim))
+            out = out_hnd.transpose(1, 2).reshape(
+                out_hnd.shape[0], out_hnd.shape[2], module.heads * module.head_dim)
+            with timed_stage(transformer_options, "out_proj"):
+                return module.out_proj(out.squeeze(0))
+
+        q, k, v = project_qkv(module, x, rope_freqs, transformer_options)
         q, k, v = to_hnd(q, k, v)
 
         with torch.no_grad():
@@ -117,11 +156,13 @@ def make_forward(module, layer_index, backend=None, attention=None):
             out = out_hnd.transpose(1, 2).reshape(
                 out_hnd.shape[0], out_hnd.shape[2], module.heads * module.head_dim)
 
-        return module.out_proj(out.squeeze(0))
+        with timed_stage(transformer_options, "out_proj"):
+            return module.out_proj(out.squeeze(0))
 
     forward._h3_attention = True
     forward._h3_layer_index = layer_index
     forward._h3_backend = getattr(backend, "name", None)
+    forward._h3_projector = getattr(projector, "name", None)
     return forward
 
 # Backward-compatible imports for the existing characterization test. The guard

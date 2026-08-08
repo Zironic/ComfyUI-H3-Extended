@@ -231,7 +231,12 @@ class MiniMaxH3LongFormRef2VPreview(MiniMaxH3LongFormRef2V):
                 ref_images=ref_images,
             )
         finally:
-            deactivate(token)
+            try:
+                publisher.close()
+            except Exception as exc:
+                logging.warning("%s async preview close failed: %s", LOG, exc)
+            finally:
+                deactivate(token)
 
 
 class MiniMaxH3LongFormPreviewExtension(ComfyExtension):

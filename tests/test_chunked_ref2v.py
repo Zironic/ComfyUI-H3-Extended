@@ -8,7 +8,7 @@ Run from the ComfyUI root:
 import os
 import shutil
 import sys
-import tempfile
+import h3_test_tempfile as tempfile
 
 import torch
 

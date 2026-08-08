@@ -1,0 +1,63 @@
+{
+  "break_even": {},
+  "metadata": {
+    "architecture": "sm89",
+    "budget": 0.5,
+    "frames": 209,
+    "gpu": "NVIDIA GeForce RTX 4070",
+    "head_dim": 128,
+    "heads": 56,
+    "height": 768,
+    "pattern": "uniform",
+    "sequence": 63448,
+    "sweep": false,
+    "text_len": 256,
+    "timing": "end_to_end",
+    "video_tokens": 62496,
+    "width": 1344
+  },
+  "router": null,
+  "rows": [
+    {
+      "attention_ms": 1014.9082000134513,
+      "budget": 0.5,
+      "flex_q_tile": 64,
+      "hard_head_fraction": 0.0,
+      "hard_q_fraction": 0.0,
+      "latency_ms": 1014.9082000134513,
+      "mode": "dense_sage",
+      "peak_allocated_gib": 4.240818023681641,
+      "router_as_percent_of_saved_attention": null,
+      "saved_attention_ms": 0.0,
+      "speedup_vs_dense": 1.0
+    },
+    {
+      "actual_video_tile_density": 0.5005117707267144,
+      "attention_ms": 661.297700018622,
+      "budget": 0.5,
+      "dense_q_tiles": 8,
+      "direct_lut_construction_ms": 14.443519592285156,
+      "flex_q_tile": 64,
+      "full_mask_density": 0.5159989594172737,
+      "hard_head_fraction": 0.0,
+      "hard_q_fraction": 0.0,
+      "kv_tiles": 992,
+      "latency_ms": 661.297700018622,
+      "mode": "sparse_sage_128x64",
+      "peak_allocated_gib": 3.916820526123047,
+      "pure_video_kv_tiles": 977,
+      "pure_video_q_tiles": 488,
+      "q_k_int8_quantization_ms": 8.761343955993652,
+      "q_tiles": 496,
+      "requested_video_budget": 0.5,
+      "retained_video_kv_tiles": 489,
+      "router_as_percent_of_saved_attention": null,
+      "saved_attention_ms": 353.6104999948293,
+      "sparse_q_tiles": 488,
+      "sparse_sage_low_level_kernel_ms": 550.7133178710938,
+      "speedup_vs_dense": 1.5347221077358528,
+      "total_hybrid_attention_ms": 597.7825317382812,
+      "v_fp8_preparation_ms": 24.602624893188477
+    }
+  ]
+}

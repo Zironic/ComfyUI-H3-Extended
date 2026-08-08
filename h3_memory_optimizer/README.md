@@ -2,11 +2,11 @@
 
 `MiniMax H3 Memory Optimizer (Zi)` combines the lossless prepared-QKV attention
 and bounded-MLP paths with optional Sol-Engine experiments behind one model
-patch. The ordinary defaults remain conservative:
+patch. The ordinary defaults use the measured held-weight native MLP path:
 
 ```text
 attention = auto                # prepared dense Sage
-activation = mlp_chunked_bf16
+activation = mlp_chunked_native     # held weights, 2048-row slabs
 adaln_precompute = off
 block_cache = off
 ```

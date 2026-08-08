@@ -208,7 +208,7 @@ a surprise.
 
 Widgets: `attention` (default `auto`), `attention_fallback` (`allow` keeps the
 run alive, `error` refuses to start), `activation` (default
-`mlp_chunked_bf16`), plus the optional `cuda_async_soft_gc` /
+`mlp_chunked_native` with held weights and 2048-row slabs), plus the optional `cuda_async_soft_gc` /
 `cuda_async_release_threshold_gib` pool policy, which is worth considering for
 an unattended multi-hour suite under cudaMallocAsync.
 

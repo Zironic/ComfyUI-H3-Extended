@@ -1129,7 +1129,12 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
                 publisher.flush_completed_chunk()
             except Exception as exc:
                 logging.warning("%s final preview flush failed: %s", LOG, exc)
-            deactivate(preview_token)
+            try:
+                publisher.close()
+            except Exception as exc:
+                logging.warning("%s async preview close failed: %s", LOG, exc)
+            finally:
+                deactivate(preview_token)
             close_writers(video_writer, audio_writer, commit=completed)
 
         output_path = mux_generated_audio(

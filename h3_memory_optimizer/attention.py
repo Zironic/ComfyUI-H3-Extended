@@ -81,6 +81,7 @@ class AttentionDecision:
     adapter: str | None
     reason: str
     environment: RuntimeEnvironment
+    projector: object | None = None
 
     @property
     def optimized(self):

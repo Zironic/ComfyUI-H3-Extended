@@ -4,7 +4,8 @@ from dataclasses import dataclass
 import math
 
 MODE_SAGE128 = "sage128"
-IMPLEMENTED_MODES = (MODE_SAGE128,)
+MODE_SAGE128_FUSED_QKV = "sage128_fused_qkv"
+IMPLEMENTED_MODES = (MODE_SAGE128, MODE_SAGE128_FUSED_QKV)
 
 
 @dataclass(frozen=True)

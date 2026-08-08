@@ -268,6 +268,82 @@ class SparseSageExecutor:
             timing=timing,
         )
 
+    def prepare_projected(self, projected, lut, valid_block_num, *, metadata,
+                          timing=None):
+        """Consume Q/K already emitted in Sparse Sage's native representation."""
+        from .fused_qkv import validate_prepared_fused_qkv
+
+        validate_prepared_fused_qkv(projected)
+        heads = int(projected.heads)
+        sequence = int(projected.sequence)
+        expected_lut = (
+            1,
+            heads,
+            (sequence + Q_TILE - 1) // Q_TILE,
+            (sequence + KV_TILE - 1) // KV_TILE,
+        )
+        if tuple(lut.shape) != expected_lut or tuple(valid_block_num.shape) != expected_lut[:-1]:
+            raise SparseSageError("Sparse Sage LUT/valid shapes do not match fused H3 QKV")
+        if lut.dtype != torch.int32 or valid_block_num.dtype != torch.int32:
+            raise SparseSageError("Sparse Sage LUT and valid counts must be int32")
+        if not lut.is_contiguous() or not valid_block_num.is_contiguous():
+            raise SparseSageError("Sparse Sage LUT and valid counts must be contiguous")
+        if lut.device != projected.q_int8.device or valid_block_num.device != projected.q_int8.device:
+            raise SparseSageError("Sparse Sage LUT and fused H3 QKV devices differ")
+        if not self.allow_cpu_for_tests:
+            if not projected.q_int8.is_cuda:
+                raise SparseSageError("fused H3 Sparse Sage requires CUDA")
+            capability = tuple(torch.cuda.get_device_capability(projected.q_int8.device))
+            if capability != (8, 9):
+                raise SparseSageError(
+                    "fused H3 Sparse Sage is SM89-only; device capability is %d.%d"
+                    % capability
+                )
+
+        v_timing = timing.begin("v_fp8_preparation") if timing is not None else None
+        try:
+            v_fp8, v_scale = self.v_preparer(projected.v, self.api.v_fused)
+            padded = (sequence + 127) // 128 * 128
+            if (tuple(v_fp8.shape) != (1, heads, projected.head_dim, padded)
+                    or v_fp8.dtype != torch.float8_e4m3fn
+                    or v_fp8.device != projected.v.device
+                    or not v_fp8.is_contiguous()
+                    or tuple(v_scale.shape) != (1, heads, projected.head_dim)
+                    or v_scale.dtype != torch.float32
+                    or v_scale.device != projected.v.device
+                    or not v_scale.is_contiguous()):
+                raise SparseSageError("V preparer returned an invalid FP8 carrier")
+        finally:
+            if timing is not None:
+                timing.end(v_timing)
+
+        projected_metadata = dict(metadata)
+        projected_metadata.update({
+            "qkv_projection": "fused_int8",
+            "smooth_k": bool(projected.smooth_k),
+        })
+        pv_threshold = torch.full(
+            (heads,), 50.0, dtype=torch.float32, device=projected.q_int8.device
+        )
+        return PreparedSparseSage(
+            q_int8=projected.q_int8,
+            k_int8=projected.k_int8,
+            v_fp8=v_fp8,
+            q_scale=projected.q_scale,
+            k_scale=projected.k_scale,
+            v_scale=v_scale,
+            lut=lut,
+            valid_block_num=valid_block_num,
+            output_dtype=projected.output_dtype,
+            output_shape=(1, heads, sequence, projected.head_dim),
+            layer_index=int(projected.layer_index),
+            sequence=sequence,
+            heads=heads,
+            metadata=projected_metadata,
+            pv_threshold=pv_threshold,
+            timing=timing,
+        )
+
     def execute(self, prepared):
         output = torch.empty(prepared.output_shape, dtype=prepared.output_dtype,
                              device=prepared.q_int8.device)

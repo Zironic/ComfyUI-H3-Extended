@@ -8,15 +8,32 @@ import torch
 
 from .report import validate_run_tag, write_request
 
+try:
+    from ...h3_runtime.timing import publish_timing
+except ImportError:
+    from h3_runtime.timing import publish_timing
+
 LOG_PREFIX = "[H3 hybrid sparse]"
 
 
 TIMING_STAGES = (
+    "total_dit_block",
+    "adaln_proj",
+    "norm1_modulation",
+    "qkv_proj",
+    "qk_rmsnorm_rope",
+    "fused_qkv_projection",
     "direct_lut_construction",
     "v_fp8_preparation",
     "q_k_int8_quantization",
     "sparse_sage_low_level_kernel",
     "total_hybrid_attention",
+    "out_proj",
+    "attention_residual_gate",
+    "norm2_modulation",
+    "mlp_fc1",
+    "mlp_swiglu_fc2",
+    "final_mlp_gate",
 )
 
 
@@ -113,6 +130,7 @@ class DeferredCudaTiming:
                 self._last_event.synchronize()
         stages = {}
         total_ms = 0.0
+        total_block_ms = 0.0
         for stage in TIMING_STAGES:
             values = [self._elapsed_ms(start, end) for _, start, end in self._samples[stage]]
             stage_sum = sum(values)
@@ -123,11 +141,15 @@ class DeferredCudaTiming:
             }
             if stage == "total_hybrid_attention":
                 total_ms = stage_sum
+            elif stage == "total_dit_block":
+                total_block_ms = stage_sum
         self._resolved = self.summary(request_wall_seconds, stages=stages,
-                                      measured_ms=total_ms)
+                                      measured_ms=total_ms,
+                                      measured_block_ms=total_block_ms)
         return self._resolved
 
-    def summary(self, request_wall_seconds=None, *, stages=None, measured_ms=0.0):
+    def summary(self, request_wall_seconds=None, *, stages=None, measured_ms=0.0,
+                measured_block_ms=0.0):
         stages = stages or {
             stage: {"count": 0, "sum_ms": 0.0, "mean_ms": 0.0}
             for stage in TIMING_STAGES
@@ -135,6 +157,8 @@ class DeferredCudaTiming:
         wall = None if request_wall_seconds is None else float(request_wall_seconds)
         cuda_seconds = float(measured_ms) / 1000.0
         ratio = None if wall is None or wall <= 0.0 else cuda_seconds / wall
+        block_seconds = float(measured_block_ms) / 1000.0
+        block_ratio = None if wall is None or wall <= 0.0 else block_seconds / wall
         return {
             "enabled": bool(self.enabled),
             "call_count": int(stages["total_hybrid_attention"]["count"]),
@@ -142,6 +166,8 @@ class DeferredCudaTiming:
             "total_measured_attention_cuda_seconds": cuda_seconds,
             "request_wall_seconds": wall,
             "attention_cuda_to_request_wall_ratio": ratio,
+            "total_measured_dit_block_cuda_seconds": block_seconds,
+            "dit_block_cuda_to_request_wall_ratio": block_ratio,
             "ratio_caveat": (
                 "CUDA event time is asynchronous and overlaps request wall time; "
                 "the ratio is indicative, not an exact decomposition."
@@ -174,6 +200,16 @@ class HybridStatsCollector:
             self._records = []
             if self._timing is not None:
                 self._timing.on_request_reset(self._request_id)
+
+    def before_forward(self, snapshot, transformer_options, payload):
+        """Start and publish one timer before the first DiT block executes."""
+        with self._lock:
+            if self._timing is None:
+                return
+            device = getattr(snapshot, "device", None)
+            cuda = getattr(device, "type", str(device).split(":", 1)[0]) == "cuda"
+            self._timing.begin_request(snapshot.request_id, cuda=cuda)
+            publish_timing(transformer_options, self._timing)
 
     def record(self, metadata):
         with self._lock:

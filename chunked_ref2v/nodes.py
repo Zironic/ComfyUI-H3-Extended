@@ -100,7 +100,7 @@ class MiniMaxH3Ref2VExperimentHarness(io.ComfyNode):
                                        "comparison survives, absolute resource figures stop being "
                                        "attributable. 'error' refuses to start the run instead."),
                 io.Combo.Input("activation", options=list(memory.ACTIVATION_MODES),
-                               default="mlp_chunked_bf16",
+                               default=memory.DEFAULT_MODE,
                                tooltip="MLP activation chunking, armed with attention. 'off' "
                                        "disables it."),
                 io.Boolean.Input("cuda_async_soft_gc", default=False,
@@ -146,7 +146,7 @@ class MiniMaxH3Ref2VExperimentHarness(io.ComfyNode):
                 ref_image_size="native", cond_cache="auto",
                 monolithic_reference=False, tail_frames=17,
                 attention="auto", attention_fallback="allow",
-                activation="mlp_chunked_bf16", cuda_async_soft_gc=False,
+                activation=memory.DEFAULT_MODE, cuda_async_soft_gc=False,
                 cuda_async_release_threshold_gib=11.0, reuse_run="",
                 width=0, height=0, save_latents=True, save_frames=True,
                 continue_after_failure=True, preview_experiment="",

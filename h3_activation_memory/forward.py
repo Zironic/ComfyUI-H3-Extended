@@ -7,9 +7,14 @@ import torch
 import comfy.model_management
 
 from .chunks import iter_mod_chunks, validate_mod_segments
-from .linear import HeldMLP, UnsafeHeldWeights, module_mlp_chunk
+from .linear import HeldMLP, UnsafeHeldWeights, module_fc1, module_swiglu_fc2
 from .observer import notify_activation
 from .stats import get_stats
+
+try:
+    from ..h3_runtime.timing import timed_stage
+except ImportError:
+    from h3_runtime.timing import timed_stage
 
 LOG_PREFIX = "[H3 activation memory]"
 
@@ -35,7 +40,7 @@ def make_forward(block, layer_index, config, original_forward=None):
     """
     original_forward = original_forward or block.forward
 
-    def forward(x, t_emb, mod_segments, rope_freqs, transformer_options={}):
+    def _forward(x, t_emb, mod_segments, rope_freqs, transformer_options={}):
         if comfy.model_management.in_training:
             raise RuntimeError(
                 "h3_activation_memory is inference-only; training requires "
@@ -54,7 +59,8 @@ def make_forward(block, layer_index, config, original_forward=None):
                 transformer_options=transformer_options,
             )
 
-        shifts = block.adaln_proj(t_emb)
+        with timed_stage(transformer_options, "adaln_proj"):
+            shifts = block.adaln_proj(t_emb)
         (
             shift_msa,
             scale_msa,
@@ -77,9 +83,10 @@ def make_forward(block, layer_index, config, original_forward=None):
             dtype=str(x.dtype),
         )
 
-        h = block.norm1(x)
-        for start, stop, row in segments:
-            _scale_shift(h[start:stop], shift_msa[row], scale_msa[row])
+        with timed_stage(transformer_options, "norm1_modulation"):
+            h = block.norm1(x)
+            for start, stop, row in segments:
+                _scale_shift(h[start:stop], shift_msa[row], scale_msa[row])
         notify_activation(
             "attention_norm_ready",
             layer_index,
@@ -97,8 +104,9 @@ def make_forward(block, layer_index, config, original_forward=None):
             transformer_options,
             shape=tuple(attn_out.shape),
         )
-        for start, stop, row in segments:
-            _gate_add(x[start:stop], attn_out[start:stop], gate_msa[row])
+        with timed_stage(transformer_options, "attention_residual_gate"):
+            for start, stop, row in segments:
+                _gate_add(x[start:stop], attn_out[start:stop], gate_msa[row])
         del h, attn_out
         notify_activation(
             "attention_gated", layer_index, transformer_options
@@ -151,21 +159,26 @@ def make_forward(block, layer_index, config, original_forward=None):
                     stop=chunk.stop,
                     mod_row=chunk.mod_row,
                 )
-                h = block.norm2(x[chunk.start : chunk.stop])
-                _scale_shift(
-                    h, shift_mlp[chunk.mod_row], scale_mlp[chunk.mod_row]
-                )
+                with timed_stage(transformer_options, "norm2_modulation"):
+                    h = block.norm2(x[chunk.start : chunk.stop])
+                    _scale_shift(
+                        h, shift_mlp[chunk.mod_row], scale_mlp[chunk.mod_row]
+                    )
 
                 if held is not None:
-                    expanded = held.fc1(h)
-                    out, path = held.fc2_swiglu(
-                        expanded, native=config.native_swiglu
-                    )
+                    with timed_stage(transformer_options, "mlp_fc1"):
+                        expanded = held.fc1(h)
+                    with timed_stage(transformer_options, "mlp_swiglu_fc2"):
+                        out, path = held.fc2_swiglu(
+                            expanded, native=config.native_swiglu
+                        )
                 else:
-                    out, path = module_mlp_chunk(
-                        block.mlp, h, native=config.native_swiglu
-                    )
-                    expanded = None
+                    with timed_stage(transformer_options, "mlp_fc1"):
+                        expanded = module_fc1(block.mlp, h)
+                    with timed_stage(transformer_options, "mlp_swiglu_fc2"):
+                        out, path = module_swiglu_fc2(
+                            block.mlp, expanded, native=config.native_swiglu
+                        )
 
                 stats.record_path(path)
                 notify_activation(
@@ -176,11 +189,12 @@ def make_forward(block, layer_index, config, original_forward=None):
                     path=path,
                     output_shape=tuple(out.shape),
                 )
-                _gate_add(
-                    x[chunk.start : chunk.stop],
-                    out,
-                    gate_mlp[chunk.mod_row],
-                )
+                with timed_stage(transformer_options, "final_mlp_gate"):
+                    _gate_add(
+                        x[chunk.start : chunk.stop],
+                        out,
+                        gate_mlp[chunk.mod_row],
+                    )
                 del h, out, expanded
                 notify_activation(
                     "mlp_chunk_gated",
@@ -199,6 +213,18 @@ def make_forward(block, layer_index, config, original_forward=None):
             chunks=len(chunks),
         )
         return x
+
+    def forward(x, t_emb, mod_segments, rope_freqs, transformer_options={}):
+        if comfy.model_management.in_training or _compiler_active():
+            return _forward(
+                x, t_emb, mod_segments, rope_freqs,
+                transformer_options=transformer_options,
+            )
+        with timed_stage(transformer_options, "total_dit_block"):
+            return _forward(
+                x, t_emb, mod_segments, rope_freqs,
+                transformer_options=transformer_options,
+            )
 
     forward._h3_activation_memory = True
     forward._h3_activation_config = config.signature

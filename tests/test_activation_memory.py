@@ -18,17 +18,27 @@ import comfy.ops  # noqa: E402
 from comfy.ldm.minimax.model import DiTBlock  # noqa: E402
 
 from h3_activation_memory import chunks  # noqa: E402
-from h3_activation_memory.config import ActivationMemoryConfig  # noqa: E402
+from h3_activation_memory.config import MODE_NATIVE, ActivationMemoryConfig  # noqa: E402
 from h3_activation_memory.forward import make_forward  # noqa: E402
 from h3_activation_memory.linear import HeldMLP  # noqa: E402
 from h3_activation_memory.observer import observing  # noqa: E402
 from h3_activation_memory import patch  # noqa: E402
+from h3_attention.hybrid.stats import DeferredCudaTiming  # noqa: E402
+from h3_runtime.timing import publish_timing  # noqa: E402
 
 
 def check(condition, message):
     if not condition:
         raise AssertionError(message)
     print("  ok: %s" % message)
+
+
+def test_defaults():
+    print("defaults")
+    config = ActivationMemoryConfig()
+    check(config.mode == MODE_NATIVE, "native SwiGLU is the default")
+    check(config.chunk_rows == 2048, "2048 rows is the default slab size")
+    check(config.prefer_held_weights, "held weights are enabled by default")
 
 
 def build_block(seed=0):
@@ -146,6 +156,58 @@ def test_multiple_chunks():
     check(out.shape == (700, 32), "large synthetic block completes")
 
 
+class FakeTimingEvent:
+    def __init__(self, clock, events):
+        self.clock = clock
+        self.events = events
+        self.value = None
+
+    def record(self):
+        self.clock[0] += 1.0
+        self.value = self.clock[0]
+        self.events.append("record")
+
+    def synchronize(self):
+        self.events.append("synchronize")
+
+    def elapsed_time(self, other):
+        return other.value - self.value
+
+
+def test_deferred_stage_counts():
+    print("deferred activation stage timing")
+    block = build_block(seed=15)
+    x = torch.randn(700, 32) * 0.1
+    t_emb = torch.randn(1, 24) * 0.1
+    segments = [(0, 300, 0), (300, 600, 1), (600, 700, 2)]
+    clock = [0.0]
+    events = []
+    timing = DeferredCudaTiming(
+        True, event_factory=lambda **kwargs: FakeTimingEvent(clock, events)
+    )
+    timing.begin_request(4, cuda=True)
+    options = {}
+    publish_timing(options, timing)
+    config = ActivationMemoryConfig(
+        mode="mlp_chunked_bf16", chunk_rows=256, alignment=256
+    )
+    with torch.no_grad():
+        make_forward(block, 15, config)(
+            x, t_emb, segments, None, transformer_options=options
+        )
+    summary = timing.resolve(1.0)
+    check(summary["stages"]["total_dit_block"]["count"] == 1,
+          "one total DiT block timing event")
+    for stage in ("adaln_proj", "norm1_modulation", "attention_residual_gate"):
+        check(summary["stages"][stage]["count"] == 1,
+              "%s runs once per block" % stage)
+    for stage in ("norm2_modulation", "mlp_fc1", "mlp_swiglu_fc2", "final_mlp_gate"):
+        check(summary["stages"][stage]["count"] == 5,
+              "%s runs once per MLP chunk" % stage)
+    check(events.count("synchronize") == 1,
+          "activation timing synchronizes once at request end")
+
+
 def test_held_mlp():
     print("held MLP")
     block = build_block(seed=5)
@@ -174,7 +236,9 @@ class FakePatcher:
 def test_patch_install():
     print("patch install")
     model = FakePatcher([build_block(10), build_block(11)])
-    config = ActivationMemoryConfig(chunk_rows=256)
+    config = ActivationMemoryConfig(
+        mode="mlp_chunked_bf16", chunk_rows=256
+    )
     check(patch.install(model, config) == 2, "every main block is patched")
     check(
         set(model.object_patches) == {patch.key_for(0), patch.key_for(1)},
@@ -214,10 +278,12 @@ def test_patch_install():
 
 
 def main():
+    test_defaults()
     test_chunks()
     test_block_parity("mlp_chunked_bf16")
     test_block_parity("mlp_chunked_native")
     test_multiple_chunks()
+    test_deferred_stage_counts()
     test_held_mlp()
     test_patch_install()
     print("\nall H3 activation-memory self-tests passed")

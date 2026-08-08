@@ -128,9 +128,13 @@ class HeldMLP:
         return F.linear(activated, weight, bias), "held_bf16_swiglu"
 
 
-def module_mlp_chunk(mlp, h, native):
-    """Correct fallback using ordinary Comfy module calls for one bounded slab."""
-    expanded = mlp.fc1(h)
+def module_fc1(mlp, h):
+    """Run the fallback module fc1 call for one bounded slab."""
+    return mlp.fc1(h)
+
+
+def module_swiglu_fc2(mlp, expanded, native):
+    """Run the fallback SwiGLU/fc2 path for one bounded slab."""
     if native:
         return (
             comfy.ops.linear_input_act(mlp.fc2, expanded, "swiglu"),

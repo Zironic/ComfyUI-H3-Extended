@@ -23,6 +23,7 @@ from h3_memory_optimizer.attention import (  # noqa: E402
     SolAdapter,
     resolve_attention,
 )
+from h3_activation_memory.config import MODE_NATIVE  # noqa: E402
 from h3_memory_optimizer.config import ACTIVATION_OFF, MemoryOptimizerConfig  # noqa: E402
 from h3_memory_optimizer.patch import apply  # noqa: E402
 
@@ -134,6 +135,17 @@ def test_resolution():
 
 def test_config():
     print("config")
+    default = MemoryOptimizerConfig()
+    activation = default.activation_config()
+    check(default.activation == MODE_NATIVE, "native SwiGLU is the optimizer default")
+    check(default.chunk_rows == 2048, "2048 rows is the optimizer default slab size")
+    check(default.prefer_held_weights, "held weights are enabled by default")
+    check(
+        activation.mode == MODE_NATIVE
+        and activation.chunk_rows == 2048
+        and activation.prefer_held_weights,
+        "optimizer defaults reach the activation patch",
+    )
     config = MemoryOptimizerConfig(activation=ACTIVATION_OFF)
     check(config.activation_config() is None, "activation off produces no block patch")
     sol = MemoryOptimizerConfig(
@@ -161,6 +173,7 @@ def test_apply_order_and_fallback():
         requested = ATTENTION_SOL
         selected = ATTENTION_SOL
         backend = Backend()
+        projector = None
         reason = "supported"
         environment = env()
 
@@ -265,6 +278,7 @@ def test_backend_runtime_capabilities():
         requested = "hybrid_sparse"
         selected = "hybrid_sparse"
         backend = Backend()
+        projector = None
         reason = "explicit test backend"
         environment = env()
 

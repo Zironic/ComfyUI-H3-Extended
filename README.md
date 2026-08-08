@@ -52,16 +52,25 @@ tiles remain dense. Reports are written to
 `output/h3_hybrid_sparse/<run_tag>_<timestamp>/`.
 
 The `timing` input defaults to enabled. On CUDA it records deferred event pairs
-for direct LUT construction, V FP8 preparation, Q/K int8 quantization, the
-low-level Sparse Sage kernel, and total hybrid attention; events are synchronized
-once at request end. CUDA event time overlaps request wall time; the reported
-ratio is indicative rather than an exact decomposition. CPU tests remain
-un-timed unless a fake event factory is injected.
+for each executed DiT block and its activation/MLP stages, attention
+projections, direct LUT construction, V FP8 preparation, Q/K int8
+quantization, the low-level Sparse Sage kernel, and total hybrid attention;
+events are synchronized once at request end. CUDA event time overlaps request
+wall time; the reported ratios are indicative rather than an exact
+decomposition. CPU tests remain un-timed unless a fake event factory is
+injected.
 
-Phase A is SM89-only and requires the compiled `spas_sage_attn` package. It
-implements `sage128` only. Compatibility measurement, dense per-head fallback,
-Flex hard-tile fallback, Sol whole-head dispatch, and cost-aware automatic
-planning are later phases and are not exposed as working modes yet.
+Phase A is SM89-only and requires the compiled `spas_sage_attn` package. The
+default `sage128` mode retains the established BF16 QKV projection. The opt-in
+`sage128_fused_qkv` mode projects directly from the checkpoint's ConvRot-256
+INT8 weights into Sparse Sage's INT8 Q/K carriers, a BF16 V carrier, and the
+128Q/64KV routing summaries. It avoids the full BF16 QKV allocation; K smoothing
+is disabled on this path, so it remains an explicitly approximate experiment.
+`benchmarks/bench_fused_qkv.py` compares both projection paths using one real
+checkpoint block and can optionally execute the compiled Sparse Sage kernel.
+Dense per-head fallback, Flex hard-tile fallback, Sol whole-head dispatch, and
+cost-aware automatic planning are later phases and are not exposed as working
+modes yet.
 
 ---
 

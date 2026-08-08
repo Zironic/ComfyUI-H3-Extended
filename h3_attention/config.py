@@ -26,7 +26,7 @@ def _pin_token_refiner_to_sage(transformer_options):
     transformer_options["optimized_attention_override"] = override
 
 
-def configure_backend(model_patcher, backend):
+def configure_backend(model_patcher, backend, projector=None):
     """Install one already-preflighted consuming backend.
 
     Prepared Sage backends pin the small token refiner to registered Sage.  Sol
@@ -41,7 +41,7 @@ def configure_backend(model_patcher, backend):
     )
     if bool(getattr(backend, "requires_registered_sage", True)):
         _pin_token_refiner_to_sage(transformer_options)
-    count = install(model_patcher, backend=backend)
+    count = install(model_patcher, backend=backend, projector=projector)
     transformer_options["minimax_h3_attention_backend"] = backend_name
     logging.info("[H3 attention] configured %s on %d blocks", backend_name, count)
     return backend, count

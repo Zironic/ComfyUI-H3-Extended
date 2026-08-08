@@ -1,7 +1,7 @@
 import json
 import os
 import sys
-import tempfile
+import h3_test_tempfile as tempfile
 import unittest
 
 import comfy.options

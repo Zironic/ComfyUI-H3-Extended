@@ -298,7 +298,12 @@ class MiniMaxH3LongFormReferenceVideoPreview(
                 publisher.flush_completed_chunk()
             except Exception as exc:
                 logging.warning("%s final preview flush failed: %s", LOG, exc)
-            deactivate(token)
+            try:
+                publisher.close()
+            except Exception as exc:
+                logging.warning("%s async preview close failed: %s", LOG, exc)
+            finally:
+                deactivate(token)
 
         audio_start, audio_count = summary["audio_overlap_latent"]
         audio_carry = summary["audio_carry"]

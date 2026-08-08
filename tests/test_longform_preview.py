@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
-import tempfile
+import h3_test_tempfile as tempfile
 import unittest
 from unittest import mock
 
@@ -56,6 +56,9 @@ class FakeTAEH3:
         self.calls.append((int(latent.shape[2]), limit))
         count = self.per_latent if limit <= 0 else min(self.per_latent, limit)
         return torch.zeros(count, 24, 32, 3, dtype=torch.uint8)
+
+    def latents_for_frames(self, frame_limit):
+        return None if frame_limit <= 0 else 2
 
 
 def make_publisher(
@@ -154,6 +157,52 @@ class LongFormPreviewTests(unittest.TestCase):
             )
             callback(0, None, current, 1)
             self.assertIs(calls[0]["current"], current)
+
+    def test_cuda_taeh3_callback_submits_a_bounded_snapshot(self):
+        class FakeWorker:
+            accepting = True
+
+            def __init__(self):
+                self.device = None
+                self.submitted = None
+
+            def record_producer_event(self, device):
+                self.device = device
+                return "ready"
+
+            def submit_snapshot(self, snapshot, event, **fields):
+                self.submitted = (snapshot, event, fields)
+                return True
+
+        with tempfile.TemporaryDirectory() as temp:
+            publisher = make_publisher(
+                temp,
+                taeh3=FakeTAEH3(),
+                current_frames=17,
+            )
+            worker = FakeWorker()
+            publisher._taeh3_async_worker = worker
+            publisher._taeh3_async_failed = False
+            publisher.publish_current_chunk = mock.Mock()
+            video = torch.zeros(2, 24, 7, 4, 4)
+
+            publisher.sampler_callback(3)(
+                1,
+                FakeNested(video),
+                FakeNested(video),
+                4,
+            )
+
+            snapshot, event, fields = worker.submitted
+            video.add_(1)
+            self.assertEqual(tuple(snapshot.shape), (1, 24, 2, 4, 4))
+            self.assertEqual(snapshot.count_nonzero().item(), 0)
+            self.assertEqual(event, "ready")
+            self.assertEqual(worker.device, video.device)
+            self.assertEqual(fields["chunk_index"], 3)
+            self.assertEqual(fields["step"], 2)
+            self.assertEqual(fields["limit"], 17)
+            publisher.publish_current_chunk.assert_not_called()
 
     def test_default_current_preview_uses_latent_path_without_vae(self):
         with tempfile.TemporaryDirectory() as temp:

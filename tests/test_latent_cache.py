@@ -15,7 +15,7 @@ import logging
 import os
 import shutil
 import sys
-import tempfile
+import h3_test_tempfile as tempfile
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(_HERE))

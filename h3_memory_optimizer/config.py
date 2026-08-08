@@ -4,12 +4,12 @@ from dataclasses import dataclass
 import math
 
 try:
-    from ..h3_activation_memory.config import DEFAULT_CHUNK_ROWS, IMPLEMENTED_MODES, ActivationMemoryConfig
+    from ..h3_activation_memory.config import DEFAULT_CHUNK_ROWS, DEFAULT_MODE, IMPLEMENTED_MODES, ActivationMemoryConfig
     from ..h3_adaln import AdaLNPrecomputeConfig
     from ..h3_block_cache import FirstBlockCacheConfig
     from ..h3_runtime.layout import SINK_PREFIX
 except ImportError:
-    from h3_activation_memory.config import DEFAULT_CHUNK_ROWS, IMPLEMENTED_MODES, ActivationMemoryConfig
+    from h3_activation_memory.config import DEFAULT_CHUNK_ROWS, DEFAULT_MODE, IMPLEMENTED_MODES, ActivationMemoryConfig
     from h3_adaln import AdaLNPrecomputeConfig
     from h3_block_cache import FirstBlockCacheConfig
     from h3_runtime.layout import SINK_PREFIX
@@ -24,7 +24,7 @@ ACTIVATION_MODES = (ACTIVATION_OFF, *sorted(IMPLEMENTED_MODES))
 class MemoryOptimizerConfig:
     attention: str = ATTENTION_AUTO
     attention_fallback: str = FALLBACK_ALLOW
-    activation: str = "mlp_chunked_bf16"
+    activation: str = DEFAULT_MODE
     chunk_rows: int = DEFAULT_CHUNK_ROWS
     prefer_held_weights: bool = True
     activation_strict: bool = False

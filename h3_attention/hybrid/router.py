@@ -169,27 +169,72 @@ class SparseTileRouter:
                 % (geometry.sequence, q.shape[-2])
             )
 
-        batch, heads = q.shape[:2]
+        retained = min(
+            geometry.pure_video_kv_tiles,
+            math.ceil(float(video_budget) * geometry.pure_video_kv_tiles),
+        )
+        if retained == geometry.pure_video_kv_tiles:
+            return self._build_lut_from_summaries(
+                q, k, geometry, video_budget
+            )
+        q_means = self._mean_pool(q, Q_TILE)
+        k_means = self._mean_pool(k, KV_TILE)
+        return self._build_lut_from_summaries(
+            q_means, k_means, geometry, video_budget
+        )
+
+    def build_lut_from_summaries(self, q_summary, k_summary, layout, video_budget):
+        """Build the identical route from projection-emitted tile means."""
+        if q_summary.ndim != 4 or k_summary.ndim != 4:
+            raise SparseRouterError("tile router summaries must be rank-4 HND tensors")
+        if q_summary.shape[:2] != k_summary.shape[:2]:
+            raise SparseRouterError("Q/K router summary batch and head shapes differ")
+        if q_summary.shape[-1] != k_summary.shape[-1]:
+            raise SparseRouterError("Q/K router summary dimensions differ")
+        if q_summary.device != k_summary.device:
+            raise SparseRouterError("Q/K router summary devices differ")
+        if not 0.0 < float(video_budget) <= 1.0:
+            raise SparseRouterError("video_budget must be in (0, 1]")
+
+        geometry = self.geometry(layout)
+        expected_q = (geometry.q_tiles, q_summary.shape[-1])
+        expected_k = (geometry.kv_tiles, k_summary.shape[-1])
+        if tuple(q_summary.shape[-2:]) != expected_q:
+            raise SparseRouterError(
+                "Q router summary shape %s does not match %s"
+                % (tuple(q_summary.shape[-2:]), expected_q)
+            )
+        if tuple(k_summary.shape[-2:]) != expected_k:
+            raise SparseRouterError(
+                "K router summary shape %s does not match %s"
+                % (tuple(k_summary.shape[-2:]), expected_k)
+            )
+        return self._build_lut_from_summaries(
+            q_summary, k_summary, geometry, video_budget
+        )
+
+    def _build_lut_from_summaries(self, q_means, k_means, geometry, video_budget):
+        batch, heads = q_means.shape[:2]
         pure_kv = geometry.pure_video_kv_tiles
         retained = min(pure_kv, math.ceil(float(video_budget) * pure_kv))
         metadata = self._metadata(geometry, video_budget, retained)
         # Every row is represented directly as sorted block indices.  The
         # low-level kernel consumes deltas, so [0, 1, 1, ...] is the dense row.
-        dense = torch.arange(geometry.kv_tiles, device=q.device, dtype=torch.int32)
+        dense = torch.arange(
+            geometry.kv_tiles, device=q_means.device, dtype=torch.int32
+        )
         dense_delta = torch.cat((dense[:1], dense[1:] - dense[:-1]))
         lut = dense_delta.view(1, 1, 1, -1).expand(
             batch, heads, geometry.q_tiles, -1
         ).clone()
         valid = torch.full(
             (batch, heads, geometry.q_tiles), geometry.kv_tiles,
-            dtype=torch.int32, device=q.device
+            dtype=torch.int32, device=q_means.device
         )
         context = dense[: geometry.pure_video_kv_start]
         if retained == pure_kv:
             selected = context
         else:
-            q_means = self._mean_pool(q, Q_TILE)
-            k_means = self._mean_pool(k, KV_TILE)
             scores = torch.matmul(
                 q_means[..., geometry.pure_video_q_start:, :],
                 k_means[..., geometry.pure_video_kv_start:, :].transpose(-1, -2),

@@ -18,6 +18,7 @@ from h3_attention.hybrid import (  # noqa: E402
     HybridSparseBackend,
     HybridSparseConfig,
     HybridStatsCollector,
+    TIMING_STAGES,
     SparseSageAPI,
     SparseSageError,
     load_sparse_sage_api,
@@ -153,6 +154,8 @@ def test_deferred_timing():
     ), "all deferred timing stages resolve once")
     check(summary["attention_cuda_to_request_wall_ratio"] is not None,
           "timing summary includes the caveated CUDA/wall ratio")
+    check(tuple(summary["stages"]) == TIMING_STAGES,
+          "timing summary resolves every declared stage key")
     report_text = render({
         "mode": "sage128",
         "summary": {

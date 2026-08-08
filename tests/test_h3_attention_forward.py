@@ -28,6 +28,8 @@ from comfy.ldm.minimax.model import Attention, rope_rotation_table  # noqa: E402
 from h3_attention import forward as h3_forward  # noqa: E402
 from h3_attention import patch as h3_patch  # noqa: E402
 from h3_attention.observer import observing  # noqa: E402
+from h3_attention.hybrid.stats import DeferredCudaTiming  # noqa: E402
+from h3_runtime.timing import publish_timing  # noqa: E402
 
 HIDDEN, HEADS, HEAD_DIM = 96, 2, 128
 SEQ = 16
@@ -181,6 +183,120 @@ def test_attention_injection():
     check(out.shape == (SEQ, HIDDEN), "out_proj applied to the backend result")
 
 
+def test_projected_attention_injection():
+    print("fused projection injection")
+    attn = build_attention(seed=18)
+    x, rope = build_inputs(seed=19)
+    calls = []
+    carrier = object()
+
+    class Projector:
+        name = "fake_fused_qkv"
+
+        def project(self, module, value, rope_freqs, *, layer_index, transformer_options):
+            calls.append(("project", module is attn, value is x, rope_freqs is rope, layer_index))
+            return carrier
+
+    class Backend:
+        name = "fake_projected_backend"
+
+        def prepare_projected(self, projected, *, layer_index, transformer_options):
+            calls.append(("prepare_projected", projected is carrier, layer_index))
+            return projected
+
+        def execute(self, prepared):
+            calls.append(("execute", prepared is carrier))
+            return torch.zeros((1, HEADS, SEQ, HEAD_DIM), dtype=x.dtype)
+
+    fn = h3_forward.make_forward(
+        attn,
+        layer_index=23,
+        backend=Backend(),
+        projector=Projector(),
+    )
+    out = fn(x, rope_freqs=rope, transformer_options={})
+    check([item[0] for item in calls] == ["project", "prepare_projected", "execute"],
+          "fused carrier flows directly from projector to consuming backend")
+    check(calls[0][1:] == (True, True, True, 23),
+          "fused projector receives the exact H3 call contract")
+    check(out.shape == (SEQ, HIDDEN), "out_proj consumes projected-backend HND output")
+
+
+def test_projector_observer_fallback():
+    print("fused projection observer fallback")
+    attn = build_attention(seed=20)
+    x, rope = build_inputs(seed=21)
+    calls = []
+    seen = []
+
+    class Projector:
+        name = "must_not_run"
+
+        def project(self, *args, **kwargs):
+            raise AssertionError("observer path must retain BF16 Q/K visibility")
+
+    class Backend:
+        name = "fake_observed_backend"
+
+        def prepare(self, q, k, v, *, layer_index, transformer_options):
+            calls.append((tuple(q.shape), layer_index))
+            return object()
+
+        def execute(self, prepared):
+            return torch.zeros((1, HEADS, SEQ, HEAD_DIM), dtype=x.dtype)
+
+    fn = h3_forward.make_forward(
+        attn,
+        layer_index=24,
+        backend=Backend(),
+        projector=Projector(),
+    )
+    options = {}
+    with observing(options, lambda q, k, layer_index: seen.append(layer_index)):
+        fn(x, rope_freqs=rope, transformer_options=options)
+    check(seen == [24], "observer still receives the BF16 Q/K path")
+    check(calls == [((1, HEADS, SEQ, HEAD_DIM), 24)],
+          "observed calls use the backend's established BF16 preparation path")
+
+
+def test_deferred_projection_stage_counts():
+    print("deferred attention stage timing")
+    attn = build_attention(seed=16)
+    x, rope = build_inputs(seed=17)
+    clock = [0.0]
+    events = []
+
+    class FakeTimingEvent:
+        def __init__(self):
+            self.value = None
+
+        def record(self):
+            clock[0] += 1.0
+            self.value = clock[0]
+
+        def synchronize(self):
+            events.append("synchronize")
+
+        def elapsed_time(self, other):
+            return other.value - self.value
+
+    timing = DeferredCudaTiming(True, event_factory=lambda **kwargs: FakeTimingEvent())
+    timing.begin_request(5, cuda=True)
+    options = {}
+    publish_timing(options, timing)
+
+    with torch.no_grad():
+        h3_forward.make_forward(attn, layer_index=16)(
+            x.clone(), rope_freqs=rope, transformer_options=options
+        )
+    summary = timing.resolve(1.0)
+    for stage in ("qkv_proj", "qk_rmsnorm_rope", "out_proj"):
+        check(summary["stages"][stage]["count"] == 1,
+              "%s runs once per attention forward" % stage)
+    check(events.count("synchronize") == 1,
+          "attention timing synchronizes once at request end")
+
+
 # --------------------------------------------------------------------------
 # patch installation
 # --------------------------------------------------------------------------
@@ -289,6 +405,9 @@ def main():
         test_v_stride_guard()
         test_observer()
         test_attention_injection()
+        test_projected_attention_injection()
+        test_projector_observer_fallback()
+        test_deferred_projection_stage_counts()
         test_patch_install()
         test_patch_conflict()
         test_patch_validation()

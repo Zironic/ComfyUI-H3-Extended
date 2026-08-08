@@ -6,6 +6,7 @@ from comfy_api.latest import ComfyExtension, io
 
 from .config import (
     DEFAULT_CHUNK_ROWS,
+    DEFAULT_MODE,
     IMPLEMENTED_MODES,
     ActivationMemoryConfig,
 )
@@ -40,7 +41,7 @@ class MiniMaxH3ActivationMemory(io.ComfyNode):
                 io.Combo.Input(
                     "mode",
                     options=sorted(IMPLEMENTED_MODES),
-                    default="mlp_chunked_bf16",
+                    default=DEFAULT_MODE,
                     tooltip=(
                         "mlp_chunked_bf16 materializes a bounded BF16 SwiGLU "
                         "slab before fc2. mlp_chunked_native uses Comfy's fused "
@@ -54,9 +55,9 @@ class MiniMaxH3ActivationMemory(io.ComfyNode):
                     max=65_536,
                     step=256,
                     tooltip=(
-                        "Maximum packed-token rows per MLP slab. 4096 is the "
-                        "initial conservative value; larger slabs use more "
-                        "VRAM but usually launch more efficient GEMMs."
+                        "Maximum packed-token rows per MLP slab. 2048 is the "
+                        "measured default; larger slabs use more VRAM and can "
+                        "reduce launch overhead."
                     ),
                 ),
                 io.Boolean.Input(
@@ -87,7 +88,7 @@ class MiniMaxH3ActivationMemory(io.ComfyNode):
         cls,
         model,
         enabled=True,
-        mode="mlp_chunked_bf16",
+        mode=DEFAULT_MODE,
         chunk_rows=DEFAULT_CHUNK_ROWS,
         prefer_held_weights=True,
         strict=True,

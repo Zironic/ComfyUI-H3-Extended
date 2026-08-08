@@ -6,7 +6,7 @@ import folder_paths
 from comfy_api.latest import ComfyExtension, io
 
 try:
-    from ..h3_activation_memory.config import DEFAULT_CHUNK_ROWS
+    from ..h3_activation_memory.config import DEFAULT_CHUNK_ROWS, DEFAULT_MODE
     from ..h3_attention.hybrid import (
         HybridSparseBackend,
         HybridSparseConfig,
@@ -22,7 +22,7 @@ try:
     from ..h3_memory_optimizer.config import ACTIVATION_MODES, MemoryOptimizerConfig
     from ..h3_memory_optimizer.patch import apply
 except ImportError:
-    from h3_activation_memory.config import DEFAULT_CHUNK_ROWS
+    from h3_activation_memory.config import DEFAULT_CHUNK_ROWS, DEFAULT_MODE
     from h3_attention.hybrid import (
         HybridSparseBackend,
         HybridSparseConfig,
@@ -68,7 +68,7 @@ class MiniMaxH3HybridSparseAttention(io.ComfyNode):
                 io.Boolean.Input("strict", default=True),
                 io.Combo.Input(
                     "activation", options=list(ACTIVATION_MODES),
-                    default="mlp_chunked_bf16",
+                    default=DEFAULT_MODE,
                 ),
                 io.Int.Input(
                     "chunk_rows", default=DEFAULT_CHUNK_ROWS,
@@ -82,7 +82,7 @@ class MiniMaxH3HybridSparseAttention(io.ComfyNode):
 
     @classmethod
     def execute(cls, model, enabled=True, mode="sage128", video_budget=0.5,
-                strict=True, activation="mlp_chunked_bf16",
+                strict=True, activation=DEFAULT_MODE,
                 chunk_rows=DEFAULT_CHUNK_ROWS, run_tag="hybrid50", timing=True) -> io.NodeOutput:
         if not enabled:
             return io.NodeOutput(model)
@@ -112,6 +112,7 @@ class MiniMaxH3HybridSparseAttention(io.ComfyNode):
             adapter=ATTENTION_HYBRID,
             reason="explicit Phase A direct 128Q x 64KV Sparse Sage experiment",
             environment=environment,
+            projector=backend.projector,
         )
         optimizer_config = MemoryOptimizerConfig(
             attention=ATTENTION_EXISTING,
