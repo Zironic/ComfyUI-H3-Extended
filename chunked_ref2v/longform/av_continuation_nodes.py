@@ -358,8 +358,12 @@ def _slice_dynamic_av_reference(
     requested_audio = int(audio_reference_latents or 0)
     if requested_audio <= 0:
         raise ValueError("audio_reference_latents must be positive")
-    audio_count = min(requested_audio, int(previous_audio.shape[-1]))
-    audio_tail = previous_audio[..., -audio_count:] if audio_count else previous_audio[..., :0]
+    if requested_audio > int(previous_audio.shape[-1]):
+        raise ValueError(
+            "audio_reference_latents=%d exceeds previous audio length=%d"
+            % (requested_audio, int(previous_audio.shape[-1]))
+        )
+    audio_tail = previous_audio[..., -requested_audio:]
     return (
         previous_pixels[-video_reference_frames:],
         previous_video[:, :, latent_start:latent_start + latent_count],

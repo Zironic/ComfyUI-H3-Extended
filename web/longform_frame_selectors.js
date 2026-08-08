@@ -189,8 +189,8 @@ function setWidgetValue(node, widget, value) {
     );
 }
 
-function activeChunkFrames(node) {
-    return node.__h3StrictAvNPlusOne ? AUDIO_ALIGNED_CHUNK_FRAMES : CHUNK_FRAMES;
+function activeChunkFrames() {
+    return CHUNK_FRAMES;
 }
 
 function activeOverlapFrames() {
@@ -204,7 +204,7 @@ function activeReferenceFrames(node) {
     if (!Number.isFinite(chunkFrames)) {
         return [];
     }
-    if (node.__h3StrictAvNPlusOne || nodeClassName(node) === AV_CONTINUATION_PLAN_NODE || nodeClassName(node) === AV_CONTINUATION_NODE) {
+    if (node.__h3StrictAvNPlusOne) {
         const spans = latentFrameSpans(videoLatentT(Math.trunc(chunkFrames)));
         const total = spans.reduce((sum, value) => sum + value, 0);
         const references = [total];
@@ -272,11 +272,11 @@ function syncFrameChoices(node) {
             : nearestAllowed(chunkWidget.value, chunks, preferLarger),
     );
 
-        if (overlapWidget) {
-            const overlaps = activeOverlapFrames(node).filter(
-                (frames) => frames < Number(chunkWidget.value),
-            );
-            makeComboWidget(overlapWidget, overlaps);
+    if (overlapWidget) {
+        const overlaps = activeOverlapFrames(node).filter(
+            (frames) => frames < Number(chunkWidget.value),
+        );
+        makeComboWidget(overlapWidget, overlaps);
 
         // Always run the value back through setWidgetValue, even when it is already
         // legal: a widget loaded as the number 4 has to become the string "4" or the
@@ -286,7 +286,11 @@ function syncFrameChoices(node) {
             overlapWidget,
             overlaps.includes(Number(overlapWidget.value))
                 ? Number(overlapWidget.value)
-                : nearestAllowed(overlapWidget.value, overlaps),
+                : nearestAllowed(
+                    overlapWidget.value,
+                    overlaps,
+                    node.__h3StrictAvNPlusOne,
+                ),
         );
     }
 
@@ -313,7 +317,11 @@ function installLegalSelectors(node) {
         const originalCallback = chunkWidget.callback;
         chunkWidget.callback = function (value, ...args) {
             const allowed = activeChunkFrames(node);
-            const legal = nearestAllowed(value, allowed, node.__h3StrictAvNPlusOne);
+            const legal = nearestAllowed(
+                value,
+                allowed,
+                node.__h3StrictAvNPlusOne,
+            );
             const next = legal === undefined ? value : String(legal);
             this.value = next;
             const result = originalCallback?.call(this, next, ...args);

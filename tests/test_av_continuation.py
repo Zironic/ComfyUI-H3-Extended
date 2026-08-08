@@ -131,6 +131,18 @@ class LongFormAVContinuationTests(unittest.TestCase):
                 geometry=geometry,
             )
 
+    def test_audio_reference_cannot_exceed_previous_chunk(self):
+        geometry = HarnessGeometry(chunk_frames=141, overlap_frames=81).validate()
+        with self.assertRaisesRegex(ValueError, "exceeds previous audio length"):
+            _slice_dynamic_av_reference(
+                torch.zeros(141, 64, 96, 3),
+                torch.zeros(1, 24, 42, 4, 6),
+                torch.zeros(1, 32, 2, 100),
+                video_reference_frames=22,
+                audio_reference_latents=160,
+                geometry=geometry,
+            )
+
     def test_dynamic_reference_requires_complete_av_source(self):
         pixels = torch.zeros(141, 64, 96, 3)
         video = torch.zeros(1, 24, 42, 4, 6)

@@ -17,9 +17,8 @@ from ..geometry import AUDIO_LATENT_FPS, chunk_seed as derive_chunk_seed
 from .nplusone_resume import legal_reference_frames, prompt_digest
 
 FPS = 24
-# 3: the plan owns the run seed, derived per-chunk seeds, and compiled-prompt
-# digests. Seed lives with the thing being edited, so a requeue after a prompt
-# edit keeps it - which is what makes resuming an existing run possible at all.
+# 4: video and audio reference lengths are independent. The plan also owns the
+# run seed, derived per-chunk seeds, and compiled-prompt digests.
 PLAN_VERSION = 4
 POLICY_AV_CONTINUATION = "previous_av_continuation"
 NPlusOneChunkPromptPlan = io.Custom("H3_N_PLUS_ONE_CHUNK_PROMPT_PLAN")
