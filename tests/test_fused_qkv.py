@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(_HERE, "..", "..", "..")))
 
 from h3_attention.hybrid.fused_qkv import (  # noqa: E402
     FusedQKVError,
+    FusedQKVProjector,
     PreparedFusedQKV,
     validate_prepared_fused_qkv,
 )
@@ -135,6 +136,30 @@ def test_mode_selection():
           "fused mode owns the H3 QKV projector")
 
 
+def test_projector_tensor_core_injection():
+    print("fused QKV tensor-core injection")
+    calls = []
+    sentinel = object()
+
+    def fake_run(module, x, rope, *, layer_index, tensor_core=None):
+        calls.append((module, x, rope, layer_index, tensor_core))
+        return sentinel
+
+    import h3_attention.hybrid.fused_qkv as fused_qkv
+    original = fused_qkv.run_fused_qkv
+    try:
+        fused_qkv.run_fused_qkv = fake_run
+        projector = FusedQKVProjector(sentinel)
+        result = projector.project(
+            "module", "x", "rope", layer_index=9, transformer_options={},
+        )
+    finally:
+        fused_qkv.run_fused_qkv = original
+    check(result is sentinel, "projector preserves the standard project return")
+    check(calls == [("module", "x", "rope", 9, sentinel)],
+          "injected tensor core reaches the fused projection boundary")
+
+
 def test_summary_router_matches_direct():
     print("summary-based fused QKV routing")
     torch.manual_seed(19)
@@ -245,6 +270,7 @@ def test_projected_backend_integration():
 def main():
     test_prepared_validation()
     test_mode_selection()
+    test_projector_tensor_core_injection()
     test_summary_router_matches_direct()
     test_projected_sparse_sage()
     test_projected_backend_integration()

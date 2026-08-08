@@ -337,7 +337,86 @@ def _quantize_projection_input(x):
     return quantize_int8_rowwise_convrot64(x, 256)
 
 
-def run_fused_qkv(module, x, rope_freqs, *, layer_index):
+def _fused_qkv_tensor_core(
+    x_int8,
+    qdata,
+    x_scale,
+    weight_scale,
+    q_norm,
+    k_norm,
+    rope,
+    *,
+    heads,
+    sequence,
+    hidden,
+    epsilon,
+    has_rope,
+    rope_strides,
+    output_dtype,
+):
+    """Run only the tensor projection and return raw carrier tensors.
+
+    This boundary intentionally has no Comfy module objects, weight handles,
+    carrier validation, timing, routing, or dataclass construction.  It is
+    therefore safe for a caller to replace with a fixed-shape compiled
+    callable while the production path remains eager by default.
+    """
+    q_blocks = (sequence + Q_TILE - 1) // Q_TILE
+    k_blocks = (sequence + KV_TILE - 1) // KV_TILE
+    shape = (1, heads, sequence, HEAD_DIM)
+    q_int8 = torch.empty(shape, dtype=torch.int8, device=x_int8.device)
+    k_int8 = torch.empty(shape, dtype=torch.int8, device=x_int8.device)
+    v = torch.empty(shape, dtype=output_dtype, device=x_int8.device)
+    q_scale = torch.empty((1, heads, q_blocks), dtype=torch.float32, device=x_int8.device)
+    k_scale = torch.empty((1, heads, k_blocks), dtype=torch.float32, device=x_int8.device)
+    q_summary = torch.empty(
+        (1, heads, q_blocks, HEAD_DIM), dtype=output_dtype, device=x_int8.device
+    )
+    k_summary = torch.empty(
+        (1, heads, k_blocks, HEAD_DIM), dtype=output_dtype, device=x_int8.device
+    )
+
+    grid = (triton.cdiv(sequence, Q_TILE), heads)
+    for kind in range(3):
+        _fused_qkv_kernel[grid](
+            x_int8,
+            qdata,
+            x_scale,
+            weight_scale,
+            q_norm,
+            k_norm,
+            rope,
+            q_int8,
+            q_scale,
+            k_int8,
+            k_scale,
+            v,
+            q_summary,
+            k_summary,
+            sequence=sequence,
+            hidden=hidden,
+            heads=heads,
+            rope_stride_seq=rope_strides[0],
+            rope_stride_dim=rope_strides[1],
+            rope_stride_rot=rope_strides[2],
+            rope_stride_pair=rope_strides[3],
+            epsilon=epsilon,
+            has_rope=has_rope,
+            KIND=kind,
+            BLOCK_M=Q_TILE,
+            BLOCK_N=HEAD_DIM,
+            BLOCK_K=64,
+            num_warps=8,
+            num_stages=3,
+        )
+    return q_int8, q_scale, k_int8, k_scale, v, q_summary, k_summary
+
+
+# Public alias for benchmark/test injection without exposing module internals.
+fused_qkv_tensor_core = _fused_qkv_tensor_core
+
+
+def run_fused_qkv(module, x, rope_freqs, *, layer_index, tensor_core=None):
     import comfy.model_management
     import comfy.ops
 
@@ -399,20 +478,6 @@ def run_fused_qkv(module, x, rope_freqs, *, layer_index):
                 "Comfy Kitchen returned an invalid ConvRot activation carrier"
             )
         x_scale = x_scale.reshape(-1).contiguous()
-        q_blocks = (sequence + Q_TILE - 1) // Q_TILE
-        k_blocks = (sequence + KV_TILE - 1) // KV_TILE
-        shape = (1, heads, sequence, HEAD_DIM)
-        q_int8 = torch.empty(shape, dtype=torch.int8, device=x.device)
-        k_int8 = torch.empty(shape, dtype=torch.int8, device=x.device)
-        v = torch.empty(shape, dtype=x.dtype, device=x.device)
-        q_scale = torch.empty((1, heads, q_blocks), dtype=torch.float32, device=x.device)
-        k_scale = torch.empty((1, heads, k_blocks), dtype=torch.float32, device=x.device)
-        q_summary = torch.empty(
-            (1, heads, q_blocks, HEAD_DIM), dtype=x.dtype, device=x.device
-        )
-        k_summary = torch.empty(
-            (1, heads, k_blocks, HEAD_DIM), dtype=x.dtype, device=x.device
-        )
         q_norm = comfy.model_management.cast_to(
             module.q_norm.weight, device=x.device, dtype=x.dtype
         ).contiguous()
@@ -435,39 +500,33 @@ def run_fused_qkv(module, x, rope_freqs, *, layer_index):
                 rope.stride(5),
             )
 
-        grid = (triton.cdiv(sequence, Q_TILE), heads)
-        for kind in range(3):
-            _fused_qkv_kernel[grid](
-                x_int8,
-                qdata,
-                x_scale,
-                weight_scale,
-                q_norm,
-                k_norm,
-                rope,
-                q_int8,
-                q_scale,
-                k_int8,
-                k_scale,
-                v,
-                q_summary,
-                k_summary,
-                sequence=sequence,
-                hidden=hidden,
-                heads=heads,
-                rope_stride_seq=rope_strides[0],
-                rope_stride_dim=rope_strides[1],
-                rope_stride_rot=rope_strides[2],
-                rope_stride_pair=rope_strides[3],
-                epsilon=float(module.q_norm.eps),
-                has_rope=rope_freqs is not None,
-                KIND=kind,
-                BLOCK_M=Q_TILE,
-                BLOCK_N=HEAD_DIM,
-                BLOCK_K=64,
-                num_warps=8,
-                num_stages=3,
-            )
+        if tensor_core is None:
+            tensor_core = _fused_qkv_tensor_core
+        carriers = tensor_core(
+            x_int8,
+            qdata,
+            x_scale,
+            weight_scale,
+            q_norm,
+            k_norm,
+            rope,
+            heads=heads,
+            sequence=sequence,
+            hidden=hidden,
+            epsilon=float(module.q_norm.eps),
+            has_rope=rope_freqs is not None,
+            rope_strides=rope_strides,
+            output_dtype=x.dtype,
+        )
+        (
+            q_int8,
+            q_scale,
+            k_int8,
+            k_scale,
+            v,
+            q_summary,
+            k_summary,
+        ) = carriers
         return validate_prepared_fused_qkv(
             PreparedFusedQKV(
                 q_int8=q_int8,
@@ -494,10 +553,16 @@ def run_fused_qkv(module, x, rope_freqs, *, layer_index):
 class FusedQKVProjector:
     name = "h3_fused_qkv"
 
+    def __init__(self, tensor_core=None):
+        self.tensor_core = (
+            _fused_qkv_tensor_core if tensor_core is None else tensor_core
+        )
+
     def project(self, module, x, rope_freqs, *, layer_index, transformer_options):
         return run_fused_qkv(
             module,
             x,
             rope_freqs,
             layer_index=layer_index,
+            tensor_core=self.tensor_core,
         )

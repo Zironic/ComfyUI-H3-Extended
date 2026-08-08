@@ -45,12 +45,51 @@ python custom_nodes/ComfyUI-H3-Extended/benchmarks/benchmark_h3_activation_memor
   --checkpoint hf_minimax_h3/minimax_h3_fl2va_pruned_int8_convrot.safetensors \
   --block-index 0 --device cuda --dtype bf16 --seq 63448 \
   --chunks 2048,4096,8192,16384 \
-  --swiglu-modes bf16,native --held-modes off,on --json h3-mlp.json
+  --swiglu-modes bf16,native,tiled_convrot --held-modes off,on \
+  --feature-tile-width 3584 --json h3-mlp.json
 ```
 
 Actual-checkpoint mode lazily loads only the selected block's `fc1` and `fc2`
 MLP tensors (including their quantization metadata); it is an MLP benchmark,
-not a full model load or generation run.
+not a full model load or generation run. `tiled_convrot` is an opt-in baseline:
+it requires BF16 compute, pre-packs feature-major INT8 ConvRot tiles before warmup/timing, bounds each
+fc1 expansion by `chunk_rows × (2 * feature_tile_width)`, and reports error
+against the raw current ConvRot path after peak capture. The
+pre-packed tiles are inherently held, so tiled cases are emitted once per
+chunk regardless of `--held-modes`; production should replace the original
+layout or consume strided tiles rather than retain both copies.
+
+To compare the existing fused ConvRot-INT8 down-projection against Transformer
+Engine delayed-scaling FP8 using the same real `fc2` weight and BF16 reference:
+
+```powershell
+& .\custom_nodes\ComfyUI-H3-Extended\benchmarks\run_te_fp8_mlp.ps1 `
+  --checkpoint /models/diffusion_models/hf_minimax_h3/minimax_h3_fl2va_pruned_int8_convrot.safetensors `
+  --block-index 0 --rows 2048,8192 --recipes delayed_e4m3
+```
+
+The runner builds a pinned local benchmark image when needed. The comparison
+fails unless the selected checkpoint weight is TensorWise-INT8 ConvRot; it does
+not silently substitute a synthetic weight or another Comfy execution path.
+
+Option C can be tested without changing the checkpoint weights to FP8. This
+benchmark compares the full ConvRot MLP with a 256-aligned feature-tiled path
+that consumes each bounded BF16 fc1 tile through fused SwiGLU+ConvRot fc2 and
+accumulates the partial outputs:
+
+```powershell
+& .\custom_nodes\ComfyUI-H3-Extended\benchmarks\run_convrot_mlp_c.ps1 `
+  --checkpoint D:\AI\ComfyUI\Models\diffusion_models\hf_minimax_h3\minimax_h3_fl2va_pruned_int8_convrot.safetensors `
+  --block-index 0 --rows '2048,8192' --feature-tiles '7168,3584'
+```
+
+The local runner uses Comfy's `.venv\Scripts\python.exe` after the required
+idle-GPU preflight; it does not require Docker or Transformer Engine. The
+tiled benchmark pre-packs feature-major INT8 weight tiles so weight layout
+copies are outside the activation peak and timed region. Production code must
+replace the original layout or consume strided tiles rather than retain both
+weight copies. A profiler run fails if it observes a full BF16 fc1 expansion
+allocation in the tiled path.
 
 See [`PLAN.md`](PLAN.md) for the staged attention-side follow-ups. Prequantized
 QKV production and query-slab attention remain capability-gated on

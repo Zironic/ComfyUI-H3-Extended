@@ -280,6 +280,16 @@ def test_dependency_and_disabled_node():
     check(result.args[0] is marker, "disabled node is an exact model pass-through")
 
 
+def test_node_mode_schema():
+    print("node mode schema")
+    schema = MiniMaxH3HybridSparseAttention.define_schema()
+    mode = next(item for item in schema.inputs if item.id == "mode")
+    check(mode.options == ["sage128", "sage128_fused_qkv"],
+          "node exposes established and fused-QKV modes")
+    check(mode.default == "sage128",
+          "established mode remains the backward-compatible default")
+
+
 def test_report_files():
     print("request report")
     output_root = os.path.join("output", "h3_hybrid_sparse")
@@ -345,6 +355,7 @@ def main():
     test_prepare_execute_lifetime()
     test_strict_errors()
     test_dependency_and_disabled_node()
+    test_node_mode_schema()
     test_report_files()
     test_deferred_timing()
     optional_cuda_numerical()

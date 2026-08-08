@@ -62,6 +62,38 @@ class BenchmarkTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             BENCH.inspect_carrier(torch.empty((2, 4)), type("Other", (), {}))
 
+    def test_checkpoint_loader_requires_convrot_int8(self):
+        config = json.dumps({
+            "format": "int8_tensorwise",
+            "convrot": True,
+            "convrot_groupsize": 256,
+        }).encode("utf-8")
+        tensors = {
+            "blocks.3.mlp.fc2.weight": torch.empty((8, 16), dtype=torch.int8),
+            "blocks.3.mlp.fc2.weight_scale": torch.ones((8, 1), dtype=torch.float32),
+            "blocks.3.mlp.fc2.comfy_quant": torch.tensor(list(config), dtype=torch.uint8),
+        }
+
+        class Handle:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def keys(self):
+                return tensors.keys()
+
+            def get_tensor(self, key):
+                return tensors[key]
+
+        loaded = BENCH.load_convrot_fc2(
+            "unused.safetensors",
+            block_index=3,
+            safe_open_fn=lambda *args, **kwargs: Handle(),
+        )
+        self.assertEqual(loaded["group_size"], 256)
+        self.assertEqual(tuple(loaded["weight"].shape), (8, 16))
 
 if __name__ == "__main__":
     unittest.main()

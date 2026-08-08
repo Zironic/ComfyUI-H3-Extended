@@ -67,7 +67,20 @@ INT8 weights into Sparse Sage's INT8 Q/K carriers, a BF16 V carrier, and the
 128Q/64KV routing summaries. It avoids the full BF16 QKV allocation; K smoothing
 is disabled on this path, so it remains an explicitly approximate experiment.
 `benchmarks/bench_fused_qkv.py` compares both projection paths using one real
-checkpoint block and can optionally execute the compiled Sparse Sage kernel.
+checkpoint block. With no `--frames` it retains the sequence-only projection
+microbenchmark (default sequence 54006); adding geometry runs both production
+routed paths end to end, for example:
+
+```powershell
+python benchmarks/bench_fused_qkv.py `
+  --checkpoint <checkpoint.safetensors> --frames 209 `
+  --width 1344 --height 768 --text-len 256 --video-budget 0.5 `
+  --warmup 1 --iterations 3 --compile-fused --json `
+  --i-understand-this-uses-gpu
+```
+
+The geometry result includes routing, preparation, kernel timing, peak memory,
+and bounded output-error metrics; run the required idle-GPU preflight first.
 Dense per-head fallback, Flex hard-tile fallback, Sol whole-head dispatch, and
 cost-aware automatic planning are later phases and are not exposed as working
 modes yet.

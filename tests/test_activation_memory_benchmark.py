@@ -28,6 +28,56 @@ def test_case_parsing_matrix():
     assert cases[-1] == {"chunk_rows": 16384, "swiglu_mode": "native", "held_mode": "on"}
 
 
+def test_tiled_cases_are_prepacked_once_per_chunk():
+    cases = bench.iter_cases((128,), ("bf16", "tiled_convrot"), ("off", "on"))
+    assert cases == (
+        {"chunk_rows": 128, "swiglu_mode": "bf16", "held_mode": "off"},
+        {"chunk_rows": 128, "swiglu_mode": "bf16", "held_mode": "on"},
+        {"chunk_rows": 128, "swiglu_mode": "tiled_convrot", "held_mode": "prepacked"},
+    )
+
+
+def test_tiled_mode_rejects_non_bf16_before_building_modules():
+    args = bench.build_parser().parse_args(["--swiglu-modes", "tiled_convrot"])
+    with mock.patch.object(bench, "build_checkpoint_mlp") as build:
+        try:
+            bench.run_actual({}, args, torch.device("cpu"), torch.float16)
+        except ValueError as exc:
+            assert "--dtype bf16" in str(exc)
+        else:
+            raise AssertionError("tiled ConvRot must reject non-BF16 compute")
+        build.assert_not_called()
+
+
+def test_feature_tile_packing_shape_and_bytes():
+    fc1 = {
+        "weight": torch.empty(1024, 256, dtype=torch.int8),
+        "weight_scale": torch.empty(1024),
+        "group_size": 256,
+    }
+    fc2 = {
+        "weight": torch.empty(256, 512, dtype=torch.int8),
+        "weight_scale": torch.empty(256),
+        "group_size": 256,
+    }
+    tiles = bench.prepare_convrot_tiles(fc1, fc2, 256)
+    assert bench.feature_ranges(512, 256) == ((0, 256), (256, 512))
+    assert [tuple(tile["fc1_weight"].shape) for tile in tiles] == [(512, 256), (512, 256)]
+    assert [tuple(tile["fc2_weight"].shape) for tile in tiles] == [(256, 256), (256, 256)]
+    expected = sum(
+        tile[name].numel() * tile[name].element_size()
+        for tile in tiles
+        for name in ("fc1_weight", "fc1_scale", "fc2_weight")
+    )
+    assert bench.prepared_tile_bytes(tiles) == expected
+    try:
+        bench.feature_ranges(512, 128)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("unaligned feature tile width must be rejected")
+
+
 def test_checkpoint_resolution():
     with TemporaryDirectory() as temp:
         path = Path(temp) / "weights.safetensors"
@@ -181,6 +231,64 @@ def test_case_dispatch_and_native_rejection():
             assert "native" in str(exc)
         else:
             raise AssertionError("native mode must reject a silent fallback")
+
+
+def test_tiled_dispatch_with_cpu_fake_convrot():
+    fc1 = {
+        "weight": torch.arange(1024 * 256, dtype=torch.int8).reshape(1024, 256),
+        "weight_scale": torch.ones(1024),
+        "group_size": 256,
+    }
+    fc2 = {
+        "weight": torch.arange(256 * 512, dtype=torch.int8).reshape(256, 512),
+        "weight_scale": torch.ones(256),
+        "group_size": 256,
+    }
+    tiles = bench.prepare_convrot_tiles(fc1, fc2, 256)
+
+    def fake_convrot(_ck, x, weight, _scale, _groups, input_act=None):
+        if input_act is None:
+            return torch.nn.functional.linear(x.float(), weight.float()).to(torch.bfloat16)
+        gate, up = x.chunk(2, dim=-1)
+        return torch.nn.functional.linear(torch.nn.functional.silu(gate.float()) * up.float(), weight.float()).to(torch.bfloat16)
+
+    activation = torch.randn(3, 256, dtype=torch.bfloat16)
+    output, path, _, _ = bench.run_tiled_convrot_case(
+        object(), activation, 2, fc1, fc2, tiles, torch.device("cpu"), convrot_fn=fake_convrot
+    )
+    expected_expanded = fake_convrot(None, activation, fc1["weight"], fc1["weight_scale"], 256)
+    expected = fake_convrot(None, expected_expanded, fc2["weight"], fc2["weight_scale"], 256, input_act="swiglu")
+    assert output.shape == (3, 256)
+    assert path == "tiled_convrot"
+    assert torch.allclose(output, expected, atol=1e-2, rtol=1e-2)
+
+
+def test_tiled_metadata_rejects_transposed_and_wrong_format():
+    def metadata(**overrides):
+        value = {"format": "int8_tensorwise", "convrot": True, "transposed": False, "convrot_groupsize": 256}
+        value.update(overrides)
+        encoded = json.dumps(value).encode()
+        return torch.tensor(list(encoded), dtype=torch.uint8)
+
+    state = {
+        "fc1.weight": torch.empty(1024, 256, dtype=torch.int8),
+        "fc1.weight_scale": torch.empty(1024),
+        "fc1.comfy_quant": metadata(),
+        "fc2.weight": torch.empty(256, 512, dtype=torch.int8),
+        "fc2.weight_scale": torch.empty(256),
+        "fc2.comfy_quant": metadata(),
+    }
+    loaded = {"state_dict": state}
+    assert bench.load_convrot_mlp(loaded)["ffn_width"] == 512
+    for overrides in ({"transposed": True}, {"format": "nvfp4"}):
+        bad = dict(state)
+        bad["fc1.comfy_quant"] = metadata(**overrides)
+        try:
+            bench.load_convrot_mlp({"state_dict": bad})
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("unsupported ConvRot metadata must fail closed")
 
 
 def test_report_serialization_and_synthetic_helpers():

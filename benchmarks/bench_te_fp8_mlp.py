@@ -1,6 +1,7 @@
-"""Compare H3's BF16 down projection with Transformer Engine FP8."""
+"""Compare H3's fused ConvRot-INT8 down projection with TE FP8."""
 
 import argparse
+import importlib.metadata
 import json
 import statistics
 from pathlib import Path
@@ -21,6 +22,7 @@ DEFAULT_RECIPES = (
 )
 FP8_DIM_MULTIPLE = 16
 CONTAINER_IMAGE = "nvcr.io/nvidia/pytorch@sha256:2140e699b3beaf7f96a0081fd9c9406bc3832b435cdb60dfa2d261f7d2f34a1c"
+BENCHMARK_IMAGE = "h3-te-fp8-convrot:ck-0.2.28"
 KERNEL_SOURCES = (
     "transformer_engine/pytorch/ops/basic/swiglu.py",
     "transformer_engine/pytorch/csrc/extensions/activation.cpp",
@@ -117,6 +119,89 @@ def _load_te():
     from transformer_engine.pytorch.tensor import QuantizedTensor
 
     return transformer_engine, te, recipe, QuantizedTensor
+
+
+def _decode_quant_config(value):
+    return json.loads(value.detach().cpu().numpy().tobytes())
+
+
+def load_convrot_layer(checkpoint, layer, block_index=0, safe_open_fn=None):
+    """Load one H3 MLP TensorWise-INT8 ConvRot layer, fail-closed."""
+    if safe_open_fn is None:
+        from safetensors import safe_open as safe_open_fn
+
+    layer = str(layer)
+    if layer not in ("fc1", "fc2"):
+        raise ValueError("layer must be fc1 or fc2")
+    suffix = "blocks.%d.mlp.%s." % (int(block_index), layer)
+    prefixes = ("model.diffusion_model.", "diffusion_model.", "")
+    with safe_open_fn(str(checkpoint), framework="pt", device="cpu") as handle:
+        keys = set(handle.keys())
+        prefix = next(
+            (candidate + suffix for candidate in prefixes if candidate + suffix + "weight" in keys),
+            None,
+        )
+        if prefix is None:
+            raise KeyError("checkpoint has no blocks.%d.mlp.%s weight" % (block_index, layer))
+        required = (prefix + "weight", prefix + "weight_scale", prefix + "comfy_quant")
+        missing = [key for key in required if key not in keys]
+        if missing:
+            raise KeyError("%s checkpoint tensors are missing: %s" % (layer, ", ".join(missing)))
+        weight = handle.get_tensor(required[0])
+        weight_scale = handle.get_tensor(required[1])
+        quant = _decode_quant_config(handle.get_tensor(required[2]))
+
+    if quant.get("format") != "int8_tensorwise" or quant.get("convrot") is not True:
+        raise ValueError("%s must be TensorWise-INT8 with ConvRot enabled" % layer)
+    if quant.get("transposed", False):
+        raise ValueError("transposed %s ConvRot weights are unsupported" % layer)
+    group_size = int(quant.get("convrot_groupsize", 256))
+    if group_size <= 0:
+        raise ValueError("%s ConvRot group size must be positive" % layer)
+    if weight.ndim != 2 or weight.dtype != torch.int8:
+        raise ValueError("ConvRot %s weight must be a rank-2 INT8 tensor" % layer)
+    if weight_scale.numel() not in (1, weight.shape[0]):
+        raise ValueError("ConvRot %s scale must be scalar or per-output-channel" % layer)
+    return {
+        "layer": layer,
+        "weight": weight,
+        "weight_scale": weight_scale,
+        "group_size": group_size,
+        "prefix": prefix,
+        "quant": quant,
+    }
+
+
+def load_convrot_fc2(checkpoint, block_index=0, safe_open_fn=None):
+    return load_convrot_layer(checkpoint, "fc2", block_index, safe_open_fn)
+
+
+def _load_comfy_kitchen():
+    try:
+        import comfy_kitchen as ck
+    except ImportError as exc:
+        raise RuntimeError(
+            "checkpoint comparison requires comfy-kitchen in the benchmark image"
+        ) from exc
+    return ck
+
+
+def _convrot_output(ck, x, weight, weight_scale, group_size, input_act="swiglu"):
+    with torch.no_grad():
+        kwargs = dict(
+            bias=None,
+            out_dtype=torch.bfloat16,
+            convrot=True,
+            convrot_groupsize=group_size,
+        )
+        if input_act is not None:
+            kwargs["input_act"] = input_act
+        return ck.int8_linear(
+            x,
+            weight,
+            weight_scale,
+            **kwargs,
+        )
 
 
 def _recipe_for(te_recipe, recipe_name):
@@ -234,6 +319,8 @@ def build_parser():
     parser.add_argument("--iterations", type=int, default=5)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--profile-dir", type=Path)
+    parser.add_argument("--checkpoint", type=Path)
+    parser.add_argument("--block-index", type=int, default=0)
     parser.add_argument("--json", type=Path, metavar="PATH")
     parser.add_argument("--i-understand-this-uses-gpu", action="store_true")
     return parser
@@ -252,7 +339,9 @@ def serialize_result(result):
 
 
 def run(args):
-    validate_dimensions(args.expanded_width, args.ffn_width, args.hidden_width, args.rows)
+    expanded_width, ffn_width, hidden_width, rows_values = validate_dimensions(
+        args.expanded_width, args.ffn_width, args.hidden_width, args.rows
+    )
     if args.warmup < 0 or args.iterations <= 0:
         raise ValueError("warmup must be non-negative and iterations must be positive")
     if not args.i_understand_this_uses_gpu:
@@ -272,14 +361,35 @@ def run(args):
         raise RuntimeError("Transformer Engine reports that FP8 is unavailable%s" % suffix)
 
     device = torch.device("cuda")
+    checkpoint_case = None
+    ck = None
+    if args.checkpoint is not None:
+        checkpoint_case = load_convrot_fc2(args.checkpoint, args.block_index)
+        hidden_width, ffn_width = checkpoint_case["weight"].shape
+        expanded_width = ffn_width * 2
+        validate_dimensions(expanded_width, ffn_width, hidden_width, rows_values)
+        ck = _load_comfy_kitchen()
+        convrot_weight = checkpoint_case["weight"].to(device=device)
+        convrot_scale = checkpoint_case["weight_scale"].to(device=device, dtype=torch.float32)
+        weight = torch.ops.comfy_kitchen.dequantize_int8_convrot_weight_dtype(
+            convrot_weight,
+            convrot_scale,
+            checkpoint_case["group_size"],
+            2,
+        )
+    else:
+        convrot_weight = None
+        convrot_scale = None
+        weight = None
     generator = torch.Generator(device=device).manual_seed(args.seed)
-    weight = torch.randn((args.hidden_width, args.ffn_width), generator=generator, dtype=torch.bfloat16, device=device)
+    if weight is None:
+        weight = torch.randn((hidden_width, ffn_width), generator=generator, dtype=torch.bfloat16, device=device)
     results = []
     carrier_details = []
     if args.profile_dir:
         args.profile_dir.mkdir(parents=True, exist_ok=True)
-    for rows in args.rows:
-        x = torch.randn((rows, args.expanded_width), generator=generator, dtype=torch.bfloat16, device=device)
+    for rows in rows_values:
+        x = torch.randn((rows, expanded_width), generator=generator, dtype=torch.bfloat16, device=device)
         reference = _eager_output(x, weight)
         baseline_timing = benchmark_case(
             lambda: _eager_output(x, weight), args.warmup, args.iterations
@@ -290,9 +400,50 @@ def run(args):
             "recipe": None,
             "timing": baseline_timing,
         })
+        if checkpoint_case is not None:
+            convrot_output = _convrot_output(
+                ck,
+                x,
+                convrot_weight,
+                convrot_scale,
+                checkpoint_case["group_size"],
+            )
+            convrot_case = {
+                "rows": rows,
+                "case": "comfy_convrot_int8",
+                "recipe": None,
+                "relative_l2": relative_l2(convrot_output, reference),
+                "max_absolute_error": max_absolute_error(convrot_output, reference),
+                "timing": benchmark_case(
+                    lambda: _convrot_output(
+                        ck,
+                        x,
+                        convrot_weight,
+                        convrot_scale,
+                        checkpoint_case["group_size"],
+                    ),
+                    args.warmup,
+                    args.iterations,
+                ),
+            }
+            if args.profile_dir:
+                profile_path = args.profile_dir / ("comfy_convrot_int8_rows%d.json" % rows)
+                _profile(
+                    lambda: _convrot_output(
+                        ck,
+                        x,
+                        convrot_weight,
+                        convrot_scale,
+                        checkpoint_case["group_size"],
+                    ),
+                    profile_path,
+                )
+                convrot_case["profile"] = str(profile_path)
+            results.append(convrot_case)
+            del convrot_output
         for recipe_name in args.recipes:
             recipe = _recipe_for(te_recipe, recipe_name)
-            chain = _build_case(te, recipe, args.ffn_width, args.hidden_width, weight)
+            chain = _build_case(te, recipe, ffn_width, hidden_width, weight)
             output = _te_output(te, chain, x, recipe)
             torch.cuda.synchronize()
             case = {
@@ -315,8 +466,12 @@ def run(args):
     result = {
         "versions": {
             "container_image": CONTAINER_IMAGE,
+            "benchmark_image": BENCHMARK_IMAGE,
             "torch": torch.__version__,
             "transformer_engine": _te_version(transformer_engine),
+            "comfy_kitchen": (
+                importlib.metadata.version("comfy-kitchen") if ck is not None else "not loaded"
+            ),
         },
         "device": {
             "name": torch.cuda.get_device_name(),
@@ -324,10 +479,16 @@ def run(args):
             "capability_label": "SM%d%d" % capability,
         },
         "dimensions": {
-            "expanded_width": args.expanded_width,
-            "ffn_width": args.ffn_width,
-            "hidden_width": args.hidden_width,
-            "rows": list(args.rows),
+            "expanded_width": expanded_width,
+            "ffn_width": ffn_width,
+            "hidden_width": hidden_width,
+            "rows": list(rows_values),
+        },
+        "checkpoint": None if checkpoint_case is None else {
+            "path": str(args.checkpoint),
+            "block_index": int(args.block_index),
+            "weight_prefix": checkpoint_case["prefix"],
+            "quant": checkpoint_case["quant"],
         },
         "recipes": list(args.recipes),
         "kernel_source_expectation": "TE SwiGLU receives the following FP8 Linear input quantizer",

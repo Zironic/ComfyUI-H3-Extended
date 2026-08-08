@@ -1,0 +1,3 @@
+FROM nvcr.io/nvidia/pytorch@sha256:2140e699b3beaf7f96a0081fd9c9406bc3832b435cdb60dfa2d261f7d2f34a1c
+
+RUN python -m pip install --no-deps comfy-kitchen==0.2.28
