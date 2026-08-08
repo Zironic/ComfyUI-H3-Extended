@@ -23,6 +23,13 @@ from .sol import (
     SolAttentionError,
     preflight_sol_attention,
 )
+from .hybrid import (
+    HybridSparseBackend,
+    HybridSparseConfig,
+    HybridStatsCollector,
+    SparseSageError,
+    preflight_sparse_sage,
+)
 
 SM89SageMemoryEfficientBackend = _sage_mem_eff.SM89SageMemoryEfficientBackend
 
@@ -42,4 +49,9 @@ __all__ = [
     "SolAttentionConfig",
     "SolAttentionError",
     "preflight_sol_attention",
+    "HybridSparseBackend",
+    "HybridSparseConfig",
+    "HybridStatsCollector",
+    "SparseSageError",
+    "preflight_sparse_sage",
 ]

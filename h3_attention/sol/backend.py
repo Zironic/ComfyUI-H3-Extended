@@ -205,6 +205,8 @@ class SolAttentionBackend:
     name = "sol_attn"
     # The token refiner can keep the incoming Comfy attention path.
     requires_registered_sage = False
+    requires_runtime_context = True
+    approximate = True
 
     def __init__(self, dense_backend, config=None, sol_callable=None):
         if dense_backend is None:
@@ -213,6 +215,7 @@ class SolAttentionBackend:
         self.config = config or SolAttentionConfig()
         if not isinstance(self.config, SolAttentionConfig):
             raise TypeError("config must be SolAttentionConfig")
+        self.strict_runtime_layout = bool(self.config.strict)
         if sol_callable is None:
             self.sol_attn, module = load_sol_attention()
             self.sol_module = getattr(module, "__name__", type(module).__name__)

@@ -22,6 +22,7 @@ can be loaded at the same time:
 | `MiniMaxH3Moba3DProbeZi` | MiniMax H3 MoBA 3D Probe (Zi) |
 | `MiniMaxH3Ref2VExperimentHarnessZi` | MiniMax H3 Ref2V Experiment Harness (Zi) |
 | `MiniMaxH3MaskedRef2VCacheZi` | MiniMax H3 Masked Ref2V Cache (Zi) |
+| `MiniMaxH3HybridSparseAttentionZi` | MiniMax H3 Hybrid Sparse Attention (Zi) |
 
 Existing workflows still point at the stock ids; re-add the `(Zi)` nodes to use
 this copy.
@@ -37,6 +38,20 @@ expanded back to packed-token masks. Reports retain the logical density/output
 metrics and add separately labelled executable density and sparse-output error;
 this remains a CPU-safe measurement probe and does not alter production
 attention.
+
+## Hybrid sparse attention
+
+`MiniMaxH3HybridSparseAttentionZi` is the Phase-A production experiment. It
+routes once per globally aligned 128-query tile, scores globally aligned
+64-token KV tiles, and retains the configured fraction of pure target-video KV
+tiles per head. Text, references, audio, mixed boundary tiles, and non-video Q
+tiles remain dense. Reports are written to
+`output/h3_hybrid_sparse/<run_tag>_<timestamp>/`.
+
+Phase A is SM89-only and requires the compiled `spas_sage_attn` package. It
+implements `sage128` only. Compatibility measurement, dense per-head fallback,
+Flex hard-tile fallback, Sol whole-head dispatch, and cost-aware automatic
+planning are later phases and are not exposed as working modes yet.
 
 ---
 
@@ -548,17 +563,10 @@ generalize.
 
 ## What follows
 
-Once the probe establishes a candidate pattern:
-
-1. Implement a **dense masked emulator** — the proposed block mask applied to an
-   ordinary correctness-oriented attention calculation.
-2. Compare against the dense baseline at identical seeds.
-3. Adjust mandatory context and Top-k budget.
-4. **Only then** implement a Triton/CUDA block-sparse backend.
-
-The instrumentation stays explicitly H3-focused and disposable. There is no
-reason to build a generic Comfy attention profiler before the first measurements
-say what H3 needs.
+The direct 128Q x 64KV Sparse Sage backend is now the first visual A/B path.
+Compare dense prepared Sage, Sparse Sage at 100%, and direct Sparse Sage at 50%
+with identical generation settings. If coarse 128Q routing needs recovery, add
+128-vs-64 compatibility measurement before implementing any Flex fallback.
 
 ---
 
@@ -695,6 +703,8 @@ statistics with synthetic Q/K whose attention target is known in advance:
 
 ```bash
 cd /path/to/ComfyUI
+python custom_nodes/ComfyUI-H3-Extended/tests/test_hybrid_router.py
+python custom_nodes/ComfyUI-H3-Extended/tests/test_hybrid_attention.py
 python custom_nodes/ComfyUI-H3-Extended/tests/test_probe.py
 python custom_nodes/ComfyUI-H3-Extended/tests/test_attention_backend.py
 python custom_nodes/ComfyUI-H3-Extended/tests/test_vram_guard.py
@@ -704,6 +714,9 @@ python custom_nodes/ComfyUI-H3-Extended/tests/test_latent_cache.py
 python custom_nodes/ComfyUI-H3-Extended/tests/test_chunked_ref2v.py
 python custom_nodes/ComfyUI-H3-Extended/tests/test_masked_cache.py
 ```
+
+The hybrid tests are CPU-only by default. Their real Sparse Sage numerical
+section runs only when `H3_RUN_SPARSE_SAGE_CUDA_TESTS=1` is set deliberately.
 
 `test_cond_cache.py`, `test_chunked_ref2v.py` and `test_masked_cache.py` are safe
 to run while a generation is in flight — the first masks the GPU out entirely,

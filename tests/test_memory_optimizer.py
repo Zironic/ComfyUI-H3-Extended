@@ -152,10 +152,15 @@ def test_apply_order_and_fallback():
     patcher = FakePatcher()
     calls = []
 
+    class Backend:
+        approximate = True
+        requires_runtime_context = True
+        strict_runtime_layout = True
+
     class Decision:
         requested = ATTENTION_SOL
         selected = ATTENTION_SOL
-        backend = object()
+        backend = Backend()
         reason = "supported"
         environment = env()
 
@@ -243,11 +248,67 @@ def test_apply_order_and_fallback():
     check(result.activation_blocks == 50 and result.attention_blocks == 0, "portable MLP optimization remains active")
 
 
+def test_backend_runtime_capabilities():
+    print("backend runtime capabilities")
+    listener = object()
+
+    class Backend:
+        approximate = True
+        requires_runtime_context = True
+        strict_runtime_layout = True
+        runtime_listeners = (listener,)
+
+        def as_status(self):
+            return {"phase": "test"}
+
+    class Decision:
+        requested = "hybrid_sparse"
+        selected = "hybrid_sparse"
+        backend = Backend()
+        reason = "explicit test backend"
+        environment = env()
+
+    patcher = FakePatcher()
+    seen = {}
+
+    def attention(model, backend):
+        return backend, 50
+
+    def disabled(model, config):
+        return None, 0
+
+    def runtime(model, session):
+        seen["session"] = session
+        return session
+
+    result = apply(
+        patcher,
+        config=MemoryOptimizerConfig(
+            attention=ATTENTION_EXISTING,
+            activation=ACTIVATION_OFF,
+        ),
+        decision=Decision(),
+        attention_configurer=attention,
+        adaln_installer=disabled,
+        block_cache_installer=disabled,
+        runtime_installer=runtime,
+    )
+    session = seen["session"]
+    check(result.attention_requested == "hybrid_sparse" and result.runtime_installed,
+          "custom backend identity and runtime requirement are preserved")
+    check(session.strict_layout and listener in session.listeners,
+          "backend strict-layout flag and listener configure the shared runtime")
+    status = patcher.model_options["transformer_options"]["minimax_h3_memory_optimizer"]
+    check(status["attention_approximate"] and status["attention_backend"]["phase"] == "test",
+          "backend capability and status replace Sol-specific checks")
+
+
 def main():
     test_architecture_probes()
     test_resolution()
     test_config()
     test_apply_order_and_fallback()
+    test_backend_runtime_capabilities()
     print("\nall unified memory-optimizer tests passed")
 
 

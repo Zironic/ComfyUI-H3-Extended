@@ -52,6 +52,10 @@ def _component_status(component):
     return {"type": type(component).__name__}
 
 
+def _backend_flag(backend, name, default=False):
+    return bool(getattr(backend, name, default)) if backend is not None else bool(default)
+
+
 def _record_status(
     model_patcher,
     result,
@@ -71,7 +75,8 @@ def _record_status(
         "attention_selected": result.attention_selected,
         "attention_reason": result.attention_reason,
         "attention_blocks": result.attention_blocks,
-        "attention_approximate": result.attention_selected == ATTENTION_SOL,
+        "attention_approximate": _backend_flag(attention_backend, "approximate"),
+        "attention_backend": _component_status(attention_backend),
         "activation_mode": result.activation_mode,
         "activation_blocks": result.activation_blocks,
         "chunk_rows": int(config.chunk_rows),
@@ -162,19 +167,23 @@ def apply(
         item for item in (adaln_provider, cache_coordinator)
         if item is not None
     ]
+    listeners.extend(
+        item for item in getattr(decision.backend, "runtime_listeners", ())
+        if item is not None and item not in listeners
+    )
     runtime_needed = bool(
-        listeners or decision.selected == ATTENTION_SOL
+        listeners or _backend_flag(decision.backend, "requires_runtime_context")
     )
     runtime_session = None
     if runtime_needed:
         runtime_session = H3RuntimeSession(
-            strict_layout=bool(config.sol_strict and decision.selected == ATTENTION_SOL),
+            strict_layout=_backend_flag(decision.backend, "strict_runtime_layout"),
             listeners=listeners,
         )
         runtime_installer(model_patcher, runtime_session)
 
     result = ApplyResult(
-        attention_requested=config.attention,
+        attention_requested=decision.requested,
         attention_selected=decision.selected,
         attention_reason=decision.reason,
         attention_blocks=int(attention_blocks),
