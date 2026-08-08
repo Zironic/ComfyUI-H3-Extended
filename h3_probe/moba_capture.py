@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import os
 
-from . import capture, layout as h3_layout, moba3d
+from . import capture, latent_dynamics, layout as h3_layout, moba3d
 
 try:
     from ..h3_attention.observer import observing
@@ -25,6 +25,7 @@ class MobaProbeRun:
         self.include_audio = session.include_audio
         self.include_text = session.include_text
         self.capture_uncond = session.capture_uncond
+        self.capture_latent_dynamics = session.capture_latent_dynamics
         self.block_t = session.block_t
         self.block_h = session.block_h
         self.block_w = session.block_w
@@ -34,6 +35,10 @@ class MobaProbeRun:
         self.records = []
         self.layout = None
         self.notes = {}
+        self.anchor_frames = []
+        self.dynamics_queries = []
+        self.latent_dynamics = []
+        self.dynamics_tracker = latent_dynamics.LatentDynamicsTracker()
 
 
 class MobaProbeSession:
@@ -48,6 +53,7 @@ class MobaProbeSession:
         include_audio,
         include_text,
         capture_uncond,
+        capture_latent_dynamics,
         block_t,
         block_h,
         block_w,
@@ -63,6 +69,7 @@ class MobaProbeSession:
         self.include_audio = bool(include_audio)
         self.include_text = bool(include_text)
         self.capture_uncond = bool(capture_uncond)
+        self.capture_latent_dynamics = bool(capture_latent_dynamics)
         self.block_t = int(block_t)
         self.block_h = int(block_h)
         self.block_w = int(block_w)
@@ -81,13 +88,21 @@ class MobaProbeSession:
     def end(self):
         run = self.run
         self.run = None
-        if run is None or not run.records:
+        if run is None:
+            return None
+        run.dynamics_tracker.close()
+        if not run.records and not run.latent_dynamics:
             logging.warning("[H3 MoBA3D probe] run finished with no captures")
             return None
         from .moba_report import write_run
 
         path = write_run(run)
-        logging.info("[H3 MoBA3D probe] %d records -> %s", len(run.records), path)
+        logging.info(
+            "[H3 MoBA3D probe] %d attention records, %d dynamics records -> %s",
+            len(run.records),
+            len(run.latent_dynamics),
+            path,
+        )
         return path
 
 
@@ -170,9 +185,50 @@ class ForwardMobaProbe:
             self.run.records.append(rec)
 
 
+def _replace_outer_callback(args, kwargs, callback):
+    """Return args/kwargs with CFGGuider.outer_sample's callback replaced."""
+    if len(args) > 5:
+        args = list(args)
+        args[5] = callback
+        return tuple(args), kwargs
+    kwargs = dict(kwargs)
+    kwargs["callback"] = callback
+    return args, kwargs
+
+
 def make_outer_wrapper(session):
     def wrapper(executor, *args, **kwargs):
-        session.begin()
+        run = session.begin()
+        original_callback = args[5] if len(args) > 5 else kwargs.get("callback")
+        latent_shapes = kwargs.get("latent_shapes")
+
+        if run.capture_latent_dynamics:
+            def probe_callback(step, x0, x, total_steps):
+                try:
+                    rec = run.dynamics_tracker.capture(
+                        run,
+                        step,
+                        x0,
+                        x,
+                        total_steps,
+                        latent_shapes,
+                        run.dynamics_queries,
+                    )
+                    if rec is not None:
+                        run.latent_dynamics.append(rec)
+                except Exception:
+                    # Diagnostics must never break sampling or the user's preview
+                    # callback. The attention probe follows the same policy.
+                    logging.exception(
+                        "[H3 MoBA3D probe] latent dynamics capture failed at step %s",
+                        step,
+                    )
+                if original_callback is not None:
+                    return original_callback(step, x0, x, total_steps)
+                return None
+
+            args, kwargs = _replace_outer_callback(args, kwargs, probe_callback)
+
         try:
             return executor(*args, **kwargs)
         finally:
@@ -212,6 +268,20 @@ def make_wrapper(session):
             num_layers = len(getattr(model, "blocks", [])) or 50
             run.layers = set(capture.resolve_indices(run.layers_spec, num_layers))
             run.steps = set(capture.resolve_indices(run.steps_spec, total_steps))
+            run.anchor_frames = latent_dynamics.resolve_anchor_frames(
+                payload, layout.latent_t
+            )
+            if run.capture_latent_dynamics:
+                # Match the video query regions used by the attention probe, but
+                # omit audio/text because sampler dynamics are target-video only.
+                run.dynamics_queries = capture.select_query_blocks(
+                    layout,
+                    run.n_time,
+                    run.n_spatial,
+                    run.query_block,
+                    include_audio=False,
+                    include_text=False,
+                )
             run.notes.update(
                 {
                     "total_steps": int(total_steps),
@@ -220,11 +290,16 @@ def make_wrapper(session):
                         "probe-only per-query-token 3D mean-pooled routing "
                         "with exact sparse-output comparison"
                     ),
+                    "latent_dynamics": bool(run.capture_latent_dynamics),
+                    "latent_dynamics_source": "sampler callback x/x0",
+                    "latent_dynamics_patch": [1, 2, 2],
+                    "anchor_frames": list(run.anchor_frames),
                 }
             )
             logging.info(
                 "[H3 MoBA3D probe] layout=%s layers=%s steps=%s "
-                "block=%dx%dx%d budgets=%s per-query-token routing",
+                "block=%dx%dx%d budgets=%s per-query-token routing "
+                "latent_dynamics=%s anchors=%s",
                 layout.describe(),
                 sorted(run.layers),
                 sorted(run.steps),
@@ -232,6 +307,8 @@ def make_wrapper(session):
                 run.block_h,
                 run.block_w,
                 run.budgets,
+                run.capture_latent_dynamics,
+                run.anchor_frames,
             )
 
         step, sigma = capture._step_index(transformer_options)

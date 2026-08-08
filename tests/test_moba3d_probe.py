@@ -7,6 +7,7 @@ Run from the ComfyUI root:
 
 import os
 import sys
+from types import SimpleNamespace
 
 import torch
 
@@ -16,7 +17,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(_HERE, "..", "..", "..")))
 
 from h3_attention.observer import notify_attention, observing  # noqa: E402
 from h3_probe import layout as h3_layout  # noqa: E402
-from h3_probe import moba3d, moba_report  # noqa: E402
+from h3_probe import latent_dynamics, moba3d, moba_report  # noqa: E402
 
 TEXT_LEN = 24
 LATENT_T, LATENT_H, LATENT_W = 4, 8, 12
@@ -188,6 +189,67 @@ def test_random_output_metrics(lay):
         check(len(row["oracle_head_rel_l2"]) == HEADS, "per-head oracle output errors are retained")
 
 
+def test_latent_dynamics_math():
+    previous = torch.ones(1, 2, 3, 4, 4)
+    current = previous.clone()
+    current[:, :, 1] += 0.01
+    current[:, :, 2] += 0.20
+
+    stream = latent_dynamics._stream_update(previous, current)
+    updates = [row["update_rel_l2"] for row in stream["frames"]]
+    check(abs(updates[0]) < 1e-8, "unchanged latent frame has zero update")
+    check(updates[0] < updates[1] < updates[2], "frame update metric tracks planted change magnitude")
+    check(stream["patch_shape"] == (3, 2, 2), "latent dynamics reduce to H3 1x2x2 patches")
+    check(
+        abs(stream["global"]["stable_patch_fraction"]["1%"] - (2.0 / 3.0)) < 1e-6,
+        "stable-patch fraction counts unchanged and 1% frames",
+    )
+
+    tiny_layout = SimpleNamespace(video_range=(100, 112))
+    region = latent_dynamics._region_metrics(stream, tiny_layout, 104, 108)
+    check(abs(region["update_rel_l2"] - 0.01) < 1e-5, "query-region update matches planted middle frame")
+
+    anchors = latent_dynamics.resolve_anchor_frames(
+        {
+            "frame_count": 125,
+            "keyframes": [
+                {"resolved_frame_index": 0},
+                {"resolved_frame_index": 124},
+            ],
+        },
+        62,
+    )
+    check(anchors == [0, 61], "pixel first/last keyframes map to latent endpoints")
+    check(latent_dynamics.anchor_distance(30, anchors) == 30, "anchor distance uses nearest explicit keyframe")
+
+
+def test_latent_dynamics_summary():
+    frames = [
+        {
+            "frame": i,
+            "anchor_distance": i,
+            "sample": {"update_rel_l2": 0.01 * (i + 1)},
+            "prediction": {"update_rel_l2": 0.02 * (i + 1)},
+        }
+        for i in range(4)
+    ]
+    dynamics = [
+        {
+            "step": 3,
+            "anchor_frames": [0],
+            "frames": frames,
+            "query_regions": [],
+            "global": {
+                "sample": {"update_rel_l2": 0.02},
+                "prediction": {"update_rel_l2": 0.04},
+            },
+        }
+    ]
+    summary = latent_dynamics.summarize_dynamics(dynamics)
+    corr = summary["by_step"]["3"]["anchor_distance_vs_prediction_update_pearson"]
+    check(corr is not None and corr > 0.999, "anchor-distance/update correlation is reported")
+
+
 def test_report(lay):
     class Run:
         tag = "unit"
@@ -197,6 +259,8 @@ def test_report(lay):
         notes = {"num_layers": 1, "total_steps": 1}
         block_t, block_h, block_w = 1, 2, 2
         budgets = (0.25,)
+        capture_latent_dynamics = True
+        anchor_frames = [0]
 
     row = {
         "budget": 0.25,
@@ -254,13 +318,56 @@ def test_report(lay):
         },
     }
     Run.records = [rec]
+    Run.latent_dynamics = [
+        {
+            "step": 0,
+            "total_steps": 2,
+            "anchor_frames": [0],
+            "frames": [
+                {
+                    "frame": 0,
+                    "anchor_distance": 0,
+                    "sample": {"update_rel_l2": 0.01},
+                    "prediction": {"update_rel_l2": 0.02},
+                }
+            ],
+            "query_regions": [
+                {
+                    "kind": "video",
+                    "frame": 0,
+                    "spatial_offset": 0,
+                    "start": rec["start"],
+                    "stop": rec["stop"],
+                    "anchor_distance": 0,
+                    "sample": {"update_rel_l2": 0.01},
+                    "prediction": {"update_rel_l2": 0.02},
+                }
+            ],
+            "global": {
+                "sample": {
+                    "update_rel_l2": 0.01,
+                    "stable_patch_fraction": {"1%": 0.5, "2%": 0.75, "5%": 1.0},
+                },
+                "prediction": {
+                    "update_rel_l2": 0.02,
+                    "stable_patch_fraction": {"1%": 0.25, "2%": 0.5, "5%": 0.9},
+                },
+            },
+            "patch_shape": [4, 4, 6],
+        }
+    ]
     summary = moba_report.summarize(Run.records)
-    text = moba_report.render(Run, summary)
+    dyn_summary = latent_dynamics.summarize_dynamics(Run.latent_dynamics, Run.records)
+    text = moba_report.render(Run, summary, dyn_summary)
     check(
         "sparse output rel-L2" in text
         and "LAYER / HEAD DIAGNOSTICS" in text
         and "oracle" in text,
         "report exposes output error, layer/head diagnostics and oracle",
+    )
+    check(
+        "LATENT DYNAMICS" in text and "latent dynamics: sample" in text,
+        "report exposes sampler convergence beside matching attention queries",
     )
 
 
@@ -272,6 +379,8 @@ def main():
     test_observer_carries_v()
     test_per_query_routing_and_output(lay)
     test_random_output_metrics(lay)
+    test_latent_dynamics_math()
+    test_latent_dynamics_summary()
     test_report(lay)
     print("\nall 3D MoBA probe self-tests passed")
 
