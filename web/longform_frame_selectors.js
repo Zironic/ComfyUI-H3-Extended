@@ -29,13 +29,6 @@ const REFERENCE_MAX_SECONDS = 15;
 const MIN_REFERENCE_FRAMES = FPS * REFERENCE_MIN_SECONDS;
 const MAX_REFERENCE_FRAMES = FPS * REFERENCE_MAX_SECONDS;
 
-// Video is 24 fps and H3 audio latents are 40 Hz. Their time boundaries meet
-// every three video frames (five audio latents), so an exact A/V chunk length
-// must also be divisible by three.
-const AUDIO_ALIGNED_CHUNK_FRAMES = CHUNK_FRAMES.filter(
-    (frames) => frames % 3 === 0,
-);
-
 // A carried overlap must begin on a video-latent boundary. For a legal H3
 // chunk, the possible suffix lengths repeat with residues 0, 4, 5, 9 and 13
 // modulo 17. O=4 is the smallest possible suffix and carries one latent.

@@ -32,6 +32,10 @@ function calculateSchedule(node) {
         0.025,
         Number(getWidget(node, "audio_reference_seconds")?.value ?? 4.0),
     );
+    const audioReferenceLatents = Math.min(
+        Math.round(audioReferenceSeconds * 40),
+        Math.round((chunkFrames / FPS) * 40),
+    );
     const targetFrames = outputSeconds * FPS;
     const chunkCount = Math.max(1, Math.ceil(targetFrames / chunkFrames));
     return {
@@ -39,6 +43,7 @@ function calculateSchedule(node) {
         chunkFrames,
         videoReferenceFrames,
         audioReferenceSeconds,
+        audioReferenceLatents,
         targetFrames,
         chunkCount,
     };
@@ -356,7 +361,7 @@ class NPlusOnePromptEditor {
             `${schedule.chunkCount} chunks`,
             `C=${schedule.chunkFrames}`,
             `V=${referenceSummary}`,
-            `A=${schedule.audioReferenceSeconds.toFixed(3)}s history`,
+            `A=${schedule.audioReferenceLatents} latents (${(schedule.audioReferenceLatents / 40).toFixed(3)}s) history`,
             "no overlap",
             "N+1 AV continuation",
             `${schedule.outputSeconds}s`,
@@ -383,7 +388,7 @@ class NPlusOnePromptEditor {
                     ? "static refs only"
                     : schedule.videoReferenceFrames === schedule.chunkFrames
                     ? `N+1 AV continuation | previous complete previous chunk`
-                    : `N+1 AV continuation | previous ${formatSeconds(schedule.videoReferenceFrames)} video tail + ${schedule.audioReferenceSeconds.toFixed(3)}s audio history`;
+                    : `N+1 AV continuation | previous ${formatSeconds(schedule.videoReferenceFrames)} video tail + ${(schedule.audioReferenceLatents / 40).toFixed(3)}s audio history`;
 
             const label = document.createElement("div");
             label.style.cssText = "margin-bottom:6px;font-size:11px;color:#aaa";
