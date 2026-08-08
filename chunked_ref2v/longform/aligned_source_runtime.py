@@ -28,6 +28,7 @@ _ORIGINAL_EXECUTE = None
 _ORIGINAL_PREPARE = None
 _ORIGINAL_PROMPTS = None
 _ORIGINAL_COUNT_ITEMS = None
+_ORIGINAL_RUN_IDENTITY = None
 
 
 @dataclass(frozen=True)
@@ -314,6 +315,18 @@ def _prompts_for_plan(*args, **kwargs):
     ]
 
 
+def _run_identity(*args, **kwargs):
+    identity = _ORIGINAL_RUN_IDENTITY(*args, **kwargs)
+    active = _ACTIVE.get()
+    if active.video is not None:
+        identity["aligned_source"] = av._reference_identity({
+            "video": active.video,
+            "audio": active.audio,
+            "video_size": active.video_size,
+        })
+    return identity
+
+
 def _replace_inputs(schema, inputs):
     if is_dataclass(schema):
         return replace(schema, inputs=inputs)
@@ -326,6 +339,7 @@ def _replace_inputs(schema, inputs):
 def install():
     global _INSTALLED, _ORIGINAL_SCHEMA, _ORIGINAL_EXECUTE
     global _ORIGINAL_PREPARE, _ORIGINAL_PROMPTS, _ORIGINAL_COUNT_ITEMS
+    global _ORIGINAL_RUN_IDENTITY
     if _INSTALLED:
         return
 
@@ -336,6 +350,7 @@ def install():
     _ORIGINAL_PREPARE = av._encode_static_references
     _ORIGINAL_PROMPTS = av.prompts_for_av_continuation_plan
     _ORIGINAL_COUNT_ITEMS = av._count_items
+    _ORIGINAL_RUN_IDENTITY = av._run_identity
 
     @classmethod
     def define_schema(cls):
@@ -385,8 +400,14 @@ def install():
     ):
         bound = execute_signature.bind(cls, *args, **kwargs)
         bound.apply_defaults()
-        target_frames = int(bound.arguments["output_seconds"]) * 24
-        chunk_frames = int(bound.arguments["chunk_frames"])
+        prompt_plan = bound.arguments.get("n_plus_one_prompt_plan")
+        if prompt_plan is not None:
+            prompt_plan = av.validate_nplusone_chunk_prompt_plan(prompt_plan)
+            target_frames = int(prompt_plan["target_frames"])
+            chunk_frames = int(prompt_plan["chunk_frames"])
+        else:
+            target_frames = int(bound.arguments["output_seconds"]) * 24
+            chunk_frames = int(bound.arguments["chunk_frames"])
 
         if aligned_source_audio is not None and aligned_source_video is None:
             raise ValueError(
@@ -433,6 +454,7 @@ def install():
     av._encode_static_references = _prepare_references
     av.prompts_for_av_continuation_plan = _prompts_for_plan
     av._count_items = _count_items
+    av._run_identity = _run_identity
     _INSTALLED = True
 
 

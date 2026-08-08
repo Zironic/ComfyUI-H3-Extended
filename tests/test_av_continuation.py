@@ -10,6 +10,8 @@ from chunked_ref2v.longform.av_continuation_nodes import (
     MiniMaxH3LongFormAVContinuation,
     _chunk_count,
     _dynamic_av_reference,
+    _resolve_execution_plan,
+    _run_identity,
     _slice_dynamic_av_reference,
     _resolve_reference_frames,
     continuation_prompt,
@@ -106,10 +108,10 @@ class LongFormAVContinuationTests(unittest.TestCase):
         self.assertIs(sliced_audio, audio)
 
     def test_reference_frames_are_snapped_to_legal_values(self):
-        self.assertEqual(_resolve_reference_frames(141, 80), 81)
+        self.assertEqual(_resolve_reference_frames(141, 80), 90)
 
     def test_reference_frames_respect_reference_input_range(self):
-        self.assertEqual(_resolve_reference_frames(141, 40), 51)
+        self.assertEqual(_resolve_reference_frames(141, 40), 90)
 
     def test_reference_frames_can_snap_to_whole_chunk(self):
         self.assertEqual(_resolve_reference_frames(141, 141), 141)
@@ -194,18 +196,82 @@ class LongFormAVContinuationTests(unittest.TestCase):
             self.assertNotIn("<Audio", prompt)
             self.assertNotIn("video continuation", prompt)
 
-    def test_plan_geometry_mismatch_fails_before_sampling(self):
+    def test_connected_plan_owns_geometry_and_seed(self):
         plan = build_nplusone_chunk_prompt_plan(
             output_seconds=12,
             chunk_frames=141,
+            seed=123,
         )
-        with self.assertRaises(ValueError):
-            prompts_for_av_continuation_plan(
-                plan,
-                "fallback",
-                output_seconds=12,
-                chunk_frames=90,
-            )
+        effective, prompts, source, overrides = _resolve_execution_plan(
+            plan,
+            "fallback",
+            output_seconds=1,
+            chunk_frames=90,
+            reference_frames=39,
+            seed=999,
+        )
+        self.assertEqual(effective["output_seconds"], 12)
+        self.assertEqual(effective["chunk_frames"], 141)
+        self.assertEqual(effective["reference_frames"], 90)
+        self.assertEqual(effective["seed"], 123)
+        self.assertEqual(source, "N+1 prompt plan")
+        self.assertEqual(
+            overrides,
+            ["output_seconds", "chunk_frames", "reference_frames", "seed"],
+        )
+        self.assertEqual(prompts, ["fallback", "fallback", "fallback"])
+
+    def test_plan_fallback_prompt_updates_effective_digest(self):
+        plan = build_nplusone_chunk_prompt_plan(
+            output_seconds=1,
+            chunk_frames=141,
+        )
+        effective, prompts, _, _ = _resolve_execution_plan(
+            plan,
+            "fallback",
+            output_seconds=1,
+            chunk_frames=141,
+            reference_frames=90,
+            seed=0,
+        )
+        self.assertEqual(prompts, ["fallback"])
+        self.assertNotEqual(effective["chunk_digests"], plan["chunk_digests"])
+
+    def test_run_manifest_allows_prompt_and_seed_edits(self):
+        before = build_nplusone_chunk_prompt_plan(
+            output_seconds=12,
+            chunk_frames=141,
+            global_prompt="before",
+            seed=1,
+        )
+        after = build_nplusone_chunk_prompt_plan(
+            output_seconds=12,
+            chunk_frames=141,
+            global_prompt="after",
+            seed=2,
+        )
+        component = object()
+        kwargs = dict(
+            canvas=(96, 64),
+            model=component,
+            clip=component,
+            video_vae=component,
+            audio_vae=component,
+            sampler=component,
+            sigmas=torch.tensor([1.0, 0.0]),
+            ref_images=None,
+            ref_videos=None,
+            ref_video_audios=None,
+            ref_audios=None,
+            ref_image_size="native",
+            cond_cache="auto",
+            attention="auto",
+            activation="mlp_chunked_native",
+        )
+        self.assertEqual(
+            _run_identity(before, **kwargs),
+            _run_identity(after, **kwargs),
+        )
 
 
 if __name__ == "__main__":

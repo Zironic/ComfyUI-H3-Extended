@@ -48,7 +48,7 @@ LOG_PREFIX = "[H3 Extended] n+1 resume"
 
 # Bump when the stored payload or the validity rule changes in a way that makes
 # older directories unsafe to reuse.
-CHUNK_SCHEMA = 1
+CHUNK_SCHEMA = 2
 
 SAMPLES_DIR = "samples"
 
@@ -125,6 +125,12 @@ def latent_digest(tensor):
     return tensor_digest(tensor)
 
 
+def chunk_digest_from_shas(video_sha, audio_sha):
+    return hashlib.sha256(
+        (str(video_sha) + "\n" + str(audio_sha)).encode("ascii")
+    ).hexdigest()
+
+
 # ------------------------------------------------------------------ storage
 
 def chunk_path(root, index, suffix=".safetensors"):
@@ -148,6 +154,8 @@ def save_chunk(root, index, *, video_latent, audio_latent, seed, prompt_sha,
         "video_latent": video_latent,
         "audio_latent": audio_latent,
     })
+    video_sha = latent_digest(video_latent)
+    audio_sha = latent_digest(audio_latent)
     meta = {
         "schema": CHUNK_SCHEMA,
         "index": int(index),
@@ -156,7 +164,9 @@ def save_chunk(root, index, *, video_latent, audio_latent, seed, prompt_sha,
         "parent_sha256": parent_sha,
         "reference_frames": int(reference_frames),
         "chunk_frames": int(chunk_frames),
-        "video_sha256": latent_digest(video_latent),
+        "video_sha256": video_sha,
+        "audio_sha256": audio_sha,
+        "chunk_sha256": chunk_digest_from_shas(video_sha, audio_sha),
     }
     tmp = _meta_path(root, index) + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
@@ -181,7 +191,11 @@ def load_chunk(root, index):
     except (OSError, ValueError):
         return None, None
     tensors = _load(chunk_path(root, index))
-    if tensors is None or "video_latent" not in tensors:
+    if (
+        tensors is None
+        or "video_latent" not in tensors
+        or "audio_latent" not in tensors
+    ):
         return None, None
     return tensors, meta
 
@@ -205,7 +219,7 @@ def invalidate_from(root, start, chunk_count):
 
 # ------------------------------------------------------------------ the scan
 
-def resume_point(root, *, chunk_count, compiled_prompts, chunk_seeds,
+def resume_point(root, *, chunk_count, chunk_digests, chunk_seeds,
                  reference_frames, chunk_frames):
     """Index of the first chunk that must be regenerated.
 
@@ -213,6 +227,8 @@ def resume_point(root, *, chunk_count, compiled_prompts, chunk_seeds,
     the run has nothing to sample and only needs reassembly.
     """
     chunk_count = int(chunk_count)
+    if len(chunk_digests) != chunk_count or len(chunk_seeds) != chunk_count:
+        raise ValueError("resume identity must contain one digest and seed per chunk")
     parent_sha = None
     for index in range(chunk_count):
         tensors, meta = load_chunk(root, index)
@@ -220,11 +236,13 @@ def resume_point(root, *, chunk_count, compiled_prompts, chunk_seeds,
             return index
         if int(meta.get("schema", -1)) != CHUNK_SCHEMA:
             return index
+        if int(meta.get("index", -1)) != index:
+            return index
         if int(meta.get("chunk_frames", -1)) != int(chunk_frames):
             return index
         if int(meta.get("reference_frames", -1)) != int(reference_frames):
             return index
-        if meta.get("prompt_sha256") != prompt_digest(compiled_prompts[index]):
+        if meta.get("prompt_sha256") != chunk_digests[index]:
             return index
         if int(meta.get("seed", -1)) != int(chunk_seeds[index]):
             return index
@@ -232,8 +250,16 @@ def resume_point(root, *, chunk_count, compiled_prompts, chunk_seeds,
             # Chunk k records the digest of the chunk it actually continued
             # from. A mismatch means the prefix was rewritten underneath it.
             return index
-        parent_sha = meta.get("video_sha256") or latent_digest(
-            tensors["video_latent"])
+        video_sha = latent_digest(tensors["video_latent"])
+        audio_sha = latent_digest(tensors["audio_latent"])
+        if meta.get("video_sha256") != video_sha:
+            return index
+        if meta.get("audio_sha256") != audio_sha:
+            return index
+        chunk_sha = chunk_digest_from_shas(video_sha, audio_sha)
+        if meta.get("chunk_sha256") != chunk_sha:
+            return index
+        parent_sha = chunk_sha
     return chunk_count
 
 

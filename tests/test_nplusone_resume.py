@@ -61,7 +61,9 @@ class _FakeStore:
         os.makedirs(os.path.join(root, resume.SAMPLES_DIR), exist_ok=True)
 
     def write(self, index, *, prompt, seed, parent_sha, video_sha,
+              audio_sha=None,
               chunk_frames=141, reference_frames=90, schema=None):
+        audio_sha = audio_sha or "audio-%d" % index
         meta = {
             "schema": resume.CHUNK_SCHEMA if schema is None else schema,
             "index": index,
@@ -71,6 +73,8 @@ class _FakeStore:
             "reference_frames": reference_frames,
             "chunk_frames": chunk_frames,
             "video_sha256": video_sha,
+            "audio_sha256": audio_sha,
+            "chunk_sha256": resume.chunk_digest_from_shas(video_sha, audio_sha),
         }
         with open(resume.chunk_path(self.root, index, ".json"), "w",
                   encoding="utf-8") as fh:
@@ -92,7 +96,9 @@ class ResumeScanTest(unittest.TestCase):
         for i in range(5):
             self.store.write(i, prompt=self.prompts[i], seed=self.seeds[i],
                              parent_sha=parent, video_sha="sha-%d" % i)
-            parent = "sha-%d" % i
+            parent = resume.chunk_digest_from_shas(
+                "sha-%d" % i, "audio-%d" % i,
+            )
 
         # load_chunk normally reads real tensors; stub it for the scan tests
         self._real_load = resume.load_chunk
@@ -102,14 +108,22 @@ class ResumeScanTest(unittest.TestCase):
             if not os.path.exists(path):
                 return None, None
             with open(path, encoding="utf-8") as fh:
-                return {"video_latent": object()}, json.load(fh)
+                meta = json.load(fh)
+            return {
+                "video_latent": meta["video_sha256"],
+                "audio_latent": meta["audio_sha256"],
+            }, meta
 
         resume.load_chunk = fake_load
         self.addCleanup(setattr, resume, "load_chunk", self._real_load)
+        self._real_digest = resume.latent_digest
+        resume.latent_digest = lambda value: str(value)
+        self.addCleanup(setattr, resume, "latent_digest", self._real_digest)
 
     def scan(self):
         return resume.resume_point(
-            self.root, chunk_count=5, compiled_prompts=self.prompts,
+            self.root, chunk_count=5,
+            chunk_digests=[resume.prompt_digest(text) for text in self.prompts],
             chunk_seeds=self.seeds, reference_frames=90, chunk_frames=141)
 
     def test_untouched_run_needs_no_sampling(self):
@@ -137,9 +151,34 @@ class ResumeScanTest(unittest.TestCase):
                          parent_sha="sha-from-another-run", video_sha="sha-3")
         self.assertEqual(self.scan(), 3)
 
+    def test_tampered_video_payload_is_caught(self):
+        real_load = resume.load_chunk
+
+        def tampered(root, index):
+            tensors, meta = real_load(root, index)
+            if index == 2:
+                tensors["video_latent"] = "different-payload"
+            return tensors, meta
+
+        resume.load_chunk = tampered
+        self.assertEqual(self.scan(), 2)
+
+    def test_tampered_audio_payload_is_caught(self):
+        real_load = resume.load_chunk
+
+        def tampered(root, index):
+            tensors, meta = real_load(root, index)
+            if index == 2:
+                tensors["audio_latent"] = "different-audio"
+            return tensors, meta
+
+        resume.load_chunk = tampered
+        self.assertEqual(self.scan(), 2)
+
     def test_changed_reference_frames_invalidates_everything(self):
         got = resume.resume_point(
-            self.root, chunk_count=5, compiled_prompts=self.prompts,
+            self.root, chunk_count=5,
+            chunk_digests=[resume.prompt_digest(text) for text in self.prompts],
             chunk_seeds=self.seeds, reference_frames=39, chunk_frames=141)
         self.assertEqual(got, 0)
 

@@ -84,8 +84,7 @@ class PlanSeedTest(unittest.TestCase):
 
     def test_validator_accepts_a_freshly_built_plan(self):
         plan = self.build()
-        normalized = self.planner.validate_nplusone_chunk_prompt_plan(
-            plan, output_seconds=58, chunk_frames=141, reference_frames=90)
+        normalized = self.planner.validate_nplusone_chunk_prompt_plan(plan)
         self.assertEqual(normalized["seed"], plan["seed"])
         self.assertEqual(normalized["chunk_seeds"], plan["chunk_seeds"])
 
@@ -94,15 +93,28 @@ class PlanSeedTest(unittest.TestCase):
         plan["chunk_seeds"] = list(plan["chunk_seeds"])
         plan["chunk_seeds"][3] += 1
         with self.assertRaises(ValueError):
-            self.planner.validate_nplusone_chunk_prompt_plan(
-                plan, output_seconds=58, chunk_frames=141, reference_frames=90)
+            self.planner.validate_nplusone_chunk_prompt_plan(plan)
 
     def test_validator_rejects_wrong_length_seed_list(self):
         plan = self.build()
         plan["chunk_seeds"] = plan["chunk_seeds"][:-1]
         with self.assertRaises(ValueError):
-            self.planner.validate_nplusone_chunk_prompt_plan(
-                plan, output_seconds=58, chunk_frames=141, reference_frames=90)
+            self.planner.validate_nplusone_chunk_prompt_plan(plan)
+
+    def test_plan_carries_one_compiled_prompt_digest_per_chunk(self):
+        plan = self.build(global_prompt="global", chunk_prompts_json='{"prompts":["a","b"]}')
+        compiled = self.planner.compile_nplusone_chunk_prompts(plan)
+        self.assertEqual(
+            plan["chunk_digests"],
+            [self.planner.prompt_digest(text) for text in compiled],
+        )
+
+    def test_validator_rejects_tampered_chunk_digest(self):
+        plan = self.build()
+        plan["chunk_digests"] = list(plan["chunk_digests"])
+        plan["chunk_digests"][0] = "0" * 64
+        with self.assertRaises(ValueError):
+            self.planner.validate_nplusone_chunk_prompt_plan(plan)
 
     def test_editing_a_chunk_prompt_leaves_every_seed_alone(self):
         """The whole point: a prompt edit must not reroll anything."""

@@ -28,10 +28,6 @@ import torch
 from comfy_api.latest import ComfyExtension, InputImpl, io
 
 from .. import harness, memory, ref_builder
-from ..audio_boundary_profile import (
-    legal_reference_tail_frames,
-    validate_av_continuation_chunk_frames,
-)
 from ..geometry import AUDIO_LATENT_FPS, HarnessGeometry
 try:
     from ...cond_cache import MODES as COND_CACHE_MODES
@@ -46,9 +42,15 @@ from .audio_output import (
 )
 from . import diagnostics
 from . import audio_runtime
+from . import nplusone_resume
+from .manifest import RunManifest, object_fingerprint, tensor_digest
 from .nplusone_chunk_prompt_timeline import (
     NPlusOneChunkPromptPlan,
+    build_nplusone_chunk_prompt_plan,
+    prompt_digest,
     prompts_for_av_continuation_plan,
+    resolve_nplusone_reference_frames,
+    validate_nplusone_chunk_prompt_plan,
 )
 from .preview import (
     CURRENT_FRAMES_TOOLTIP,
@@ -67,10 +69,6 @@ from .runner import decode_chunk
 from .writer import FFmpegVideoWriter, close_writers
 
 LOG = "[H3 Extended] longform AV continuation"
-REFERENCE_SECONDS_MIN = 2
-REFERENCE_SECONDS_MAX = 15
-REFERENCE_FRAMES_MIN = 24 * REFERENCE_SECONDS_MIN
-REFERENCE_FRAMES_MAX = 24 * REFERENCE_SECONDS_MAX
 
 
 def _chunk_count(target_frames, chunk_frames):
@@ -81,28 +79,131 @@ def _chunk_count(target_frames, chunk_frames):
     return int(math.ceil(target_frames / float(chunk_frames)))
 
 
-def _nearest(value, candidates, *, prefer_larger_on_tie=True):
-    if not candidates:
-        raise ValueError("no legal reference-tail candidate")
-    value = int(value)
-    if prefer_larger_on_tie:
-        return min(candidates, key=lambda item: (abs(item - value), -item))
-    return min(candidates, key=lambda item: (abs(item - value), item))
-
-
 def _resolve_reference_frames(chunk_frames, reference_frames):
-    validate_av_continuation_chunk_frames(chunk_frames)
-    candidates = legal_reference_tail_frames(chunk_frames)
-    bounded_candidates = [
-        value
-        for value in candidates
-        if REFERENCE_FRAMES_MIN <= value <= REFERENCE_FRAMES_MAX
-    ]
-    return _nearest(
-        reference_frames,
-        bounded_candidates or candidates,
-        prefer_larger_on_tie=True,
+    return resolve_nplusone_reference_frames(chunk_frames, reference_frames)
+
+
+def _resolve_execution_plan(
+    plan,
+    prompt,
+    *,
+    output_seconds,
+    chunk_frames,
+    reference_frames,
+    seed,
+):
+    if plan is None:
+        normalized = build_nplusone_chunk_prompt_plan(
+            output_seconds=output_seconds,
+            chunk_frames=chunk_frames,
+            global_prompt=prompt,
+            reference_frames=reference_frames,
+            seed=seed,
+        )
+        source = "node inputs"
+        overrides = []
+    else:
+        normalized = validate_nplusone_chunk_prompt_plan(plan)
+        source = "N+1 prompt plan"
+        overrides = [
+            name
+            for name, value in (
+                ("output_seconds", output_seconds),
+                ("chunk_frames", chunk_frames),
+                ("reference_frames", reference_frames),
+                ("seed", seed),
+            )
+            if int(normalized[name]) != int(value)
+        ]
+
+    compiled = prompts_for_av_continuation_plan(
+        normalized,
+        prompt,
+        output_seconds=normalized["output_seconds"],
+        chunk_frames=normalized["chunk_frames"],
+        reference_frames=normalized["reference_frames"],
     )
+    effective_digests = [prompt_digest(text) for text in compiled]
+    if effective_digests != normalized["chunk_digests"]:
+        # Blank plan entries retain the legacy prompt-socket fallback. The
+        # effective digest must describe what the text encoder actually sees.
+        normalized = dict(normalized)
+        normalized["chunk_digests"] = effective_digests
+    return normalized, compiled, source, overrides
+
+
+def _reference_identity(value):
+    if isinstance(value, torch.Tensor):
+        return {
+            "shape": list(value.shape),
+            "dtype": str(value.dtype),
+            "sha256": tensor_digest(value),
+        }
+    if isinstance(value, dict):
+        return {
+            str(key): _reference_identity(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_reference_identity(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return repr(value)
+
+
+def _run_identity(
+    plan,
+    *,
+    canvas,
+    model,
+    clip,
+    video_vae,
+    audio_vae,
+    sampler,
+    sigmas,
+    ref_images,
+    ref_videos,
+    ref_video_audios,
+    ref_audios,
+    ref_image_size,
+    cond_cache,
+    attention,
+    activation,
+):
+    return {
+        "mode": "nplusone_av_continuation",
+        "plan": {
+            key: plan[key]
+            for key in (
+                "version",
+                "schedule",
+                "continuation_policy",
+                "fps",
+                "output_seconds",
+                "target_frames",
+                "chunk_frames",
+                "chunk_count",
+                "reference_frames",
+            )
+        },
+        "canvas": list(canvas),
+        "model": object_fingerprint(model),
+        "clip": object_fingerprint(clip),
+        "video_vae": object_fingerprint(video_vae),
+        "audio_vae": object_fingerprint(audio_vae),
+        "sampler": object_fingerprint(sampler),
+        "sigmas_sha256": tensor_digest(sigmas),
+        "references": _reference_identity({
+            "images": ref_images,
+            "videos": ref_videos,
+            "video_audios": ref_video_audios,
+            "audios": ref_audios,
+        }),
+        "ref_image_size": ref_image_size,
+        "cond_cache": cond_cache,
+        "attention": attention,
+        "activation": activation,
+    }
 
 
 def _count_items(items, kind):
@@ -277,10 +378,14 @@ def _slice_dynamic_av_reference(
 def _resolve_root(run_directory, chunk_frames):
     if str(run_directory or "").strip():
         root = str(run_directory).strip()
-        if os.path.exists(root) and os.listdir(root):
+        if (
+            os.path.isdir(root)
+            and os.listdir(root)
+            and not os.path.exists(os.path.join(root, "manifest.json"))
+        ):
             raise RuntimeError(
-                "LongFormAVContinuation requires a fresh run directory; "
-                "interrupted executions are not resumable"
+                "LongFormAVContinuation run directory is non-empty but has no "
+                "resume manifest"
             )
         return root
 
@@ -335,13 +440,17 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
                     min=0,
                     max=0xFFFFFFFFFFFFFFFF,
                     control_after_generate=True,
+                    tooltip="Used only when no N+1 prompt plan is connected.",
                 ),
                 io.Int.Input(
                     "output_seconds",
                     default=30,
                     min=1,
                     max=3600,
-                    tooltip="Exact requested output duration at H3's fixed 24 fps.",
+                    tooltip=(
+                        "Exact requested output duration at H3's fixed 24 fps. "
+                        "Used only when no N+1 prompt plan is connected."
+                    ),
                 ),
                 io.Int.Input(
                     "width",
@@ -365,7 +474,8 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
                     step=17,
                     tooltip=(
                         "Generated frames per continuation invocation. Every chunk "
-                        "contributes all of its frames; there is no overlap trimming."
+                        "contributes all of its frames; there is no overlap trimming. "
+                        "Used only when no N+1 prompt plan is connected."
                     ),
                 ),
                 io.Combo.Input(
@@ -394,7 +504,8 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
                     multiline=False,
                     tooltip=(
                         "Leave blank to create a new output/h3_longform_av_continuation "
-                        "directory. Existing non-empty directories are rejected."
+                        "directory. Point at an existing matching run to reuse its "
+                        "valid chunk prefix and regenerate only the changed suffix."
                     ),
                 ),
                 io.String.Input(
@@ -511,7 +622,8 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
                     max=362,
                     tooltip=(
                         "Tail frames from each generated chunk used as dynamic "
-                        "<Video N+1>/<Audio M+1> reference."
+                        "<Video N+1>/<Audio M+1> reference. Used only when no N+1 "
+                        "prompt plan is connected."
                     ),
                 ),
             ],
@@ -563,6 +675,17 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
         reference_frames=90,
         unique_id=None,
     ) -> io.NodeOutput:
+        plan, chunk_prompts, plan_source, scalar_overrides = _resolve_execution_plan(
+            n_plus_one_prompt_plan,
+            prompt,
+            output_seconds=output_seconds,
+            chunk_frames=chunk_frames,
+            reference_frames=reference_frames,
+            seed=seed,
+        )
+        chunk_frames = int(plan["chunk_frames"])
+        resolved_reference_frames = int(plan["reference_frames"])
+
         # H3 target construction only needs a legal chunk length. The geometry
         # helper requires an overlap value, but this node never consumes its
         # stride/overlap fields; O=4 is used only to obtain the target AV shape.
@@ -571,18 +694,7 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
             overlap_frames=4,
         ).validate()
         canvas = _validate_canvas(width, height)
-        target_frames = int(output_seconds * geometry.fps)
-        resolved_reference_frames = _resolve_reference_frames(
-            chunk_frames=geometry.chunk_frames,
-            reference_frames=reference_frames,
-        )
-        chunk_prompts = prompts_for_av_continuation_plan(
-            n_plus_one_prompt_plan,
-            prompt,
-            output_seconds=output_seconds,
-            chunk_frames=geometry.chunk_frames,
-            reference_frames=resolved_reference_frames,
-        )
+        target_frames = int(plan["target_frames"])
         reference_geometry = (
             HarnessGeometry(
                 chunk_frames=int(chunk_frames),
@@ -591,7 +703,7 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
             if resolved_reference_frames < geometry.chunk_frames
             else None
         )
-        chunk_count = _chunk_count(target_frames, geometry.chunk_frames)
+        chunk_count = int(plan["chunk_count"])
         if len(chunk_prompts) != chunk_count:
             raise RuntimeError(
                 "N+1 timeline resolved %d prompts for %d continuation chunks"
@@ -626,6 +738,13 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
             activation=activation,
         )
         logging.info("%s %s", LOG, memory.describe(memory_status))
+        if scalar_overrides:
+            logging.info(
+                "%s %s overrides legacy node inputs: %s",
+                LOG,
+                plan_source,
+                ", ".join(scalar_overrides),
+            )
 
         static_video_count = sum(1 for _ in _ordered_values(ref_videos))
         if static_video_count > 2:
@@ -633,6 +752,51 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
                 "AV continuation reserves one video-reference slot for the previous "
                 "generated chunk; connect at most two static reference videos"
             )
+
+        manifest = RunManifest(
+            root,
+            _run_identity(
+                plan,
+                canvas=canvas,
+                model=model,
+                clip=clip,
+                video_vae=video_vae,
+                audio_vae=audio_vae,
+                sampler=sampler,
+                sigmas=sigmas,
+                ref_images=ref_images,
+                ref_videos=ref_videos,
+                ref_video_audios=ref_video_audios,
+                ref_audios=ref_audios,
+                ref_image_size=ref_image_size,
+                cond_cache=cond_cache,
+                attention=attention,
+                activation=activation,
+            ),
+        )
+        manifest.ensure()
+        resume_from = nplusone_resume.resume_point(
+            root,
+            chunk_count=chunk_count,
+            chunk_digests=plan["chunk_digests"],
+            chunk_seeds=plan["chunk_seeds"],
+            reference_frames=resolved_reference_frames,
+            chunk_frames=geometry.chunk_frames,
+        )
+        nplusone_resume.invalidate_from(root, resume_from, chunk_count)
+        manifest.update_state(
+            complete=False,
+            resume_from=resume_from,
+            chunks_complete=resume_from,
+        )
+        logging.info(
+            "%s",
+            nplusone_resume.describe(
+                root,
+                chunk_count=chunk_count,
+                resume_from=resume_from,
+            ),
+        )
 
         ffmpeg = ffmpeg_location.strip() or None
         raw_video = os.path.join(root, "output", "video_only.mkv")
@@ -697,77 +861,105 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
         completed = False
         try:
             with torch.inference_mode():
-                static_items, static_blocks, reference_notes = _encode_static_references(
-                    video_vae=video_vae,
-                    audio_vae=audio_vae,
-                    canvas=canvas,
-                    ref_images=ref_images,
-                    ref_videos=ref_videos,
-                    ref_video_audios=ref_video_audios,
-                    ref_audios=ref_audios,
-                    ref_image_size=ref_image_size,
-                    cond_cache=cond_cache,
-                )
+                if resume_from < chunk_count:
+                    static_items, static_blocks, reference_notes = (
+                        _encode_static_references(
+                            video_vae=video_vae,
+                            audio_vae=audio_vae,
+                            canvas=canvas,
+                            ref_images=ref_images,
+                            ref_videos=ref_videos,
+                            ref_video_audios=ref_video_audios,
+                            ref_audios=ref_audios,
+                            ref_image_size=ref_image_size,
+                            cond_cache=cond_cache,
+                        )
+                    )
+                else:
+                    static_items, static_blocks = [], []
                 dynamic_video_number = _count_items(static_items, "video") + 1
                 dynamic_audio_number = _count_items(static_items, "audio") + 1
+                parent_sha = None
 
                 for index, base_prompt in enumerate(chunk_prompts):
-                    items = list(static_items)
-                    blocks = list(static_blocks)
-                    active_prompt = str(base_prompt or "")
-
-                    if index > 0:
-                        reference_pixels, reference_video, reference_audio = (
-                            _slice_dynamic_av_reference(
-                                previous_pixels,
-                                previous_video,
-                                previous_audio,
-                                reference_frames=resolved_reference_frames,
-                                geometry=reference_geometry,
-                            )
-                        )
-                        dynamic_items, dynamic_block = _dynamic_av_reference(
-                            reference_pixels,
-                            reference_video,
-                            reference_audio,
-                            canvas,
-                        )
-                        items.extend(dynamic_items)
-                        blocks.append(dynamic_block)
-                        active_prompt = continuation_prompt(
-                            active_prompt,
-                            dynamic_video_number,
-                            dynamic_audio_number,
-                        )
-
-                    conditioning = harness._encode(
-                        clip,
-                        active_prompt,
-                        items,
-                        cond_cache,
-                    )
-                    conditioning = harness.attach_refs(conditioning, blocks)
-                    latent = harness.empty_av_latent(canvas, geometry)
                     active_publisher = current_publisher()
-                    callback = (
-                        active_publisher.sampler_callback(index)
-                        if active_publisher is not None
-                        else None
-                    )
+                    sampled = index >= resume_from
+                    if sampled:
+                        items = list(static_items)
+                        blocks = list(static_blocks)
+                        active_prompt = str(base_prompt or "")
 
-                    sample_kwargs = {
-                        "model": model,
-                        "conditioning": conditioning,
-                        "latent": latent,
-                        "sampler": sampler,
-                        "sigmas": sigmas,
-                        "seed": harness.splitmix64(int(seed) + 1000 + index),
-                    }
-                    if callback is not None:
-                        sample_kwargs["callback"] = callback
-                    video_latent, audio_latent = harness.sample(**sample_kwargs)
-                    video_latent = video_latent.to("cpu", torch.float32)
-                    audio_latent = audio_latent.to("cpu", torch.float32)
+                        if index > 0:
+                            reference_pixels, reference_video, reference_audio = (
+                                _slice_dynamic_av_reference(
+                                    previous_pixels,
+                                    previous_video,
+                                    previous_audio,
+                                    reference_frames=resolved_reference_frames,
+                                    geometry=reference_geometry,
+                                )
+                            )
+                            dynamic_items, dynamic_block = _dynamic_av_reference(
+                                reference_pixels,
+                                reference_video,
+                                reference_audio,
+                                canvas,
+                            )
+                            items.extend(dynamic_items)
+                            blocks.append(dynamic_block)
+                            active_prompt = continuation_prompt(
+                                active_prompt,
+                                dynamic_video_number,
+                                dynamic_audio_number,
+                            )
+
+                        conditioning = harness._encode(
+                            clip,
+                            active_prompt,
+                            items,
+                            cond_cache,
+                        )
+                        conditioning = harness.attach_refs(conditioning, blocks)
+                        latent = harness.empty_av_latent(canvas, geometry)
+                        callback = (
+                            active_publisher.sampler_callback(index)
+                            if active_publisher is not None
+                            else None
+                        )
+                        sample_kwargs = {
+                            "model": model,
+                            "conditioning": conditioning,
+                            "latent": latent,
+                            "sampler": sampler,
+                            "sigmas": sigmas,
+                            "seed": plan["chunk_seeds"][index],
+                        }
+                        if callback is not None:
+                            sample_kwargs["callback"] = callback
+                        video_latent, audio_latent = harness.sample(**sample_kwargs)
+                        video_latent = video_latent.to("cpu", torch.float32)
+                        audio_latent = audio_latent.to("cpu", torch.float32)
+                        chunk_meta = nplusone_resume.save_chunk(
+                            root,
+                            index,
+                            video_latent=video_latent,
+                            audio_latent=audio_latent,
+                            seed=plan["chunk_seeds"][index],
+                            prompt_sha=plan["chunk_digests"][index],
+                            parent_sha=parent_sha,
+                            reference_frames=resolved_reference_frames,
+                            chunk_frames=geometry.chunk_frames,
+                        )
+                    else:
+                        stored, chunk_meta = nplusone_resume.load_chunk(root, index)
+                        if stored is None or chunk_meta is None:
+                            raise RuntimeError(
+                                "resume prefix chunk %d disappeared during assembly"
+                                % index
+                            )
+                        video_latent = stored["video_latent"]
+                        audio_latent = stored["audio_latent"]
+                    parent_sha = chunk_meta["chunk_sha256"]
 
                     pixels = decode_chunk(video_vae, video_latent).to(
                         "cpu", torch.float32
@@ -882,18 +1074,28 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
                     previous_pixels = pixels
 
                     logging.info(
-                        "%s chunk %d/%d complete; committed %d frames; dynamic ref=%s",
+                        "%s chunk %d/%d %s; committed %d frames; dynamic ref=%s",
                         LOG,
                         index + 1,
                         chunk_count,
+                        "sampled" if sampled else "reused",
                         take_frames,
                         "none"
                         if index == 0
                         else "<Video %d>/<Audio %d>"
                         % (dynamic_video_number, dynamic_audio_number),
                     )
+                    manifest.update_state(
+                        chunks_complete=index + 1,
+                        frames_written=written_frames,
+                        audio_samples_written=written_audio,
+                    )
 
-                    del conditioning, latent, waveform, frames_u8
+                    if sampled:
+                        del conditioning, latent
+                    else:
+                        del stored
+                    del waveform, frames_u8
                     gc.collect()
 
             if written_frames != target_frames:
@@ -931,6 +1133,13 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
             fps=geometry.fps,
             ffmpeg_location=ffmpeg,
         )
+        manifest.update_state(
+            complete=True,
+            chunks_complete=chunk_count,
+            frames_written=written_frames,
+            audio_samples_written=written_audio,
+            output_path=output_path,
+        )
 
         preview_image = (
             previous_pixels[-1:].clone()
@@ -953,10 +1162,13 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
                 if n_plus_one_prompt_plan is not None
                 else "single prompt repeated per chunk"
             ),
+            "plan      %s; seed=%d" % (plan_source, plan["seed"]),
             "canvas    %dx%d" % canvas,
             "chunk     %d frames; every chunk contributes all generated frames"
             % geometry.chunk_frames,
             "chunks    %d" % chunk_count,
+            "resume    reused %d; sampled %d"
+            % (resume_from, chunk_count - resume_from),
             "output    %d frames (%.3f s at %d fps)"
             % (target_frames, target_frames / geometry.fps, geometry.fps),
             "reference R=%d frames (%.3f s) %s"

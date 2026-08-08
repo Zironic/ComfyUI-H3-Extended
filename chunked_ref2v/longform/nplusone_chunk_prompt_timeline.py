@@ -1,10 +1,10 @@
 """N+1-aware prompt timeline for native long-form continuation nodes.
 
 Unlike the overlap-based ``MiniMax H3 Chunk Prompt Timeline (Zi)``, this plan
-uses full generated chunks with no overlap/stride semantics.  It stores only the
-user-authored global/chunk instructions plus a continuation policy.  The
-consuming long-form node resolves the dynamic <Video N+1>/<Audio M+1> reference
-numbers after the previous chunk has actually been generated.
+uses full generated chunks with no overlap/stride semantics. It owns the chunk
+geometry, run seed, derived per-chunk seeds, and user-authored prompt timeline.
+The consuming node resolves dynamic <Video N+1>/<Audio M+1> reference numbers
+after the previous chunk has actually been generated.
 """
 
 from __future__ import annotations
@@ -14,15 +14,15 @@ import math
 
 from comfy_api.latest import ComfyExtension, io
 from ..audio_boundary_profile import (
-    legal_reference_tail_frames,
     validate_av_continuation_chunk_frames,
 )
-from ..geometry import chunk_seed as derive_chunk_seed
+from ..geometry import audio_boundary_is_exact, chunk_seed as derive_chunk_seed
+from .nplusone_resume import legal_reference_frames, prompt_digest
 
 FPS = 24
-# 3: the plan owns the run seed and the derived per-chunk seeds. Seed lives with
-# the thing being edited, so a requeue after a prompt edit keeps it - which is
-# what makes resuming an existing run possible at all.
+# 3: the plan owns the run seed, derived per-chunk seeds, and compiled-prompt
+# digests. Seed lives with the thing being edited, so a requeue after a prompt
+# edit keeps it - which is what makes resuming an existing run possible at all.
 PLAN_VERSION = 3
 POLICY_AV_CONTINUATION = "previous_av_continuation"
 REFERENCE_MIN_SECONDS = 2
@@ -42,9 +42,14 @@ def _nearest(value, candidates, *, prefer_larger_on_tie=True):
     return min(candidates, key=lambda item: (abs(item - value), item))
 
 
-def _resolve_reference_frames(chunk_frames, reference_frames):
+def resolve_nplusone_reference_frames(chunk_frames, reference_frames):
     validate_av_continuation_chunk_frames(chunk_frames)
-    candidates = legal_reference_tail_frames(chunk_frames)
+    candidates = [
+        value
+        for value in legal_reference_frames(chunk_frames) + [int(chunk_frames)]
+        if audio_boundary_is_exact(value)
+        and audio_boundary_is_exact(int(chunk_frames) - value)
+    ]
     bounded = [
         value
         for value in candidates
@@ -80,6 +85,15 @@ def _chunk_count(target_frames, chunk_frames):
     return int(math.ceil(target_frames / float(chunk_frames)))
 
 
+def _compiled_prompt(global_prompt, local_prompt, fallback_prompt=""):
+    global_prompt = str(global_prompt or "").strip()
+    local_prompt = str(local_prompt or "").strip()
+    fallback_prompt = str(fallback_prompt or "").strip()
+    if global_prompt and local_prompt:
+        return global_prompt + "\n\n" + local_prompt
+    return global_prompt or local_prompt or fallback_prompt
+
+
 def build_nplusone_chunk_prompt_plan(
     *,
     output_seconds,
@@ -108,8 +122,10 @@ def build_nplusone_chunk_prompt_plan(
     stored = _parse_prompt_store(chunk_prompts_json)
     prompts = stored[:chunk_count]
     prompts.extend("" for _ in range(chunk_count - len(prompts)))
-    resolved_reference_frames = _resolve_reference_frames(chunk_frames, reference_frames)
-    return {
+    resolved_reference_frames = resolve_nplusone_reference_frames(
+        chunk_frames, reference_frames,
+    )
+    plan = {
         "version": PLAN_VERSION,
         "schedule": "full_chunks",
         "continuation_policy": continuation_policy,
@@ -124,14 +140,16 @@ def build_nplusone_chunk_prompt_plan(
         "seed": seed,
         "chunk_seeds": [derive_chunk_seed(seed, index) for index in range(chunk_count)],
     }
+    plan["chunk_digests"] = [
+        prompt_digest(_compiled_prompt(plan["global_prompt"], local))
+        for local in plan["chunk_prompts"]
+    ]
+    return plan
 
 
 def validate_nplusone_chunk_prompt_plan(
     plan,
     *,
-    output_seconds,
-    chunk_frames,
-    reference_frames=90,
     continuation_policy=POLICY_AV_CONTINUATION,
 ):
     if not isinstance(plan, dict):
@@ -148,40 +166,37 @@ def validate_nplusone_chunk_prompt_plan(
             % (plan.get("continuation_policy"), continuation_policy)
         )
 
-    expected = build_nplusone_chunk_prompt_plan(
-        output_seconds=output_seconds,
-        chunk_frames=chunk_frames,
-        reference_frames=reference_frames,
-        continuation_policy=continuation_policy,
-    )
-    for key in (
-        "fps",
-        "output_seconds",
-        "target_frames",
-        "chunk_frames",
-        "chunk_count",
-        "reference_frames",
+    output_seconds = int(plan.get("output_seconds", -1))
+    chunk_frames = int(plan.get("chunk_frames", -1))
+    target_frames = int(plan.get("target_frames", -1))
+    chunk_count = int(plan.get("chunk_count", -1))
+    reference_frames = int(plan.get("reference_frames", -1))
+    if int(plan.get("fps", -1)) != FPS:
+        raise ValueError("N+1 chunk prompt plan fps is invalid")
+    if output_seconds <= 0 or target_frames != output_seconds * FPS:
+        raise ValueError("N+1 chunk prompt plan duration is invalid")
+    if chunk_count != _chunk_count(target_frames, chunk_frames):
+        raise ValueError("N+1 chunk prompt plan chunk geometry is invalid")
+    if (
+        resolve_nplusone_reference_frames(chunk_frames, reference_frames)
+        != reference_frames
     ):
-        if int(plan.get(key, -1)) != int(expected[key]):
-            raise ValueError(
-                "N+1 chunk prompt plan %s=%r does not match downstream node %s=%r"
-                % (key, plan.get(key), key, expected[key])
-            )
+        raise ValueError("N+1 chunk prompt plan reference geometry is invalid")
 
     prompts = plan.get("chunk_prompts")
-    if not isinstance(prompts, list) or len(prompts) != expected["chunk_count"]:
+    if not isinstance(prompts, list) or len(prompts) != chunk_count:
         raise ValueError(
             "N+1 chunk prompt plan contains %d prompts; expected exactly %d"
             % (
                 len(prompts) if isinstance(prompts, list) else 0,
-                expected["chunk_count"],
+                chunk_count,
             )
         )
 
     seed = int(plan.get("seed", 0)) & 0xFFFFFFFFFFFFFFFF
     chunk_seeds = plan.get("chunk_seeds")
     expected_seeds = [
-        derive_chunk_seed(seed, index) for index in range(expected["chunk_count"])
+        derive_chunk_seed(seed, index) for index in range(chunk_count)
     ]
     if list(chunk_seeds or []) != expected_seeds:
         # A plan whose seeds do not follow from its own seed would make the
@@ -189,7 +204,17 @@ def validate_nplusone_chunk_prompt_plan(
         # are not.
         raise ValueError(
             "N+1 chunk prompt plan chunk_seeds do not match seed=%d over %d chunks"
-            % (seed, expected["chunk_count"])
+            % (seed, chunk_count)
+        )
+
+    compiled = [
+        _compiled_prompt(plan.get("global_prompt"), item)
+        for item in prompts
+    ]
+    expected_digests = [prompt_digest(text) for text in compiled]
+    if list(plan.get("chunk_digests") or []) != expected_digests:
+        raise ValueError(
+            "N+1 chunk prompt plan chunk_digests do not match its compiled prompts"
         )
 
     normalized = dict(plan)
@@ -197,21 +222,15 @@ def validate_nplusone_chunk_prompt_plan(
     normalized["chunk_prompts"] = [str(item or "") for item in prompts]
     normalized["seed"] = seed
     normalized["chunk_seeds"] = expected_seeds
+    normalized["chunk_digests"] = expected_digests
     return normalized
 
 
 def compile_nplusone_chunk_prompts(plan, fallback_prompt=""):
-    global_prompt = str(plan.get("global_prompt") or "").strip()
-    fallback = str(fallback_prompt or "").strip()
-    compiled = []
-    for local in plan["chunk_prompts"]:
-        local = str(local or "").strip()
-        if global_prompt and local:
-            text = global_prompt + "\n\n" + local
-        else:
-            text = global_prompt or local or fallback
-        compiled.append(text)
-    return compiled
+    return [
+        _compiled_prompt(plan.get("global_prompt"), local, fallback_prompt)
+        for local in plan["chunk_prompts"]
+    ]
 
 
 def prompts_for_av_continuation_plan(
@@ -223,16 +242,13 @@ def prompts_for_av_continuation_plan(
     reference_frames=90,
 ):
     if plan is None:
-        count = _chunk_count(int(output_seconds) * FPS, int(chunk_frames))
-        _resolve_reference_frames(chunk_frames, reference_frames)
-        return [str(fallback_prompt or "")] * count
-    normalized = validate_nplusone_chunk_prompt_plan(
-        plan,
-        output_seconds=output_seconds,
-        chunk_frames=chunk_frames,
-        reference_frames=reference_frames,
-        continuation_policy=POLICY_AV_CONTINUATION,
-    )
+        plan = build_nplusone_chunk_prompt_plan(
+            output_seconds=output_seconds,
+            chunk_frames=chunk_frames,
+            global_prompt=fallback_prompt,
+            reference_frames=reference_frames,
+        )
+    normalized = validate_nplusone_chunk_prompt_plan(plan)
     return compile_nplusone_chunk_prompts(normalized, fallback_prompt)
 
 
@@ -318,10 +334,12 @@ class MiniMaxH3NPlusOneChunkPromptTimeline(io.ComfyNode):
                     "n_plus_one_prompt_plan",
                     display_name="N+1 prompt plan",
                 ),
-                io.Int.Output("output_seconds", display_name="output seconds"),
-                io.Int.Output("chunk_frames", display_name="chunk frames"),
+                io.Int.Output("output_seconds", display_name="output seconds (legacy)"),
+                io.Int.Output("chunk_frames", display_name="chunk frames (legacy)"),
                 io.String.Output("report", display_name="report"),
-                io.Int.Output("reference_frames", display_name="reference frames"),
+                io.Int.Output(
+                    "reference_frames", display_name="reference frames (legacy)"
+                ),
                 io.Int.Output("seed", display_name="seed"),
             ],
         )
@@ -401,6 +419,8 @@ __all__ = [
     "POLICY_AV_CONTINUATION",
     "build_nplusone_chunk_prompt_plan",
     "compile_nplusone_chunk_prompts",
+    "prompt_digest",
     "prompts_for_av_continuation_plan",
+    "resolve_nplusone_reference_frames",
     "validate_nplusone_chunk_prompt_plan",
 ]

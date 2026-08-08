@@ -37,7 +37,7 @@ class NPlusOneChunkPromptTimelineTests(unittest.TestCase):
             chunk_frames=141,
             reference_frames=80,
         )
-        self.assertEqual(plan["reference_frames"], 81)
+        self.assertEqual(plan["reference_frames"], 90)
 
     def test_reference_frames_respects_reference_input_range(self):
         plan = build_nplusone_chunk_prompt_plan(
@@ -45,7 +45,7 @@ class NPlusOneChunkPromptTimelineTests(unittest.TestCase):
             chunk_frames=141,
             reference_frames=40,
         )
-        self.assertEqual(plan["reference_frames"], 51)
+        self.assertEqual(plan["reference_frames"], 90)
 
     def test_strict_chunk_rejects_illegal_length(self):
         with self.assertRaises(ValueError):
@@ -62,7 +62,7 @@ class NPlusOneChunkPromptTimelineTests(unittest.TestCase):
                 chunk_frames=141,
                 reference_frames=60,
             )["reference_frames"],
-            60,
+            90,
         )
         self.assertEqual(
             build_nplusone_chunk_prompt_plan(
@@ -99,46 +99,40 @@ class NPlusOneChunkPromptTimelineTests(unittest.TestCase):
         plan["global_prompt"] = ""
         self.assertEqual(compile_nplusone_chunk_prompts(plan, "fallback"), ["fallback"])
 
-    def test_downstream_geometry_mismatch_is_rejected(self):
+    def test_validator_uses_geometry_from_the_plan(self):
         plan = build_nplusone_chunk_prompt_plan(
             output_seconds=12,
             chunk_frames=141,
         )
-        with self.assertRaises(ValueError):
-            validate_nplusone_chunk_prompt_plan(
-                plan,
-                output_seconds=12,
-                chunk_frames=90,
-            )
+        normalized = validate_nplusone_chunk_prompt_plan(plan)
+        self.assertEqual(normalized["output_seconds"], 12)
+        self.assertEqual(normalized["chunk_frames"], 141)
 
-    def test_reference_frames_mismatch_is_rejected(self):
+    def test_invalid_internal_reference_geometry_is_rejected(self):
         plan = build_nplusone_chunk_prompt_plan(
             output_seconds=12,
             chunk_frames=141,
-            reference_frames=72,
+            reference_frames=90,
         )
+        plan["reference_frames"] = 81
         with self.assertRaises(ValueError):
-            validate_nplusone_chunk_prompt_plan(
-                plan,
-                output_seconds=12,
-                chunk_frames=141,
-                reference_frames=81,
-            )
+            validate_nplusone_chunk_prompt_plan(plan)
 
-    def test_prompts_function_rejects_reference_frame_mismatch(self):
+    def test_prompts_function_prefers_plan_geometry(self):
         plan = build_nplusone_chunk_prompt_plan(
             output_seconds=12,
             chunk_frames=141,
-            reference_frames=72,
+            global_prompt="plan",
+            reference_frames=90,
         )
-        with self.assertRaises(ValueError):
-            prompts_for_av_continuation_plan(
-                plan,
-                "fallback",
-                output_seconds=12,
-                chunk_frames=141,
-                reference_frames=81,
-            )
+        prompts = prompts_for_av_continuation_plan(
+            plan,
+            "fallback",
+            output_seconds=1,
+            chunk_frames=90,
+            reference_frames=39,
+        )
+        self.assertEqual(prompts, ["plan", "plan", "plan"])
 
     def test_av_consumer_receives_compiled_prompts(self):
         plan = build_nplusone_chunk_prompt_plan(
