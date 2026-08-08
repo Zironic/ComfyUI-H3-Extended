@@ -20,6 +20,14 @@ DEFAULT_RECIPES = (
     "current_hybrid",
 )
 FP8_DIM_MULTIPLE = 16
+CONTAINER_IMAGE = "nvcr.io/nvidia/pytorch@sha256:2140e699b3beaf7f96a0081fd9c9406bc3832b435cdb60dfa2d261f7d2f34a1c"
+KERNEL_SOURCES = (
+    "transformer_engine/pytorch/ops/basic/swiglu.py",
+    "transformer_engine/pytorch/csrc/extensions/activation.cpp",
+    "transformer_engine/common/cast/dispatch/gated.cuh",
+    "transformer_engine/common/cast/fp8/gated_fp8.cuh",
+    "transformer_engine/common/util/vectorized_pointwise.h",
+)
 
 
 def parse_rows(value):
@@ -127,6 +135,12 @@ def _recipe_for(te_recipe, recipe_name):
     return current(fp8_format=fmt)
 
 
+def expected_swiglu_quantization_path(recipe_name):
+    if recipe_name.startswith("delayed_"):
+        return "direct_fp8_output"
+    return "high_precision_temporary_then_fp8"
+
+
 def _fp8_available(te):
     try:
         available = te.is_fp8_available(return_reason=True)
@@ -160,12 +174,13 @@ def _build_case(te, recipe, ffn_width, hidden_width, weight):
 
 
 def _eager_output(x, weight):
-    gate, up = x.chunk(2, dim=-1)
-    return F.linear(F.silu(gate) * up, weight)
+    with torch.no_grad():
+        gate, up = x.chunk(2, dim=-1)
+        return F.linear(F.silu(gate) * up, weight)
 
 
 def _te_output(te, chain, x, recipe):
-    with te.autocast(enabled=True, recipe=recipe):
+    with torch.no_grad(), te.autocast(enabled=True, recipe=recipe):
         return chain(x)
 
 
@@ -195,7 +210,7 @@ def inspect_carrier(carrier, quantized_tensor_type):
 
 def probe_carrier(te, x, recipe, quantized_tensor_type):
     probe = te.ops.Sequential(te.ops.SwiGLU(), te.ops.Quantize())
-    with te.autocast(enabled=True, recipe=recipe):
+    with torch.no_grad(), te.autocast(enabled=True, recipe=recipe):
         carrier = probe(x)
     return inspect_carrier(carrier, quantized_tensor_type)
 
@@ -284,6 +299,7 @@ def run(args):
                 "rows": rows,
                 "case": "te_fp8",
                 "recipe": recipe_name,
+                "expected_swiglu_quantization_path": expected_swiglu_quantization_path(recipe_name),
                 "relative_l2": relative_l2(output, reference),
                 "max_absolute_error": max_absolute_error(output, reference),
                 "timing": benchmark_case(lambda: _te_output(te, chain, x, recipe), args.warmup, args.iterations),
@@ -297,7 +313,11 @@ def run(args):
             del chain, output
         del x, reference
     result = {
-        "versions": {"torch": torch.__version__, "transformer_engine": _te_version(transformer_engine)},
+        "versions": {
+            "container_image": CONTAINER_IMAGE,
+            "torch": torch.__version__,
+            "transformer_engine": _te_version(transformer_engine),
+        },
         "device": {
             "name": torch.cuda.get_device_name(),
             "capability": list(capability),
@@ -310,7 +330,8 @@ def run(args):
             "rows": list(args.rows),
         },
         "recipes": list(args.recipes),
-        "kernel_source_expectation": "Transformer Engine FP8 SwiGLU + FP8-weight Linear",
+        "kernel_source_expectation": "TE SwiGLU receives the following FP8 Linear input quantizer",
+        "kernel_sources": KERNEL_SOURCES,
         "results": results,
         "carrier_details": carrier_details,
     }

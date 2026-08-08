@@ -20,7 +20,6 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(args.rows, BENCH.DEFAULT_ROWS)
         self.assertEqual(args.recipes, BENCH.DEFAULT_RECIPES)
 
-
     def test_parse_and_validate_dimensions(self):
         self.assertEqual(BENCH.parse_rows("2048, 8192"), (2048, 8192))
         self.assertEqual(BENCH.parse_recipes("delayed_e4m3,current_hybrid"), ("delayed_e4m3", "current_hybrid"))
@@ -28,7 +27,6 @@ class BenchmarkTests(unittest.TestCase):
             BENCH.validate_dimensions(32, 12, 16, (2,))
         with self.assertRaises(ValueError):
             BENCH.validate_dimensions(30, 15, 16, (2,))
-
 
     def test_numerical_metrics_and_serialization(self):
         reference = torch.tensor([[1.0, 2.0]], dtype=torch.bfloat16)
@@ -38,6 +36,14 @@ class BenchmarkTests(unittest.TestCase):
         encoded = BENCH.serialize_result({"shape": (2, 3), "value": 1})
         self.assertEqual(json.loads(encoded), {"shape": [2, 3], "value": 1})
 
+        self.assertEqual(
+            BENCH.expected_swiglu_quantization_path("delayed_e4m3"),
+            "direct_fp8_output",
+        )
+        self.assertEqual(
+            BENCH.expected_swiglu_quantization_path("current_e4m3"),
+            "high_precision_temporary_then_fp8",
+        )
 
     def test_carrier_inspection_uses_fake_te_quantized_tensor(self):
         class QuantizedTensor(torch.Tensor):
@@ -51,7 +57,6 @@ class BenchmarkTests(unittest.TestCase):
         details = BENCH.inspect_carrier(carrier, QuantizedTensor)
         self.assertEqual(details["logical_shape"], (2, 4))
         self.assertEqual(details["backing_data_bytes"], 8)
-
 
     def test_carrier_inspection_rejects_non_te_tensor(self):
         with self.assertRaises(RuntimeError):

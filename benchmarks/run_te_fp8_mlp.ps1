@@ -9,14 +9,15 @@ if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
-$image = "nvcr.io/nvidia/pytorch:26.07-py3"
+$image = "nvcr.io/nvidia/pytorch@sha256:2140e699b3beaf7f96a0081fd9c9406bc3832b435cdb60dfa2d261f7d2f34a1c"
 & docker image inspect $image *> $null
 if ($LASTEXITCODE -ne 0) {
     throw "Required local image is missing: $image (pull it explicitly before running this script)"
 }
 
 $mount = "{0}:/workspace/h3" -f $h3Root
-& docker run --gpus all --ipc=host --rm -v $mount $image `
+& docker run --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 `
+    --pull never --rm -v $mount $image `
     python /workspace/h3/benchmarks/bench_te_fp8_mlp.py `
     --i-understand-this-uses-gpu @args
 exit $LASTEXITCODE
