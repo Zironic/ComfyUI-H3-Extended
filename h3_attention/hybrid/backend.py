@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from .config import HybridSparseConfig
 from .router import SparseRouterError, SparseTileRouter
 from .sparse_sage import SparseSageError, SparseSageExecutor, load_sparse_sage_api
+from .stats import DeferredCudaTiming
 
 try:
     from ...h3_runtime.context import get_runtime_snapshot
@@ -15,6 +16,7 @@ except ImportError:
 @dataclass
 class PreparedHybrid:
     sparse: object
+    total_timing: object = None
 
 
 class HybridSparseBackend:
@@ -24,17 +26,30 @@ class HybridSparseBackend:
     approximate = True
 
     def __init__(self, config=None, *, api=None, router=None, collector=None,
-                 allow_cpu_for_tests=False):
+                 allow_cpu_for_tests=False, event_factory=None, timing_timer=None,
+                 qk_quantizer=None, v_preparer=None, low_level_selector=None):
         self.config = config or HybridSparseConfig()
         if not isinstance(self.config, HybridSparseConfig):
             raise TypeError("config must be HybridSparseConfig")
         self.router = router if router is not None else SparseTileRouter()
         self.collector = collector
         self.runtime_listeners = () if collector is None else (collector,)
+        self.timing = DeferredCudaTiming(
+            self.config.timing,
+            event_factory=event_factory,
+            timer=timing_timer,
+        )
+        if collector is not None:
+            attach = getattr(collector, "attach_timing", None)
+            if attach is not None:
+                attach(self.timing)
         self.strict_runtime_layout = bool(self.config.strict)
         self.executor = SparseSageExecutor(
             api if api is not None else load_sparse_sage_api(),
             allow_cpu_for_tests=allow_cpu_for_tests,
+            qk_quantizer=qk_quantizer,
+            v_preparer=v_preparer,
+            low_level_selector=low_level_selector,
         )
 
     def prepare(self, q, k, v, *, layer_index, transformer_options):
@@ -52,19 +67,24 @@ class HybridSparseBackend:
                 % (snapshot.layout.seq_len, q.shape[-2])
             )
 
-        # These are the Phase-A owned copies. Routing and Sparse Sage share them;
-        # the H3 forward can release the fused source allocation afterwards.
-        q_owned = q.contiguous()
-        k_owned = k.contiguous()
+        self.timing.begin_request(snapshot.request_id, cuda=bool(getattr(q, "is_cuda", False)))
+        total_timing = self.timing.begin("total_hybrid_attention")
+        router_timing = self.timing.begin("direct_lut_construction")
         try:
-            mask_id, mask_metadata = self.router.build_mask(
-                q_owned,
-                k_owned,
+            lut, valid_block_num, mask_metadata = self.router.build_lut(
+                q,
+                k,
                 snapshot.layout,
                 self.config.video_budget,
             )
         except SparseRouterError as exc:
+            self.timing.end(total_timing)
             raise SparseSageError("hybrid routing failed: %s" % exc) from exc
+        except Exception:
+            self.timing.end(total_timing)
+            raise
+        finally:
+            self.timing.end(router_timing)
 
         metadata = mask_metadata.as_dict()
         metadata.update({
@@ -81,21 +101,30 @@ class HybridSparseBackend:
                 int(mask_metadata.pure_video_q_tiles) * int(q.shape[1])
             ),
         })
-        sparse = self.executor.prepare(
-            q_owned,
-            k_owned,
-            v,
-            mask_id,
-            layer_index=layer_index,
-            metadata=metadata,
-        )
-        return PreparedHybrid(sparse=sparse)
+        try:
+            sparse = self.executor.prepare(
+                q,
+                k,
+                v,
+                lut,
+                valid_block_num,
+                layer_index=layer_index,
+                metadata=metadata,
+                timing=self.timing,
+            )
+        except Exception:
+            self.timing.end(total_timing)
+            raise
+        return PreparedHybrid(sparse=sparse, total_timing=total_timing)
 
     def execute(self, prepared):
-        output = self.executor.execute(prepared.sparse)
-        if self.collector is not None:
-            self.collector.record(prepared.sparse.metadata)
-        return output
+        try:
+            output = self.executor.execute(prepared.sparse)
+            if self.collector is not None:
+                self.collector.record(prepared.sparse.metadata)
+            return output
+        finally:
+            self.timing.end(prepared.total_timing)
 
     def as_status(self):
         return {
@@ -104,4 +133,5 @@ class HybridSparseBackend:
             "video_budget": float(self.config.video_budget),
             "sparge_attention": self.executor.api.version,
             "approximate": True,
+            "timing": bool(self.config.timing),
         }

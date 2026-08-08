@@ -18,8 +18,6 @@ from .. import harness
 from ..geometry import (
     AUDIO_LATENT_FPS,
     HarnessGeometry,
-    aligned_overlap_frames,
-    audio_boundary_is_exact,
     latent_frame_spans,
 )
 from ..layout_ops import TargetAlignedCondition
@@ -54,59 +52,82 @@ def audio_latent_boundary(
     return round(int(frame_index) / float(fps) * int(audio_latent_fps))
 
 
-def resolve_audio_aligned_overlap(chunk_frames, overlap_frames, enabled, fps=24):
-    """Snap the overlap onto the shared video/audio grid when asked.
+def audio_carry_latents_for_video_frames(video_frames, fps=24):
+    """Return the greatest whole audio-latent carry fitting ``video_frames``."""
 
-    Returns ``(overlap_frames, note)``; ``note`` is None when nothing moved.
-    Callers log the note, because silently changing a profile also changes the
-    generated result and which run directories can be resumed.
-    """
-    if not enabled:
-        if not audio_boundary_is_exact(int(chunk_frames) - int(overlap_frames), fps=fps):
-            return int(overlap_frames), (
-                "audio carry is off-grid for C=%d O=%d (stride %d): the carry "
-                "rounds to the nearest audio latent, up to 8.3 ms out of step "
-                "with the video. Enable align_audio_chunks to correct it."
-                % (chunk_frames, overlap_frames, int(chunk_frames) - int(overlap_frames))
-            )
-        return int(overlap_frames), None
+    return int(video_frames) * int(AUDIO_LATENT_FPS) // int(fps)
 
-    aligned = aligned_overlap_frames(chunk_frames, overlap_frames, fps=fps)
-    if aligned == int(overlap_frames):
-        return aligned, None
-    return aligned, (
-        "align_audio_chunks: overlap %d -> %d (stride %d -> %d) so the audio "
-        "carry lands on a whole latent; this changes the generated result and "
-        "starts a different run directory"
-        % (
-            overlap_frames,
-            aligned,
-            int(chunk_frames) - int(overlap_frames),
-            int(chunk_frames) - aligned,
-        )
+
+def audio_carry_timing(video_frames, fps=24):
+    """Describe the duration represented by a conservative audio carry."""
+
+    video_frames = int(video_frames)
+    fps = int(fps)
+    audio_latents = audio_carry_latents_for_video_frames(video_frames, fps)
+    video_ms = video_frames * 1000.0 / fps
+    audio_ms = audio_latents * 1000.0 / AUDIO_LATENT_FPS
+    return {
+        "video_frames": video_frames,
+        "audio_latents": audio_latents,
+        "video_ms": video_ms,
+        "audio_ms": audio_ms,
+        "residual_ms": video_ms - audio_ms,
+    }
+
+
+def audio_overlap_slice(geometry, video_carry_frames=None):
+    """Tail audio slice sized to fit the carried video span."""
+
+    if video_carry_frames is None:
+        video_carry_frames = geometry.overlap_frames
+    count = audio_carry_latents_for_video_frames(
+        video_carry_frames, geometry.fps
     )
-
-
-def audio_overlap_slice(geometry):
-    """Tail audio slice for the same pixel-frame overlap used by video."""
-
-    start = audio_latent_boundary(
-        geometry.stride_frames,
-        fps=geometry.fps,
-        audio_latent_fps=AUDIO_LATENT_FPS,
-    )
-    count = geometry.audio_latent_t - start
+    start = geometry.audio_latent_t - count
     if start < 0 or count <= 0:
         raise ValueError(
-            "invalid audio overlap for C=%d O=%d: start=%d count=%d"
+            "invalid audio overlap for C=%d O=%d (video carry %d): "
+            "start=%d count=%d"
             % (
                 geometry.chunk_frames,
                 geometry.overlap_frames,
+                video_carry_frames,
                 start,
                 count,
             )
         )
     return start, count
+
+
+def log_audio_carry(
+    geometry,
+    carry,
+    video_carry_frames,
+    video_carry_latents,
+    audio_start,
+    audio_count,
+):
+    timing = audio_carry_timing(video_carry_frames, geometry.fps)
+    residual_note = (
+        "exact" if abs(timing["residual_ms"]) < 0.0005 else "audio shorter"
+    )
+    logging.info(
+        "%s %s: source audio [%d:%d], video seam %.3f ms; video carry "
+        "%d frames / %d latents / %.3f ms; audio carry %d latents / "
+        "%.3f ms; AV residual %.3f ms, %s",
+        LOG,
+        carry,
+        audio_start,
+        audio_start + audio_count,
+        geometry.stride_frames * 1000.0 / geometry.fps,
+        timing["video_frames"],
+        video_carry_latents,
+        timing["video_ms"],
+        timing["audio_latents"],
+        timing["audio_ms"],
+        timing["residual_ms"],
+        residual_note,
+    )
 
 
 def _sample_chunks_av(
@@ -124,8 +145,21 @@ def _sample_chunks_av(
     audio_overlap_start = audio_overlap_count = None
     if self.carry != CARRY_NONE:
         video_overlap_start, video_overlap_count = geometry.overlap_slice()
+        video_carry_frames = geometry.overlap_frames
+        if self.carry == CARRY_FRAME:
+            video_carry_frames = latent_frame_spans(
+                geometry.target_latent_t
+            )[video_overlap_start]
         audio_overlap_start, audio_overlap_count = audio_overlap_slice(
-            geometry
+            geometry, video_carry_frames
+        )
+        log_audio_carry(
+            geometry,
+            self.carry,
+            video_carry_frames,
+            1 if self.carry == CARRY_FRAME else video_overlap_count,
+            audio_overlap_start,
+            audio_overlap_count,
         )
 
     prefix = self._first_invalid("samples", chunk_count)
@@ -152,16 +186,8 @@ def _sample_chunks_av(
         ):
             if self.carry == CARRY_FRAME:
                 video_count = 1
-                shared_frames = latent_frame_spans(
-                    geometry.target_latent_t
-                )[video_overlap_start]
                 audio_start = audio_overlap_start
-                audio_stop = audio_latent_boundary(
-                    geometry.stride_frames + shared_frames,
-                    fps=geometry.fps,
-                    audio_latent_fps=AUDIO_LATENT_FPS,
-                )
-                audio_count = audio_stop - audio_start
+                audio_count = audio_overlap_count
             else:
                 video_count = video_overlap_count
                 audio_start = audio_overlap_start
@@ -505,7 +531,15 @@ def run(**kwargs):
         chunk_frames=kwargs["chunk_frames"],
         overlap_frames=kwargs["overlap_frames"],
     ).validate()
-    audio_start, audio_count = audio_overlap_slice(geometry)
+    video_overlap_start, video_overlap_count = geometry.overlap_slice()
+    video_carry_frames = geometry.overlap_frames
+    if kwargs.get("carry") == CARRY_FRAME:
+        video_carry_frames = latent_frame_spans(
+            geometry.target_latent_t
+        )[video_overlap_start]
+    audio_start, audio_count = audio_overlap_slice(
+        geometry, video_carry_frames
+    )
     token = _ACTIVE_AUDIO_VAE.set(audio_vae)
     try:
         summary = reference_runner.run(**kwargs)
@@ -526,6 +560,15 @@ def run(**kwargs):
                 audio_start,
                 audio_count,
             ),
+            "audio_carry": {
+                **audio_carry_timing(video_carry_frames, geometry.fps),
+                "video_latents": (
+                    1 if kwargs.get("carry") == CARRY_FRAME
+                    else video_overlap_count
+                ),
+                "audio_start": audio_start,
+            },
+            "audio_carry_policy": "video_floor_v1",
         }
     )
     return summary
@@ -536,7 +579,10 @@ install()
 
 __all__ = [
     "audio_latent_boundary",
+    "audio_carry_latents_for_video_frames",
+    "audio_carry_timing",
     "audio_overlap_slice",
+    "log_audio_carry",
     "install",
     "run",
 ]

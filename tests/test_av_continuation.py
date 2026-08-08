@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import sys
 import unittest
 
+import comfy.options
+comfy.options.enable_args_parsing()
+_ARGV, sys.argv = list(sys.argv), [sys.argv[0], "--cpu"]
+
 import torch
+from comfy.ldm.minimax.model import PackedLayout, _video_t_spans
 
 from chunked_ref2v.longform.av_continuation_nodes import (
     MiniMaxH3LongFormAVContinuation,
@@ -13,7 +19,7 @@ from chunked_ref2v.longform.av_continuation_nodes import (
     _resolve_execution_plan,
     _run_identity,
     _slice_dynamic_av_reference,
-    _resolve_reference_frames,
+    _resolve_video_reference_frames,
     continuation_prompt,
 )
 from chunked_ref2v.longform.nplusone_chunk_prompt_timeline import (
@@ -21,7 +27,6 @@ from chunked_ref2v.longform.nplusone_chunk_prompt_timeline import (
     prompts_for_av_continuation_plan,
 )
 from chunked_ref2v.geometry import HarnessGeometry
-from chunked_ref2v.longform.audio_runtime import audio_overlap_slice
 
 
 class LongFormAVContinuationTests(unittest.TestCase):
@@ -36,6 +41,7 @@ class LongFormAVContinuationTests(unittest.TestCase):
         self.assertIn("<Video 3>", text)
         self.assertIn("<Audio 5>", text)
         self.assertIn("begins immediately after its end", text)
+        self.assertIn("longer history than the video tail", text)
         self.assertTrue(text.endswith("continue dancing"))
 
     def test_dynamic_reference_reuses_generated_latents_directly(self):
@@ -54,96 +60,61 @@ class LongFormAVContinuationTests(unittest.TestCase):
         self.assertEqual(block["latent_h"], 4)
         self.assertEqual(block["latent_w"], 6)
         self.assertEqual(block["ref_audio_t"], 235)
+        self.assertEqual(block["temporal_alignment"], "end")
 
-    def test_dynamic_reference_tail_is_sliced_to_reference_frames(self):
-        geometry = HarnessGeometry(chunk_frames=141, overlap_frames=81).validate()
-        _, overlap_count = geometry.overlap_slice()
-        pixels = torch.arange(141 * 64 * 96 * 3, dtype=torch.float32).reshape(
-            141, 64, 96, 3,
-        )
-        video = torch.arange(
-            1 * 24 * 42 * 4 * 6,
-            dtype=torch.float32,
-        ).reshape(1, 24, 42, 4, 6)
-        audio = torch.arange(1 * 32 * 2 * 235, dtype=torch.float32).reshape(
-            1, 32, 2, 235
-        )
-
+    def test_dynamic_reference_tails_have_independent_lengths(self):
+        geometry = HarnessGeometry(chunk_frames=141, overlap_frames=4).validate()
+        pixels = torch.arange(141 * 2 * 2 * 3, dtype=torch.float32).reshape(141, 2, 2, 3)
+        video = torch.arange(1 * 24 * 42 * 2 * 2, dtype=torch.float32).reshape(1, 24, 42, 2, 2)
+        audio = torch.arange(1 * 32 * 2 * 235, dtype=torch.float32).reshape(1, 32, 2, 235)
         sliced_pixels, sliced_video, sliced_audio = _slice_dynamic_av_reference(
             pixels,
             video,
             audio,
-            reference_frames=81,
+            video_reference_frames=22,
+            audio_reference_latents=160,
             geometry=geometry,
         )
-        self.assertEqual(sliced_pixels.shape, (81, 64, 96, 3))
-        self.assertTrue(torch.equal(sliced_pixels, pixels[-81:]))
-        self.assertEqual(sliced_video.shape, (1, 24, overlap_count, 4, 6))
-        self.assertEqual(sliced_audio.shape, (1, 32, 2, 135))
-        self.assertEqual(int(sliced_video.shape[2]), int(overlap_count))
+        self.assertEqual(sliced_pixels.shape[0], 22)
+        self.assertEqual(sliced_video.shape[2], 7)
+        self.assertEqual(sliced_audio.shape[-1], 160)
+        self.assertTrue(torch.equal(sliced_pixels, pixels[-22:]))
+        self.assertTrue(torch.equal(sliced_audio, audio[..., -160:]))
 
-    def test_dynamic_reference_tail_can_use_whole_chunk(self):
-        geometry = HarnessGeometry(chunk_frames=141, overlap_frames=81).validate()
-        pixels = torch.arange(141 * 64 * 96 * 3, dtype=torch.float32).reshape(
-            141, 64, 96, 3,
+    def test_packed_layout_static_start_and_dynamic_end_alignment(self):
+        base = {
+            "kind": "video_audio",
+            "latent_t": 2,
+            "latent_h": 4,
+            "latent_w": 6,
+            "ref_audio_t": 160,
+        }
+        start = PackedLayout(3, 42, 4, 6, 235, refs=[base])
+        end = PackedLayout(3, 42, 4, 6, 235, refs=[dict(base, temporal_alignment="end")])
+        start_audio, start_audio_stop, _ = next(s for s in start.segments if s[2] == "ref_audio")
+        start_video, start_video_stop, _ = next(s for s in start.segments if s[2] == "ref_img")
+        end_audio, end_audio_stop, _ = next(s for s in end.segments if s[2] == "ref_audio")
+        end_video, end_video_stop, _ = next(s for s in end.segments if s[2] == "ref_img")
+        self.assertEqual(
+            float(start.position_ids[start_audio, 0]),
+            float(start.position_ids[start_video, 0]),
         )
-        video = torch.arange(
-            1 * 24 * 42 * 4 * 6,
-            dtype=torch.float32,
-        ).reshape(1, 24, 42, 4, 6)
-        audio = torch.arange(1 * 32 * 2 * 235, dtype=torch.float32).reshape(
-            1, 32, 2, 235
-        )
-
-        sliced_pixels, sliced_video, sliced_audio = _slice_dynamic_av_reference(
-            pixels,
-            video,
-            audio,
-            reference_frames=141,
-            geometry=geometry,
-        )
-        self.assertEqual(sliced_pixels.shape, pixels.shape)
-        self.assertTrue(torch.equal(sliced_pixels, pixels))
-        self.assertIs(sliced_video, video)
-        self.assertIs(sliced_audio, audio)
+        audio_end = float(end.position_ids[end_audio_stop - 1, 0]) + 1.0
+        video_end = float(end.position_ids[end_video_stop - 1, 0]) + _video_t_spans(2)[-1]
+        self.assertAlmostEqual(audio_end, video_end)
 
     def test_reference_frames_are_snapped_to_legal_values(self):
-        self.assertEqual(_resolve_reference_frames(141, 80), 90)
+        self.assertEqual(_resolve_video_reference_frames(141, 80), 73)
 
     def test_reference_frames_respect_reference_input_range(self):
-        self.assertEqual(_resolve_reference_frames(141, 40), 90)
+        self.assertEqual(_resolve_video_reference_frames(141, 40), 39)
 
     def test_reference_frames_can_snap_to_whole_chunk(self):
-        self.assertEqual(_resolve_reference_frames(141, 141), 141)
+        self.assertEqual(_resolve_video_reference_frames(141, 141), 141)
 
     def test_reference_frames_reject_illegal_chunk(self):
         with self.assertRaises(ValueError):
-            _resolve_reference_frames(124, 60)
-
-    def test_reference_tail_slice_preserves_shared_intervals(self):
-        geometry = HarnessGeometry(chunk_frames=141, overlap_frames=60).validate()
-        pixels = torch.arange(141 * 64 * 96 * 3, dtype=torch.float32).reshape(
-            141, 64, 96, 3,
-        )
-        video = torch.arange(
-            24 * 42 * 4 * 6,
-            dtype=torch.float32,
-        ).reshape(1, 24, 42, 4, 6)
-        audio = torch.arange(1 * 32 * 2 * 235, dtype=torch.float32).reshape(
-            1, 32, 2, 235
-        )
-
-        sliced_pixels, sliced_video, sliced_audio = _slice_dynamic_av_reference(
-            pixels,
-            video,
-            audio,
-            reference_frames=60,
-            geometry=geometry,
-        )
-        self.assertEqual(sliced_pixels.shape, (60, 64, 96, 3))
-        _, audio_overlap_count = audio_overlap_slice(geometry)
-        self.assertEqual(int(audio_overlap_count), 100)
-        self.assertEqual(sliced_audio.shape[-1], 100)
+            _resolve_video_reference_frames(120, 60)
 
     def test_reference_frames_cannot_exceed_previous_chunk(self):
         geometry = HarnessGeometry(chunk_frames=141, overlap_frames=81).validate()
@@ -155,7 +126,8 @@ class LongFormAVContinuationTests(unittest.TestCase):
                 pixels,
                 video,
                 audio,
-                reference_frames=200,
+                video_reference_frames=200,
+                audio_reference_latents=160,
                 geometry=geometry,
             )
 
@@ -207,17 +179,17 @@ class LongFormAVContinuationTests(unittest.TestCase):
             "fallback",
             output_seconds=1,
             chunk_frames=90,
-            reference_frames=39,
+            video_reference_frames=39,
             seed=999,
         )
         self.assertEqual(effective["output_seconds"], 12)
         self.assertEqual(effective["chunk_frames"], 141)
-        self.assertEqual(effective["reference_frames"], 90)
+        self.assertEqual(effective["video_reference_frames"], 90)
         self.assertEqual(effective["seed"], 123)
         self.assertEqual(source, "N+1 prompt plan")
         self.assertEqual(
             overrides,
-            ["output_seconds", "chunk_frames", "reference_frames", "seed"],
+            ["output_seconds", "chunk_frames", "video_reference_frames", "seed"],
         )
         self.assertEqual(prompts, ["fallback", "fallback", "fallback"])
 
@@ -231,13 +203,34 @@ class LongFormAVContinuationTests(unittest.TestCase):
             "fallback",
             output_seconds=1,
             chunk_frames=141,
-            reference_frames=90,
+            video_reference_frames=90,
             seed=0,
         )
         self.assertEqual(prompts, ["fallback"])
         self.assertNotEqual(effective["chunk_digests"], plan["chunk_digests"])
 
     def test_run_manifest_allows_prompt_and_seed_edits(self):
+        class SamplingA:
+            def __init__(self, shift=12.0, audio_shift=3.0):
+                self.shift = shift
+                self.audio_shift = audio_shift
+
+        class SamplingB(SamplingA):
+            pass
+
+        class Model:
+            def __init__(self, sampling):
+                self.sampling = sampling
+                self.model_options = {"transformer_options": {
+                    "minimax_h3_sigma_shift_video": sampling.shift,
+                    "minimax_h3_sigma_shift_audio": sampling.audio_shift,
+                }}
+
+            def get_model_object(self, name):
+                if name != "model_sampling":
+                    raise KeyError(name)
+                return self.sampling
+
         before = build_nplusone_chunk_prompt_plan(
             output_seconds=12,
             chunk_frames=141,
@@ -253,7 +246,7 @@ class LongFormAVContinuationTests(unittest.TestCase):
         component = object()
         kwargs = dict(
             canvas=(96, 64),
-            model=component,
+            model=Model(SamplingA()),
             clip=component,
             video_vae=component,
             audio_vae=component,
@@ -268,11 +261,13 @@ class LongFormAVContinuationTests(unittest.TestCase):
             attention="auto",
             activation="mlp_chunked_native",
         )
-        self.assertEqual(
-            _run_identity(before, **kwargs),
-            _run_identity(after, **kwargs),
-        )
+        baseline = _run_identity(before, **kwargs)
+        self.assertEqual(baseline, _run_identity(after, **kwargs))
+        for sampling in (SamplingA(10.0, 3.0), SamplingA(12.0, 2.0), SamplingB()):
+            changed = dict(kwargs, model=Model(sampling))
+            self.assertNotEqual(baseline, _run_identity(before, **changed))
 
 
 if __name__ == "__main__":
+    sys.argv = _ARGV
     unittest.main()

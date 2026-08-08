@@ -529,14 +529,21 @@ class MiniMaxH3SigmaShift(io.ComfyNode):
     @classmethod
     def execute(cls, model, shift_video, shift_audio, attention_backend="sage",
                 vram_guard_mb=800) -> io.NodeOutput:
+        model_sampling_av = getattr(comfy.model_sampling, "ModelSamplingAV", None)
+        if model_sampling_av is None:
+            raise RuntimeError(
+                "MiniMax H3 Sigma Shift (Zi) requires ComfyUI v0.31.0+; "
+                "update ComfyUI and try again."
+            )
+
         m = model.clone()
 
-        class ModelSamplingAdvanced(comfy.model_sampling.ModelSamplingDiscreteFlow, comfy.model_sampling.CONST):
+        class ModelSamplingAdvanced(model_sampling_av, comfy.model_sampling.CONST):
             pass
 
         original = m.get_model_object("model_sampling")
         model_sampling = ModelSamplingAdvanced(model.model.model_config)
-        model_sampling.set_parameters(shift=shift_video)
+        model_sampling.set_parameters(shift=shift_video, audio_shift=shift_audio)
         if hasattr(original, "noise_scale"):
             model_sampling.set_noise_scale(original.noise_scale)
         m.add_object_patch("model_sampling", model_sampling)

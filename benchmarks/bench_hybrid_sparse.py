@@ -81,6 +81,27 @@ class TileGeometry:
 class PreparedCall:
     execute: Any
     details: dict
+    timing: Any = None
+
+
+SPARSE_TIMING_STAGES = (
+    "direct_lut_construction",
+    "v_fp8_preparation",
+    "q_k_int8_quantization",
+    "sparse_sage_low_level_kernel",
+    "total_hybrid_attention",
+)
+
+
+def _aggregate_timing_fields(summaries):
+    """Return median production-stage timings from deferred timing summaries."""
+    return {
+        "%s_ms" % stage: statistics.median([
+            float(summary["stages"][stage]["mean_ms"])
+            for summary in summaries
+        ])
+        for stage in SPARSE_TIMING_STAGES
+    }
 
 
 def tile_geometry(layout, q_tile=Q_TILE, kv_tile=KV_TILE):
@@ -204,6 +225,20 @@ def build_controlled_mask(layout, budget, *, pattern="uniform", q_tile=Q_TILE,
     return mask.contiguous(), metadata
 
 
+def block_mask_to_lut(mask):
+    """Convert a synthetic benchmark mask to Sparge's delta LUT carrier."""
+    import torch
+
+    kv_tiles = mask.shape[-1]
+    indices = torch.arange(kv_tiles, dtype=torch.int32, device=mask.device)
+    selected = torch.where(mask, indices, kv_tiles).sort(dim=-1).values
+    previous = torch.cat(
+        (torch.zeros_like(selected[..., :1]), selected[..., :-1]), dim=-1
+    )
+    valid = mask.sum(dim=-1, dtype=torch.int32)
+    return (selected - previous).contiguous(), valid.contiguous()
+
+
 def compact_kv_blocks(mask):
     """Convert a dense tile mask to Flex's compact KV block rows."""
     import torch
@@ -227,6 +262,15 @@ def make_flex_block_mask(mask, q_length, kv_length, q_tile, kv_tile=KV_TILE):
         BLOCK_SIZE=(int(q_tile), int(kv_tile)),
         seq_lengths=(int(q_length), int(kv_length)),
     )
+
+
+def compile_flex_attention(torch, flex_attention):
+    """Compile Flex once so it lowers to its fused block-sparse kernel."""
+    return torch.compile(flex_attention, fullgraph=True)
+
+
+def flex_kernel_options(q_tile, kv_tile=KV_TILE):
+    return {"BLOCK_M": int(q_tile), "BLOCK_N": int(kv_tile)}
 
 
 def _rank(seed, kind, index):
@@ -424,7 +468,7 @@ def _fused_qkv(torch, sequence, device, seed):
 
 
 def _prepare_call(context, mode, budget, hard_q_fraction, hard_head_fraction,
-                  flex_q_tile, pattern, seed):
+                  flex_q_tile, pattern, seed, timing=None):
     torch = context["torch"]
     layout = context["layout"]
     device = context["device"]
@@ -444,13 +488,41 @@ def _prepare_call(context, mode, budget, hard_q_fraction, hard_head_fraction,
         return PreparedCall(lambda: context["sol"].execute(prepared), {})
 
     if mode == "sparse_sage_128x64":
-        mask, details = build_controlled_mask(
-            layout, budget, pattern=pattern, heads=HEADS, seed=seed, device=device
-        )
-        prepared = context["sparse"].prepare(
-            q, k, v, mask, layer_index=10, metadata=details
-        )
-        return PreparedCall(lambda: context["sparse"].execute(prepared), details)
+        total_timing = timing.begin("total_hybrid_attention") if timing is not None else None
+        router_timing = timing.begin("direct_lut_construction") if timing is not None else None
+        try:
+            lut, valid, metadata = context["router"].build_lut(
+                q, k, layout, budget
+            )
+        except Exception:
+            if timing is not None:
+                timing.end(total_timing)
+            raise
+        finally:
+            if timing is not None:
+                timing.end(router_timing)
+        details = metadata.as_dict() if hasattr(metadata, "as_dict") else dict(metadata)
+        try:
+            prepare_kwargs = {
+                "layer_index": 10,
+                "metadata": details,
+            }
+            if timing is not None:
+                prepare_kwargs["timing"] = timing
+            prepared = context["sparse"].prepare(q, k, v, lut, valid, **prepare_kwargs)
+        except Exception:
+            if timing is not None:
+                timing.end(total_timing)
+            raise
+
+        def execute_sparse():
+            try:
+                return context["sparse"].execute(prepared)
+            finally:
+                if timing is not None:
+                    timing.end(total_timing)
+
+        return PreparedCall(execute_sparse, details, timing)
 
     if mode.startswith("flex_"):
         q_tile = int(mode.split("_")[1].split("x")[0])
@@ -463,7 +535,8 @@ def _prepare_call(context, mode, budget, hard_q_fraction, hard_head_fraction,
         )
         return PreparedCall(
             lambda: context["flex"](
-                q, k, v, block_mask=block_mask, scale=HEAD_DIM ** -0.5
+                q, k, v, block_mask=block_mask, scale=HEAD_DIM ** -0.5,
+                kernel_options=flex_kernel_options(q_tile),
             ),
             details,
         )
@@ -473,8 +546,9 @@ def _prepare_call(context, mode, budget, hard_q_fraction, hard_head_fraction,
         hard_head_fraction=hard_head_fraction, pattern=pattern,
         flex_q_tile=flex_q_tile, heads=HEADS, seed=seed, device=device,
     )
+    sparse_lut, sparse_valid = block_mask_to_lut(plan["placeholder_mask"])
     sparse_prepared = context["sparse"].prepare(
-        q, k, v, plan["placeholder_mask"], layer_index=10,
+        q, k, v, sparse_lut, sparse_valid, layer_index=10,
         metadata=plan["sparse_metadata"],
     )
     details = dict(plan["sparse_metadata"])
@@ -505,6 +579,7 @@ def _prepare_call(context, mode, budget, hard_q_fraction, hard_head_fraction,
             flex_q, flex_k, flex_v,
             block_mask=block_mask,
             scale=HEAD_DIM ** -0.5,
+            kernel_options=flex_kernel_options(flex_q_tile),
         )
         output[0, head_index[:, None], token_index[None, :], :] = fallback[0]
         return output
@@ -519,13 +594,20 @@ def _measure_case(context, mode, budget, hard_q_fraction, hard_head_fraction,
     times = []
     peaks = []
     details = {}
+    timing_summaries = []
     for index in range(args.warmups + args.repeats):
         torch.cuda.empty_cache()
+        timing = None
+        if mode == "sparse_sage_128x64":
+            timing = context["DeferredCudaTiming"](enabled=True)
+            timing.begin_request(index, cuda=True)
+        prepare_args = (
+            context, mode, budget, hard_q_fraction, hard_head_fraction,
+            flex_q_tile, args.pattern, args.seed + index,
+        )
+        prepare_kwargs = {} if timing is None else {"timing": timing}
         if args.timing == "kernel":
-            call = _prepare_call(
-                context, mode, budget, hard_q_fraction, hard_head_fraction,
-                flex_q_tile, args.pattern, args.seed + index,
-            )
+            call = _prepare_call(*prepare_args, **prepare_kwargs)
             torch.cuda.synchronize(device)
             torch.cuda.reset_peak_memory_stats(device)
             base = torch.cuda.memory_allocated(device)
@@ -535,10 +617,7 @@ def _measure_case(context, mode, budget, hard_q_fraction, hard_head_fraction,
             torch.cuda.reset_peak_memory_stats(device)
             base = torch.cuda.memory_allocated(device)
             started = time.perf_counter()
-            call = _prepare_call(
-                context, mode, budget, hard_q_fraction, hard_head_fraction,
-                flex_q_tile, args.pattern, args.seed + index,
-            )
+            call = _prepare_call(*prepare_args, **prepare_kwargs)
         output = call.execute()
         torch.cuda.synchronize(device)
         elapsed = (time.perf_counter() - started) * 1000.0
@@ -548,7 +627,9 @@ def _measure_case(context, mode, budget, hard_q_fraction, hard_head_fraction,
         if index >= args.warmups:
             times.append(elapsed)
             peaks.append(peak)
-    return {
+            if timing is not None:
+                timing_summaries.append(timing.resolve())
+    result = {
         "mode": mode,
         "budget": float(budget),
         "hard_q_fraction": float(hard_q_fraction),
@@ -558,6 +639,9 @@ def _measure_case(context, mode, budget, hard_q_fraction, hard_head_fraction,
         "peak_allocated_gib": statistics.median(peaks),
         **details,
     }
+    if timing_summaries:
+        result.update(_aggregate_timing_fields(timing_summaries))
+    return result
 
 
 def _mean_pool(x, block):
@@ -719,9 +803,14 @@ def _build_context(args, modes):
             preflight_sparse_sage,
         )
         context["sparse"] = SparseSageExecutor(preflight_sparse_sage())
+    if "sparse_sage_128x64" in modes:
+        from h3_attention.hybrid.router import SparseTileRouter
+        from h3_attention.hybrid.stats import DeferredCudaTiming
+        context["router"] = SparseTileRouter()
+        context["DeferredCudaTiming"] = DeferredCudaTiming
     if any(mode.startswith("flex_") or mode == "hybrid_sage_flex" for mode in modes):
         from torch.nn.attention.flex_attention import flex_attention
-        context["flex"] = flex_attention
+        context["flex"] = compile_flex_attention(torch, flex_attention)
     context["environment"] = environment
     return context
 
@@ -814,6 +903,15 @@ def _print_results(metadata, rows, break_even):
             100 * row["hard_head_fraction"], row["latency_ms"],
             row["peak_allocated_gib"], "-" if speedup is None else "%.2fx" % speedup,
         ))
+    sparse_rows = [row for row in rows if row.get("mode") == "sparse_sage_128x64"]
+    if sparse_rows:
+        print("\nSparse Sage stage medians (ms):")
+        for row in sparse_rows:
+            values = ", ".join(
+                "%s=%.3f" % (stage, row["%s_ms" % stage])
+                for stage in SPARSE_TIMING_STAGES
+            )
+            print("  budget %.1f%%: %s" % (100 * row["budget"], values))
     if break_even:
         print("\nMeasured break-even frontier (greatest faster sampled hard-Q fraction):")
         for key, value in break_even.items():

@@ -1,4 +1,4 @@
-"""Sparse-Sage executor used by the H3 hybrid backend."""
+"""Prepared Sparse Sage executor for the installed SM89 low-level ABI."""
 
 from dataclasses import dataclass
 import importlib
@@ -16,58 +16,64 @@ class SparseSageError(RuntimeError):
 @dataclass(frozen=True)
 class SparseSageAPI:
     version: str
-    block_sparse: object
+    low_level_f16: object
+    low_level_f32: object
+    v_fused: object = None
 
 
 @dataclass
 class PreparedSparseSage:
-    q: torch.Tensor
-    k: torch.Tensor
-    v: torch.Tensor
-    mask_id: torch.Tensor
+    q_int8: torch.Tensor
+    k_int8: torch.Tensor
+    v_fp8: torch.Tensor
+    q_scale: torch.Tensor
+    k_scale: torch.Tensor
+    v_scale: torch.Tensor
+    lut: torch.Tensor
+    valid_block_num: torch.Tensor
     output_dtype: torch.dtype
+    output_shape: tuple
     layer_index: int
     sequence: int
     heads: int
     metadata: dict
+    pv_threshold: torch.Tensor
+    timing: object = None
 
 
 def load_sparse_sage_api():
-    """Import the public API and both compiled extensions it depends on."""
+    """Import Sparge's fused and SM89 low-level extensions, never its wrapper."""
     try:
-        module = importlib.import_module("spas_sage_attn")
+        importlib.import_module("spas_sage_attn")
         importlib.import_module("spas_sage_attn._fused")
-        block_sparse = getattr(module, "block_sparse_sage2_attn_cuda")
+        sm89 = importlib.import_module("spas_sage_attn.sm89_compile")
         version = importlib.metadata.version("spas-sage-attn")
+        ops = sm89._qattn_sm89
+        low_f32 = getattr(
+            ops,
+            "qk_int8_sv_f8_accum_f32_block_sparse_attn_inst_buf_fuse_v_scale_with_pv_threshold",
+        )
+        low_f16 = getattr(
+            ops,
+            "qk_int8_sv_f8_accum_f16_block_sparse_attn_inst_buf_fuse_v_scale_with_pv_threshold",
+        )
+        fused = torch.ops.spas_sage_attn_fused
     except Exception as exc:
         raise SparseSageError(
-            "Hybrid Sparse Attention requires SpargeAttention with its compiled "
+            "Hybrid Sparse Attention requires SpargeAttention's compiled SM89 "
             "_qattn and _fused extensions"
         ) from exc
-    qattn_error = None
-    for extension in ("spas_sage_attn._qattn_sm89", "spas_sage_attn._qattn"):
-        try:
-            importlib.import_module(extension)
-            break
-        except Exception as exc:
-            qattn_error = exc
-    else:
-        raise SparseSageError(
-            "Hybrid Sparse Attention requires SpargeAttention's SM89 _qattn extension"
-        ) from qattn_error
-    if not callable(block_sparse):
-        raise SparseSageError(
-            "SpargeAttention does not expose callable block_sparse_sage2_attn_cuda"
-        )
-    return SparseSageAPI(version=version, block_sparse=block_sparse)
+    return SparseSageAPI(version, low_f16, low_f32, fused)
 
 
 def preflight_sparse_sage(api_loader=load_sparse_sage_api, cuda_available=None,
                           capability_getter=None):
     """Fail before model mutation unless the installed extension targets Ada."""
     api = api_loader()
-    cuda_available = cuda_available or torch.cuda.is_available
-    capability_getter = capability_getter or torch.cuda.get_device_capability
+    if cuda_available is None:
+        cuda_available = torch.cuda.is_available
+    if capability_getter is None:
+        capability_getter = torch.cuda.get_device_capability
     if not cuda_available():
         raise SparseSageError("Hybrid Sparse Attention requires CUDA")
     capability = tuple(capability_getter())
@@ -79,14 +85,81 @@ def preflight_sparse_sage(api_loader=load_sparse_sage_api, cuda_available=None,
     return api
 
 
+def _quantize_blocks(x, block, *, subtract_mean=False):
+    """Quantize HND directly from its strided view, one block at a time."""
+    if x.ndim != 4 or x.stride(-1) != 1:
+        raise SparseSageError("Q/K quantization requires HND views with contiguous head dimension")
+    b, h, sequence, dim = x.shape
+    blocks = (sequence + block - 1) // block
+    output = torch.empty((b, h, sequence, dim), dtype=torch.int8, device=x.device)
+    scales = torch.empty((b, h, blocks), dtype=torch.float32, device=x.device)
+    mean = x.mean(dim=-2, keepdim=True).float() if subtract_mean else None
+    for index in range(blocks):
+        start = index * block
+        stop = min(start + block, sequence)
+        value = x[..., start:stop, :].float()
+        if mean is not None:
+            value = value - mean
+        scale = value.abs().amax(dim=(-2, -1)) / 127.0 + 1e-7
+        quantized = value / scale[..., None, None]
+        quantized = quantized + torch.where(quantized >= 0, 0.5, -0.5)
+        output[..., start:stop, :].copy_(quantized.to(torch.int8))
+        scales[..., index].copy_(scale)
+    return output, scales
+
+
+def quantize_qk(q, k):
+    if q.is_cuda:
+        try:
+            from .sparse_quant import quantize_qk as quantize_qk_triton
+        except Exception as exc:
+            raise SparseSageError(
+                "Sparse Sage Q/K quantization requires Triton on CUDA"
+            ) from exc
+        return quantize_qk_triton(q, k, Q_TILE, KV_TILE)
+    q_int8, q_scale = _quantize_blocks(q, Q_TILE)
+    k_int8, k_scale = _quantize_blocks(k, KV_TILE, subtract_mean=True)
+    return q_int8, q_scale, k_int8, k_scale
+
+
+def prepare_v_fp8(v, fused=None):
+    """Transpose/pad and quantize HND V through Sparge's installed fused ops."""
+    if v.ndim != 4 or v.stride(-1) != 1:
+        raise SparseSageError("V preparation requires an HND view with contiguous head dimension")
+    if not v.is_cuda:
+        raise SparseSageError("SM89 V FP8 preparation requires CUDA")
+    if fused is None:
+        fused = torch.ops.spas_sage_attn_fused
+    b, h, sequence, dim = v.shape
+    padded = (sequence + 127) // 128 * 128
+    transposed = torch.empty((b, h, dim, padded), dtype=v.dtype, device=v.device)
+    fused.transpose_pad_permute_cuda(v, transposed, 1)
+    try:
+        v_fp8 = torch.empty_like(transposed, dtype=torch.float8_e4m3fn)
+        v_scale = torch.empty((b, h, dim), dtype=torch.float32, device=v.device)
+        fused.scale_fuse_quant_cuda(transposed, v_fp8, v_scale, sequence, 2.25, 1)
+    finally:
+        del transposed
+    return v_fp8, v_scale
+
+
+def _cuda_version():
+    parts = (torch.version.cuda or "0.0").split(".")
+    return int(parts[0]), int(parts[1])
+
+
 class SparseSageExecutor:
-    def __init__(self, api, *, allow_cpu_for_tests=False):
+    def __init__(self, api, *, allow_cpu_for_tests=False, qk_quantizer=None,
+                 v_preparer=None, low_level_selector=None):
         if api is None:
             raise TypeError("SparseSageExecutor requires a preflighted API")
         self.api = api
         self.allow_cpu_for_tests = bool(allow_cpu_for_tests)
+        self.qk_quantizer = qk_quantizer or quantize_qk
+        self.v_preparer = v_preparer or prepare_v_fp8
+        self.low_level_selector = low_level_selector or self._select_low_level
 
-    def _validate(self, q, k, v, mask_id):
+    def _validate(self, q, k, v, lut, valid):
         if q.shape != k.shape or q.shape != v.shape:
             raise SparseSageError(
                 "Sparse Sage requires equal self-attention Q/K/V shapes; got %s %s %s"
@@ -105,23 +178,18 @@ class SparseSageExecutor:
             raise SparseSageError("Sparse Sage Q/K/V dtypes differ")
         if q.device != k.device or q.device != v.device:
             raise SparseSageError("Sparse Sage Q/K/V devices differ")
-        if q.stride(-1) != 1 or k.stride(-1) != 1 or v.stride(-1) != 1:
+        if any(t.stride(-1) != 1 for t in (q, k, v)):
             raise SparseSageError("Sparse Sage Q/K/V last dimension must be contiguous")
-        expected_mask = (
-            batch,
-            heads,
-            (sequence + Q_TILE - 1) // Q_TILE,
-            (sequence + KV_TILE - 1) // KV_TILE,
-        )
-        if tuple(mask_id.shape) != expected_mask:
-            raise SparseSageError(
-                "Sparse Sage mask shape is %s; expected %s"
-                % (tuple(mask_id.shape), expected_mask)
-            )
-        if mask_id.dtype != torch.bool or not mask_id.is_contiguous():
-            raise SparseSageError("Sparse Sage mask must be contiguous bool")
-        if mask_id.device != q.device:
-            raise SparseSageError("Sparse Sage mask and Q/K/V devices differ")
+        expected_lut = (batch, heads, (sequence + Q_TILE - 1) // Q_TILE,
+                        (sequence + KV_TILE - 1) // KV_TILE)
+        if tuple(lut.shape) != expected_lut or tuple(valid.shape) != expected_lut[:-1]:
+            raise SparseSageError("Sparse Sage LUT/valid shapes do not match H3 geometry")
+        if lut.dtype != torch.int32 or valid.dtype != torch.int32:
+            raise SparseSageError("Sparse Sage LUT and valid counts must be int32")
+        if not lut.is_contiguous() or not valid.is_contiguous():
+            raise SparseSageError("Sparse Sage LUT and valid counts must be contiguous")
+        if lut.device != q.device or valid.device != q.device:
+            raise SparseSageError("Sparse Sage LUT and Q/K/V devices differ")
         if not self.allow_cpu_for_tests:
             if not q.is_cuda:
                 raise SparseSageError("Sparse Sage requires CUDA")
@@ -133,56 +201,93 @@ class SparseSageExecutor:
                 )
         return heads, sequence
 
-    def prepare(self, q, k, v, mask_id, *, layer_index, metadata):
-        heads, sequence = self._validate(q, k, v, mask_id)
-        if not self.allow_cpu_for_tests:
-            torch.cuda.set_device(q.device)
-        q_prepared = q.contiguous()
-        k_prepared = k.contiguous()
-        v_prepared = torch.empty(v.shape, dtype=torch.float16, device=v.device)
-        v_prepared.copy_(v)
+    def _select_low_level(self, _q):
+        name = "low_level_f16" if _cuda_version() >= (12, 8) else "low_level_f32"
+        kernel = getattr(self.api, name, None)
+        if kernel is None:
+            raise SparseSageError("SpargeAttention SM89 low-level kernel is unavailable")
+        return kernel
+
+    def prepare(self, q, k, v, lut, valid_block_num, *, layer_index, metadata,
+                timing=None):
+        heads, sequence = self._validate(q, k, v, lut, valid_block_num)
+        # Keep V's temporary transposed buffer out of the Q/K quantization peak.
+        v_timing = timing.begin("v_fp8_preparation") if timing is not None else None
+        try:
+            v_fp8, v_scale = self.v_preparer(v, self.api.v_fused)
+            expected_v_shape = (v.shape[0], v.shape[1], v.shape[3],
+                                (sequence + 127) // 128 * 128)
+            if (tuple(v_fp8.shape) != expected_v_shape
+                    or v_fp8.dtype != torch.float8_e4m3fn
+                    or v_fp8.device != v.device
+                    or not v_fp8.is_contiguous()
+                    or tuple(v_scale.shape) != (v.shape[0], v.shape[1], v.shape[3])
+                    or v_scale.dtype != torch.float32
+                    or v_scale.device != v.device
+                    or not v_scale.is_contiguous()):
+                raise SparseSageError("V preparer returned an invalid FP8 carrier")
+        finally:
+            if timing is not None:
+                timing.end(v_timing)
+        qk_timing = timing.begin("q_k_int8_quantization") if timing is not None else None
+        try:
+            q_int8, q_scale, k_int8, k_scale = self.qk_quantizer(q, k)
+            q_blocks = (sequence + Q_TILE - 1) // Q_TILE
+            k_blocks = (sequence + KV_TILE - 1) // KV_TILE
+            if (tuple(q_int8.shape) != tuple(q.shape)
+                    or tuple(k_int8.shape) != tuple(k.shape)
+                    or q_int8.dtype != torch.int8 or k_int8.dtype != torch.int8
+                    or q_int8.device != q.device or k_int8.device != q.device
+                    or q_int8.stride(-1) != 1 or k_int8.stride(-1) != 1
+                    or tuple(q_scale.shape) != (q.shape[0], heads, q_blocks)
+                    or tuple(k_scale.shape) != (q.shape[0], heads, k_blocks)
+                    or q_scale.dtype != torch.float32 or k_scale.dtype != torch.float32
+                    or q_scale.device != q.device or k_scale.device != q.device
+                    or not q_scale.is_contiguous() or not k_scale.is_contiguous()):
+                raise SparseSageError("Q/K quantizer returned an invalid INT8 carrier")
+        finally:
+            if timing is not None:
+                timing.end(qk_timing)
+        pv_threshold = torch.full((heads,), 50.0, dtype=torch.float32, device=q.device)
         return PreparedSparseSage(
-            q=q_prepared,
-            k=k_prepared,
-            v=v_prepared,
-            mask_id=mask_id,
+            q_int8=q_int8,
+            k_int8=k_int8,
+            v_fp8=v_fp8,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            lut=lut,
+            valid_block_num=valid_block_num,
             output_dtype=q.dtype,
+            output_shape=tuple(q.shape),
             layer_index=int(layer_index),
             sequence=int(sequence),
             heads=int(heads),
             metadata=dict(metadata),
+            pv_threshold=pv_threshold,
+            timing=timing,
         )
 
     def execute(self, prepared):
+        output = torch.empty(prepared.output_shape, dtype=prepared.output_dtype,
+                             device=prepared.q_int8.device)
+        kernel_timing = prepared.timing.begin("sparse_sage_low_level_kernel") if prepared.timing is not None else None
         try:
-            output = self.api.block_sparse(
-                prepared.q,
-                prepared.k,
-                prepared.v,
-                mask_id=prepared.mask_id,
-                scale=128 ** -0.5,
-                tensor_layout="HND",
+            kernel = self.low_level_selector(prepared.q_int8)
+            kernel(
+                prepared.q_int8, prepared.k_int8, prepared.v_fp8, output,
+                prepared.lut, prepared.valid_block_num, prepared.pv_threshold,
+                prepared.q_scale, prepared.k_scale, prepared.v_scale,
+                1, 0, 1, 128 ** -0.5, 0,
             )
         except Exception as exc:
             raise SparseSageError(
                 "Sparse Sage kernel failed: layer=%d sequence=%d heads=%d "
                 "dtype=%s SpargeAttention=%s"
-                % (
-                    prepared.layer_index,
-                    prepared.sequence,
-                    prepared.heads,
-                    prepared.output_dtype,
-                    self.api.version,
-                )
+                % (prepared.layer_index, prepared.sequence, prepared.heads,
+                   prepared.output_dtype, self.api.version)
             ) from exc
-        if not torch.is_tensor(output) or output.shape != prepared.q.shape:
-            raise SparseSageError(
-                "Sparse Sage returned %s; expected HND shape %s"
-                % (getattr(output, "shape", type(output).__name__), tuple(prepared.q.shape))
-            )
-        if output.dtype != prepared.output_dtype:
-            raise SparseSageError(
-                "Sparse Sage returned %s; expected %s"
-                % (output.dtype, prepared.output_dtype)
-            )
+        finally:
+            if prepared.timing is not None:
+                prepared.timing.end(kernel_timing)
         return output

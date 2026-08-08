@@ -46,11 +46,24 @@ def routed_inputs():
     return q, k
 
 
+def decode(lut, valid):
+    mask = torch.zeros(lut.shape, dtype=torch.bool)
+    for index in range(valid.shape[-1]):
+        count = int(valid[..., index].max().item())
+        if count:
+            delta = lut[..., index, :count]
+            mask[..., index, :] = torch.nn.functional.one_hot(
+                torch.cumsum(delta, dim=-1).long(), num_classes=lut.shape[-1]
+            ).any(dim=-2)
+    return mask
+
+
 def test_exact_direct_routing():
     print("direct per-head routing")
     router = SparseTileRouter()
     q, k = routed_inputs()
-    mask, metadata = router.build_mask(q, k, layout(), 0.5)
+    lut, valid, metadata = router.build_lut(q, k, layout(), 0.5)
+    mask = decode(lut, valid)
     check(mask.shape == (1, 2, 3, 6), "mask uses global 128Q x 64KV geometry")
     check(mask[..., :2].all(), "all non-video KV tiles stay dense")
     check(mask[:, :, 0].all(), "non-video Q tile stays dense")
@@ -72,7 +85,8 @@ def test_mixed_boundary_and_partial_tiles():
     q = torch.randn((1, 1, 350, 4))
     k = torch.randn_like(q)
     mixed_layout = layout(sequence=350, video_start=96)
-    mask, metadata = router.build_mask(q, k, mixed_layout, 0.5)
+    lut, valid, metadata = router.build_lut(q, k, mixed_layout, 0.5)
+    mask = decode(lut, valid)
     check(mask[:, :, 0].all(), "128Q tile crossing the video boundary stays dense")
     check(mask[..., 1].all(), "64KV tile crossing the video boundary stays dense")
     check(metadata.q_tiles == 3 and metadata.kv_tiles == 6,
@@ -90,7 +104,8 @@ def test_full_budget_skips_scoring():
             raise AssertionError("100% budget must not pool Q/K")
 
     q = torch.randn((1, 2, 384, 8))
-    mask, metadata = NoPoolingRouter().build_mask(q, q, layout(), 1.0)
+    lut, valid, metadata = NoPoolingRouter().build_lut(q, q, layout(), 1.0)
+    mask = decode(lut, valid)
     check(mask.all(), "100% budget produces an all-one block mask")
     check(metadata.full_mask_density == 1.0 and metadata.sparse_q_tiles == 0,
           "100% metadata reports a fully dense executable mask")

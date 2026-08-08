@@ -79,8 +79,8 @@ def _chunk_count(target_frames, chunk_frames):
     return int(math.ceil(target_frames / float(chunk_frames)))
 
 
-def _resolve_reference_frames(chunk_frames, reference_frames):
-    return resolve_nplusone_reference_frames(chunk_frames, reference_frames)
+def _resolve_video_reference_frames(chunk_frames, video_reference_frames):
+    return resolve_nplusone_reference_frames(chunk_frames, video_reference_frames)
 
 
 def _resolve_execution_plan(
@@ -89,15 +89,17 @@ def _resolve_execution_plan(
     *,
     output_seconds,
     chunk_frames,
-    reference_frames,
-    seed,
+    video_reference_frames=90,
+    audio_reference_seconds=4.0,
+    seed=0,
 ):
     if plan is None:
         normalized = build_nplusone_chunk_prompt_plan(
             output_seconds=output_seconds,
             chunk_frames=chunk_frames,
             global_prompt=prompt,
-            reference_frames=reference_frames,
+            video_reference_frames=video_reference_frames,
+            audio_reference_seconds=audio_reference_seconds,
             seed=seed,
         )
         source = "node inputs"
@@ -110,10 +112,15 @@ def _resolve_execution_plan(
             for name, value in (
                 ("output_seconds", output_seconds),
                 ("chunk_frames", chunk_frames),
-                ("reference_frames", reference_frames),
+                ("video_reference_frames", video_reference_frames),
+                ("audio_reference_seconds", audio_reference_seconds),
                 ("seed", seed),
             )
-            if int(normalized[name]) != int(value)
+            if (
+                float(normalized[name]) != float(value)
+                if name == "audio_reference_seconds"
+                else int(normalized[name]) != int(value)
+            )
         ]
 
     compiled = prompts_for_av_continuation_plan(
@@ -121,7 +128,8 @@ def _resolve_execution_plan(
         prompt,
         output_seconds=normalized["output_seconds"],
         chunk_frames=normalized["chunk_frames"],
-        reference_frames=normalized["reference_frames"],
+        video_reference_frames=normalized["video_reference_frames"],
+        audio_reference_seconds=normalized["audio_reference_seconds"],
     )
     effective_digests = [prompt_digest(text) for text in compiled]
     if effective_digests != normalized["chunk_digests"]:
@@ -183,7 +191,9 @@ def _run_identity(
                 "target_frames",
                 "chunk_frames",
                 "chunk_count",
-                "reference_frames",
+                "video_reference_frames",
+                "audio_reference_seconds",
+                "audio_reference_latents",
             )
         },
         "canvas": list(canvas),
@@ -227,7 +237,8 @@ def continuation_prompt(prompt, video_number, audio_number):
         "Reference relationship for this generation: [video continuation + audio reference]. "
         "%s is the immediately preceding generated video segment of the same continuous "
         "target video, and the target video begins immediately after its end. %s is the "
-        "synchronized audio of %s and provides the immediately preceding audio state. "
+        "preceding audio history ending at the same point as %s; it may cover a longer "
+        "history than the video tail and provides the preceding audio state. "
         "Continue both picture and sound directly forward without restarting, repeating, "
         "or replaying the referenced segment. Preserve the final subject states, scene, "
         "camera state, motion direction and phase, lighting, and audiovisual continuity "
@@ -301,6 +312,7 @@ def _dynamic_av_reference(previous_pixels, previous_video, previous_audio, canva
     ]
     block = {
         "kind": "video_audio",
+        "temporal_alignment": "end",
         "latent_t": int(previous_video.shape[2]),
         "latent_h": int(canvas[1] // 16),
         "latent_w": int(canvas[0] // 16),
@@ -316,62 +328,42 @@ def _slice_dynamic_av_reference(
     previous_video,
     previous_audio,
     *,
-    reference_frames,
+    video_reference_frames,
+    audio_reference_latents,
     geometry,
 ):
-    reference_frames = int(reference_frames)
-    if reference_frames <= 0:
-        raise ValueError("reference_frames must be positive")
+    video_reference_frames = int(video_reference_frames)
+    if video_reference_frames <= 0:
+        raise ValueError("video_reference_frames must be positive")
     if previous_pixels is None or previous_audio is None or previous_video is None:
         raise ValueError("dynamic continuation reference is incomplete")
-    if reference_frames > int(previous_pixels.shape[0]):
+    if video_reference_frames > int(previous_pixels.shape[0]):
         raise ValueError(
-            "reference_frames=%d exceeds previous decoded chunk length=%d"
-            % (reference_frames, int(previous_pixels.shape[0]))
+            "video_reference_frames=%d exceeds previous decoded chunk length=%d"
+            % (video_reference_frames, int(previous_pixels.shape[0]))
         )
-    if int(reference_frames) == int(previous_pixels.shape[0]):
+    if int(video_reference_frames) == int(previous_pixels.shape[0]) and (
+        audio_reference_latents is None or int(audio_reference_latents) >= int(previous_audio.shape[-1])
+    ):
         return (
             previous_pixels,
             previous_video,
             previous_audio,
         )
-    if geometry.overlap_frames != int(reference_frames):
-        raise ValueError(
-            "reference frames mismatch: geometry overlap=%d reference=%d"
-            % (geometry.overlap_frames, int(reference_frames))
-        )
-    video_overlap_start, video_overlap_count = geometry.overlap_slice()
-    audio_overlap_start, audio_overlap_count = audio_runtime.audio_overlap_slice(geometry)
-    expected_audio_latents = (
-        int(reference_frames) * AUDIO_LATENT_FPS // geometry.fps
+    if geometry is None:
+        raise ValueError("geometry is required for N+1 video slicing")
+    latent_start, latent_count = nplusone_resume.group_aligned_slice(
+        geometry.chunk_frames, video_reference_frames,
     )
-    if int(reference_frames) * AUDIO_LATENT_FPS % geometry.fps:
-        raise RuntimeError(
-            "reference duration is not audio exact: R=%d fps=%d latent_fps=%d"
-            % (reference_frames, geometry.fps, AUDIO_LATENT_FPS)
-        )
-    if audio_overlap_count != expected_audio_latents:
-        raise RuntimeError(
-            "reference audio latent mismatch: expected %d from %d frames at %d fps, "
-            "but geometry overlap gives %d"
-            % (
-                expected_audio_latents,
-                int(reference_frames),
-                geometry.fps,
-                audio_overlap_count,
-            )
-        )
+    requested_audio = int(audio_reference_latents or 0)
+    if requested_audio <= 0:
+        raise ValueError("audio_reference_latents must be positive")
+    audio_count = min(requested_audio, int(previous_audio.shape[-1]))
+    audio_tail = previous_audio[..., -audio_count:] if audio_count else previous_audio[..., :0]
     return (
-        previous_pixels[-int(reference_frames):],
-        previous_video[
-            :,
-            :,
-            video_overlap_start:video_overlap_start + video_overlap_count,
-        ],
-        previous_audio[
-            ...,
-            audio_overlap_start:audio_overlap_start + audio_overlap_count,
-        ],
+        previous_pixels[-video_reference_frames:],
+        previous_video[:, :, latent_start:latent_start + latent_count],
+        audio_tail,
     )
 
 
@@ -616,14 +608,27 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
                 # inserted, so saved widgets_values keep their indices.
                 decoder_input(),
                 io.Int.Input(
-                    "reference_frames",
+                    "video_reference_frames",
                     default=90,
                     min=1,
                     max=362,
                     tooltip=(
-                        "Tail frames from each generated chunk used as dynamic "
-                        "<Video N+1>/<Audio M+1> reference. Used only when no N+1 "
-                        "prompt plan is connected."
+                        "Tail video frames from each generated chunk used as dynamic "
+                        "<Video N+1> reference. Resolved to a legal H3 VAE-group "
+                        "tail independently of audio. Used only when no N+1 prompt "
+                        "plan is connected."
+                    ),
+                ),
+                io.Float.Input(
+                    "audio_reference_seconds",
+                    default=4.0,
+                    min=0.025,
+                    max=60.0,
+                    step=0.025,
+                    tooltip=(
+                        "Audio history in seconds for dynamic <Audio M+1>. It is "
+                        "normalized to integer 40 Hz latents and may be longer "
+                        "than the video tail."
                     ),
                 ),
             ],
@@ -672,7 +677,8 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
         ref_audios=None,
         diagnostic_dump_chunks=False,
         current_preview_decoder=DECODER_AUTO,
-        reference_frames=90,
+        video_reference_frames=90,
+        audio_reference_seconds=4.0,
         unique_id=None,
     ) -> io.NodeOutput:
         plan, chunk_prompts, plan_source, scalar_overrides = _resolve_execution_plan(
@@ -680,11 +686,13 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
             prompt,
             output_seconds=output_seconds,
             chunk_frames=chunk_frames,
-            reference_frames=reference_frames,
+            video_reference_frames=video_reference_frames,
+            audio_reference_seconds=audio_reference_seconds,
             seed=seed,
         )
         chunk_frames = int(plan["chunk_frames"])
-        resolved_reference_frames = int(plan["reference_frames"])
+        resolved_video_reference_frames = int(plan["video_reference_frames"])
+        resolved_audio_reference_latents = int(plan["audio_reference_latents"])
 
         # H3 target construction only needs a legal chunk length. The geometry
         # helper requires an overlap value, but this node never consumes its
@@ -695,14 +703,6 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
         ).validate()
         canvas = _validate_canvas(width, height)
         target_frames = int(plan["target_frames"])
-        reference_geometry = (
-            HarnessGeometry(
-                chunk_frames=int(chunk_frames),
-                overlap_frames=int(resolved_reference_frames),
-            ).validate()
-            if resolved_reference_frames < geometry.chunk_frames
-            else None
-        )
         chunk_count = int(plan["chunk_count"])
         if len(chunk_prompts) != chunk_count:
             raise RuntimeError(
@@ -740,7 +740,7 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
         logging.info("%s %s", LOG, memory.describe(memory_status))
         if scalar_overrides:
             logging.info(
-                "%s %s overrides legacy node inputs: %s",
+                "%s %s overrides node inputs: %s",
                 LOG,
                 plan_source,
                 ", ".join(scalar_overrides),
@@ -780,7 +780,8 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
             chunk_count=chunk_count,
             chunk_digests=plan["chunk_digests"],
             chunk_seeds=plan["chunk_seeds"],
-            reference_frames=resolved_reference_frames,
+            video_reference_frames=resolved_video_reference_frames,
+            audio_reference_latents=resolved_audio_reference_latents,
             chunk_frames=geometry.chunk_frames,
         )
         nplusone_resume.invalidate_from(root, resume_from, chunk_count)
@@ -895,8 +896,9 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
                                     previous_pixels,
                                     previous_video,
                                     previous_audio,
-                                    reference_frames=resolved_reference_frames,
-                                    geometry=reference_geometry,
+                                    video_reference_frames=resolved_video_reference_frames,
+                                    audio_reference_latents=resolved_audio_reference_latents,
+                                    geometry=geometry,
                                 )
                             )
                             dynamic_items, dynamic_block = _dynamic_av_reference(
@@ -947,7 +949,8 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
                             seed=plan["chunk_seeds"][index],
                             prompt_sha=plan["chunk_digests"][index],
                             parent_sha=parent_sha,
-                            reference_frames=resolved_reference_frames,
+                            video_reference_frames=resolved_video_reference_frames,
+                            audio_reference_latents=resolved_audio_reference_latents,
                             chunk_frames=geometry.chunk_frames,
                         )
                     else:
@@ -1149,10 +1152,10 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
         video = InputImpl.VideoFromFile(output_path)
         reference_note = (
             "complete previous chunk"
-            if resolved_reference_frames == geometry.chunk_frames
+            if resolved_video_reference_frames == geometry.chunk_frames
             else "from previous generated tail"
         )
-        reference_seconds = resolved_reference_frames / float(geometry.fps)
+        reference_seconds = resolved_video_reference_frames / float(geometry.fps)
         report_lines = [
             "MiniMax H3 LongForm AV Continuation",
             "mode      native video + audio continuation; no latent overlap carry",
@@ -1171,10 +1174,12 @@ class MiniMaxH3LongFormAVContinuation(io.ComfyNode):
             % (resume_from, chunk_count - resume_from),
             "output    %d frames (%.3f s at %d fps)"
             % (target_frames, target_frames / geometry.fps, geometry.fps),
-            "reference R=%d frames (%.3f s) %s"
+            "reference video=%d frames (%.3f s); audio=%d latents (%.3f s) %s"
             % (
-                resolved_reference_frames,
+                resolved_video_reference_frames,
                 reference_seconds,
+                resolved_audio_reference_latents,
+                resolved_audio_reference_latents / AUDIO_LATENT_FPS,
                 reference_note,
             ),
             "dynamic   <Video %d> + <Audio %d> from previous generated chunk"

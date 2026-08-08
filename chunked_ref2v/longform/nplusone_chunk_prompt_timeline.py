@@ -13,24 +13,22 @@ import json
 import math
 
 from comfy_api.latest import ComfyExtension, io
-from ..audio_boundary_profile import (
-    validate_av_continuation_chunk_frames,
-)
-from ..geometry import audio_boundary_is_exact, chunk_seed as derive_chunk_seed
+from ..geometry import AUDIO_LATENT_FPS, chunk_seed as derive_chunk_seed
 from .nplusone_resume import legal_reference_frames, prompt_digest
 
 FPS = 24
 # 3: the plan owns the run seed, derived per-chunk seeds, and compiled-prompt
 # digests. Seed lives with the thing being edited, so a requeue after a prompt
 # edit keeps it - which is what makes resuming an existing run possible at all.
-PLAN_VERSION = 3
+PLAN_VERSION = 4
 POLICY_AV_CONTINUATION = "previous_av_continuation"
-REFERENCE_MIN_SECONDS = 2
-REFERENCE_MAX_SECONDS = 15
-REFERENCE_FRAMES_MIN = FPS * REFERENCE_MIN_SECONDS
-REFERENCE_FRAMES_MAX = FPS * REFERENCE_MAX_SECONDS
-
 NPlusOneChunkPromptPlan = io.Custom("H3_N_PLUS_ONE_CHUNK_PROMPT_PLAN")
+
+
+def _validate_video_chunk_frames(chunk_frames):
+    chunk_frames = int(chunk_frames)
+    if chunk_frames < 22 or (chunk_frames - 5) % 17:
+        raise ValueError("chunk_frames=%d is not a legal H3 VAE length" % chunk_frames)
 
 
 def _nearest(value, candidates, *, prefer_larger_on_tie=True):
@@ -42,24 +40,27 @@ def _nearest(value, candidates, *, prefer_larger_on_tie=True):
     return min(candidates, key=lambda item: (abs(item - value), item))
 
 
-def resolve_nplusone_reference_frames(chunk_frames, reference_frames):
-    validate_av_continuation_chunk_frames(chunk_frames)
+def resolve_nplusone_reference_frames(chunk_frames, video_reference_frames):
+    _validate_video_chunk_frames(chunk_frames)
     candidates = [
         value
         for value in legal_reference_frames(chunk_frames) + [int(chunk_frames)]
-        if audio_boundary_is_exact(value)
-        and audio_boundary_is_exact(int(chunk_frames) - value)
-    ]
-    bounded = [
-        value
-        for value in candidates
-        if REFERENCE_FRAMES_MIN <= value <= REFERENCE_FRAMES_MAX
     ]
     return _nearest(
-        reference_frames,
-        bounded or candidates,
+        video_reference_frames,
+        candidates,
         prefer_larger_on_tie=True,
     )
+
+
+def normalize_audio_reference_seconds(audio_reference_seconds):
+    seconds = float(audio_reference_seconds)
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise ValueError("audio_reference_seconds must be positive")
+    latents = int(round(seconds * AUDIO_LATENT_FPS))
+    if latents <= 0:
+        raise ValueError("audio_reference_seconds is below one audio latent")
+    return latents
 
 
 def _parse_prompt_store(value):
@@ -100,20 +101,21 @@ def build_nplusone_chunk_prompt_plan(
     chunk_frames,
     global_prompt="",
     chunk_prompts_json="",
-    reference_frames=90,
+    video_reference_frames=90,
+    audio_reference_seconds=4.0,
     seed=0,
     continuation_policy=POLICY_AV_CONTINUATION,
 ):
     output_seconds = int(output_seconds)
     chunk_frames = int(chunk_frames)
-    reference_frames = int(reference_frames)
+    video_reference_frames = int(video_reference_frames)
     seed = int(seed) & 0xFFFFFFFFFFFFFFFF
     if output_seconds <= 0:
         raise ValueError("output_seconds must be positive")
     if chunk_frames <= 0:
         raise ValueError("chunk_frames must be positive")
-    if reference_frames <= 0:
-        raise ValueError("reference_frames must be positive")
+    if video_reference_frames <= 0:
+        raise ValueError("video_reference_frames must be positive")
     if continuation_policy != POLICY_AV_CONTINUATION:
         raise ValueError("unsupported N+1 continuation policy %r" % continuation_policy)
 
@@ -123,8 +125,11 @@ def build_nplusone_chunk_prompt_plan(
     prompts = stored[:chunk_count]
     prompts.extend("" for _ in range(chunk_count - len(prompts)))
     resolved_reference_frames = resolve_nplusone_reference_frames(
-        chunk_frames, reference_frames,
+        chunk_frames, video_reference_frames,
     )
+    requested_audio_reference_latents = normalize_audio_reference_seconds(audio_reference_seconds)
+    audio_capacity = round(chunk_frames / float(FPS) * AUDIO_LATENT_FPS)
+    audio_reference_latents = min(requested_audio_reference_latents, audio_capacity)
     plan = {
         "version": PLAN_VERSION,
         "schedule": "full_chunks",
@@ -136,7 +141,9 @@ def build_nplusone_chunk_prompt_plan(
         "chunk_count": chunk_count,
         "global_prompt": str(global_prompt or ""),
         "chunk_prompts": prompts,
-        "reference_frames": resolved_reference_frames,
+        "video_reference_frames": resolved_reference_frames,
+        "audio_reference_seconds": float(audio_reference_seconds),
+        "audio_reference_latents": audio_reference_latents,
         "seed": seed,
         "chunk_seeds": [derive_chunk_seed(seed, index) for index in range(chunk_count)],
     }
@@ -170,7 +177,8 @@ def validate_nplusone_chunk_prompt_plan(
     chunk_frames = int(plan.get("chunk_frames", -1))
     target_frames = int(plan.get("target_frames", -1))
     chunk_count = int(plan.get("chunk_count", -1))
-    reference_frames = int(plan.get("reference_frames", -1))
+    video_reference_frames = int(plan.get("video_reference_frames", -1))
+    audio_reference_latents = int(plan.get("audio_reference_latents", -1))
     if int(plan.get("fps", -1)) != FPS:
         raise ValueError("N+1 chunk prompt plan fps is invalid")
     if output_seconds <= 0 or target_frames != output_seconds * FPS:
@@ -178,10 +186,18 @@ def validate_nplusone_chunk_prompt_plan(
     if chunk_count != _chunk_count(target_frames, chunk_frames):
         raise ValueError("N+1 chunk prompt plan chunk geometry is invalid")
     if (
-        resolve_nplusone_reference_frames(chunk_frames, reference_frames)
-        != reference_frames
+        resolve_nplusone_reference_frames(chunk_frames, video_reference_frames)
+        != video_reference_frames
     ):
         raise ValueError("N+1 chunk prompt plan reference geometry is invalid")
+    audio_capacity = round(chunk_frames / float(FPS) * AUDIO_LATENT_FPS)
+    requested_audio_reference_latents = normalize_audio_reference_seconds(
+        plan.get("audio_reference_seconds", audio_reference_latents / AUDIO_LATENT_FPS)
+    )
+    if audio_reference_latents <= 0 or audio_reference_latents > audio_capacity:
+        raise ValueError("N+1 chunk prompt plan audio reference geometry is invalid")
+    if audio_reference_latents != min(requested_audio_reference_latents, audio_capacity):
+        raise ValueError("N+1 chunk prompt plan audio reference geometry is invalid")
 
     prompts = plan.get("chunk_prompts")
     if not isinstance(prompts, list) or len(prompts) != chunk_count:
@@ -223,6 +239,11 @@ def validate_nplusone_chunk_prompt_plan(
     normalized["seed"] = seed
     normalized["chunk_seeds"] = expected_seeds
     normalized["chunk_digests"] = expected_digests
+    normalized["video_reference_frames"] = video_reference_frames
+    normalized["audio_reference_latents"] = audio_reference_latents
+    normalized["audio_reference_seconds"] = float(
+        plan.get("audio_reference_seconds", audio_reference_latents / AUDIO_LATENT_FPS)
+    )
     return normalized
 
 
@@ -239,14 +260,16 @@ def prompts_for_av_continuation_plan(
     *,
     output_seconds,
     chunk_frames,
-    reference_frames=90,
+    video_reference_frames=90,
+    audio_reference_seconds=4.0,
 ):
     if plan is None:
         plan = build_nplusone_chunk_prompt_plan(
             output_seconds=output_seconds,
             chunk_frames=chunk_frames,
             global_prompt=fallback_prompt,
-            reference_frames=reference_frames,
+            video_reference_frames=video_reference_frames,
+            audio_reference_seconds=audio_reference_seconds,
         )
     normalized = validate_nplusone_chunk_prompt_plan(plan)
     return compile_nplusone_chunk_prompts(normalized, fallback_prompt)
@@ -305,14 +328,14 @@ class MiniMaxH3NPlusOneChunkPromptTimeline(io.ComfyNode):
                     tooltip="Internal timeline storage managed by the node editor.",
                 ),
                 io.Int.Input(
-                    "reference_frames",
+                    "video_reference_frames",
                     default=90,
                     min=1,
                     max=362,
                     tooltip=(
-                        "Tail frames from each generated chunk used as dynamic "
-                        "references for the next chunk. This is resolved to the "
-                        "same AV-aligned set used by continuation execution."
+                        "Tail video frames from each generated chunk used as dynamic "
+                        "references for the next chunk. This is resolved to a legal "
+                        "H3 VAE-group tail independently of audio."
                     ),
                 ),
                 io.Int.Input(
@@ -328,6 +351,17 @@ class MiniMaxH3NPlusOneChunkPromptTimeline(io.ComfyNode):
                         "unchanged one lets completed chunks be reused."
                     ),
                 ),
+                io.Float.Input(
+                    "audio_reference_seconds",
+                    default=4.0,
+                    min=0.025,
+                    max=60.0,
+                    step=0.025,
+                    tooltip=(
+                        "Audio history in seconds. It is normalized once to the "
+                        "integer 40 Hz audio_reference_latents in the plan."
+                    ),
+                ),
             ],
             outputs=[
                 NPlusOneChunkPromptPlan.Output(
@@ -338,7 +372,7 @@ class MiniMaxH3NPlusOneChunkPromptTimeline(io.ComfyNode):
                 io.Int.Output("chunk_frames", display_name="chunk frames (legacy)"),
                 io.String.Output("report", display_name="report"),
                 io.Int.Output(
-                    "reference_frames", display_name="reference frames (legacy)"
+                    "video_reference_frames", display_name="video reference frames"
                 ),
                 io.Int.Output("seed", display_name="seed"),
             ],
@@ -351,13 +385,15 @@ class MiniMaxH3NPlusOneChunkPromptTimeline(io.ComfyNode):
         chunk_frames=141,
         global_prompt="",
         chunk_prompts_json="",
-        reference_frames=90,
+        video_reference_frames=90,
+        audio_reference_seconds=4.0,
         seed=0,
     ) -> io.NodeOutput:
         plan = build_nplusone_chunk_prompt_plan(
             output_seconds=output_seconds,
             chunk_frames=chunk_frames,
-            reference_frames=reference_frames,
+            video_reference_frames=video_reference_frames,
+            audio_reference_seconds=audio_reference_seconds,
             global_prompt=global_prompt,
             chunk_prompts_json=chunk_prompts_json,
             seed=seed,
@@ -367,11 +403,12 @@ class MiniMaxH3NPlusOneChunkPromptTimeline(io.ComfyNode):
             "mode      previous <Video N+1> + <Audio M+1> AV continuation",
             "output    %d s / %d frames at %d fps"
             % (plan["output_seconds"], plan["target_frames"], plan["fps"]),
-            "profile   C=%d; no overlap; stride=%d; R=%d"
+            "profile   C=%d; no overlap; stride=%d; video tail=%d; audio=%d latents"
             % (
                 plan["chunk_frames"],
                 plan["chunk_frames"],
-                plan["reference_frames"],
+                plan["video_reference_frames"],
+                plan["audio_reference_latents"],
             ),
             "chunks    %d" % plan["chunk_count"],
             "seed      %d (per-chunk seeds derived; keep fixed to resume)"
@@ -401,7 +438,7 @@ class MiniMaxH3NPlusOneChunkPromptTimeline(io.ComfyNode):
             int(output_seconds),
             int(chunk_frames),
             "\n".join(lines),
-            int(plan["reference_frames"]),
+            int(plan["video_reference_frames"]),
             int(plan["seed"]),
         )
 
@@ -422,5 +459,6 @@ __all__ = [
     "prompt_digest",
     "prompts_for_av_continuation_plan",
     "resolve_nplusone_reference_frames",
+    "normalize_audio_reference_seconds",
     "validate_nplusone_chunk_prompt_plan",
 ]

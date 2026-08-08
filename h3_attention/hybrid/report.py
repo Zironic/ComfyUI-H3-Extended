@@ -20,7 +20,7 @@ def _mean(records, key):
     return sum(float(row[key]) for row in records) / len(records) if records else 0.0
 
 
-def summarize(records, seconds=None):
+def summarize(records, seconds=None, timing=None):
     layers = sorted({int(row["layer"]) for row in records})
     steps = sorted({int(row["step"]) for row in records if int(row["step"]) >= 0})
     full = [float(row["full_mask_density"]) for row in records]
@@ -42,6 +42,17 @@ def summarize(records, seconds=None):
         "min_video_tile_density": min(video) if video else None,
         "max_video_tile_density": max(video) if video else None,
         "request_seconds": None if seconds is None else float(seconds),
+        "timing": timing or {
+            "enabled": False,
+            "call_count": 0,
+            "stages": {},
+            "total_measured_attention_cuda_seconds": 0.0,
+            "request_wall_seconds": None if seconds is None else float(seconds),
+            "attention_cuda_to_request_wall_ratio": None,
+            "ratio_caveat": (
+                "CUDA event timing was disabled; no attention CUDA time was measured."
+            ),
+        },
     }
 
 
@@ -71,12 +82,37 @@ def render(payload):
     lines.extend([
         "",
         "Phase A uses direct 128Q x 64KV Sparse Sage routing.",
-        "Flex, compatibility fallback, Sol head dispatch, and timing are not enabled.",
+        "Flex, compatibility fallback, and Sol head dispatch are not enabled.",
+        "Timing stages cover direct LUT construction, V FP8 preparation, Q/K "
+        "int8 quantization, and the low-level Sparse Sage kernel.",
     ])
+    timing = summary.get("timing") or {}
+    if timing.get("call_count", 0):
+        lines.extend([
+            "",
+            "CUDA timing (deferred): %d attention calls" % timing["call_count"],
+            *[
+                "%s: %d calls, sum %.3f ms, mean %.3f ms" % (
+                    stage, values["count"], values["sum_ms"], values["mean_ms"]
+                )
+                for stage, values in timing.get("stages", {}).items()
+            ],
+            "measured attention CUDA seconds: %.6f" % (
+                timing["total_measured_attention_cuda_seconds"]),
+            "request wall seconds: %s" % (
+                "unknown" if timing.get("request_wall_seconds") is None
+                else "%.6f" % timing["request_wall_seconds"]),
+            "attention-CUDA/request-wall ratio: %s" % (
+                "unknown" if timing.get("attention_cuda_to_request_wall_ratio") is None
+                else "%.3f" % timing["attention_cuda_to_request_wall_ratio"]),
+            timing.get("ratio_caveat", ""),
+            "Stage times are nested; do not add them to total_hybrid_attention.",
+        ])
     return "\n".join(lines) + "\n"
 
 
-def write_request(output_root, run_tag, timestamp, request_id, records, seconds=None):
+def write_request(output_root, run_tag, timestamp, request_id, records, seconds=None,
+                  timing=None):
     tag = validate_run_tag(run_tag)
     directory = os.path.join(output_root, "%s_%s" % (tag, timestamp))
     os.makedirs(directory, exist_ok=False)
@@ -85,7 +121,7 @@ def write_request(output_root, run_tag, timestamp, request_id, records, seconds=
         "mode": "sage128",
         "run_tag": tag,
         "request_id": int(request_id),
-        "summary": summarize(records, seconds),
+        "summary": summarize(records, seconds, timing),
         "records": list(records),
     }
     with open(os.path.join(directory, "report.json"), "w", encoding="utf-8") as handle:

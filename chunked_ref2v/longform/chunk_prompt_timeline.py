@@ -20,7 +20,7 @@ import torch
 from comfy_api.latest import ComfyExtension, io
 
 from .. import harness, ref_builder
-from ..geometry import AUDIO_LATENT_FPS, HarnessGeometry, latent_frame_spans
+from ..geometry import HarnessGeometry, latent_frame_spans
 from ..layout_ops import TargetAlignedCondition
 from ..model_patch import patch_target_conditions
 from . import (
@@ -452,8 +452,21 @@ def _sample_chunks_av(
     audio_overlap_start = audio_overlap_count = None
     if self.carry != runner.CARRY_NONE:
         video_overlap_start, video_overlap_count = geometry.overlap_slice()
+        video_carry_frames = geometry.overlap_frames
+        if self.carry == runner.CARRY_FRAME:
+            video_carry_frames = latent_frame_spans(
+                geometry.target_latent_t
+            )[video_overlap_start]
         audio_overlap_start, audio_overlap_count = audio_runtime.audio_overlap_slice(
-            geometry
+            geometry, video_carry_frames
+        )
+        audio_runtime.log_audio_carry(
+            geometry,
+            self.carry,
+            video_carry_frames,
+            1 if self.carry == runner.CARRY_FRAME else video_overlap_count,
+            audio_overlap_start,
+            audio_overlap_count,
         )
 
     prefix = self._first_invalid("samples", chunk_count)
@@ -483,16 +496,8 @@ def _sample_chunks_av(
         ):
             if self.carry == runner.CARRY_FRAME:
                 video_count = 1
-                shared_frames = latent_frame_spans(
-                    geometry.target_latent_t
-                )[video_overlap_start]
                 audio_start = audio_overlap_start
-                audio_stop = audio_runtime.audio_latent_boundary(
-                    geometry.stride_frames + shared_frames,
-                    fps=geometry.fps,
-                    audio_latent_fps=AUDIO_LATENT_FPS,
-                )
-                audio_count = audio_stop - audio_start
+                audio_count = audio_overlap_count
             else:
                 video_count = video_overlap_count
                 audio_start = audio_overlap_start

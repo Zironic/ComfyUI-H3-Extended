@@ -8,7 +8,7 @@ import os
 from dataclasses import dataclass
 from typing import Any, Iterable
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 
 
 def _atomic_json(path: str, payload: dict[str, Any]) -> None:
@@ -87,13 +87,27 @@ def object_fingerprint(obj: Any) -> dict[str, Any]:
         value = getattr(obj, key, None)
         if isinstance(value, (str, int, float, bool)):
             out[key] = value
+    get_model_object = getattr(obj, "get_model_object", None)
+    if callable(get_model_object):
+        try:
+            model_sampling = get_model_object("model_sampling")
+        except (AttributeError, KeyError):
+            model_sampling = None
+        if model_sampling is not None:
+            sampling_identity = {
+                "class": f"{model_sampling.__class__.__module__}.{model_sampling.__class__.__qualname__}",
+                "shift": getattr(model_sampling, "shift", None),
+                "audio_shift": getattr(model_sampling, "audio_shift", None),
+            }
+            out["model_sampling"] = sampling_identity
+
     model_options = getattr(obj, "model_options", None)
     if isinstance(model_options, dict):
         transformer_options = model_options.get("transformer_options", {})
         if isinstance(transformer_options, dict):
             for key in (
-                "h3_video_shift",
-                "h3_audio_shift",
+                "minimax_h3_sigma_shift_video",
+                "minimax_h3_sigma_shift_audio",
                 "h3_attention_backend",
                 "h3_activation_mode",
             ):

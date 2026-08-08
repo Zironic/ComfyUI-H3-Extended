@@ -13,6 +13,7 @@ class HybridSparseConfig:
     video_budget: float = 0.5
     strict: bool = True
     run_tag: str = "hybrid50"
+    timing: bool = False
 
     def __post_init__(self):
         if self.mode not in IMPLEMENTED_MODES:

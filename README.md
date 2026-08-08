@@ -7,6 +7,9 @@ block-sparse attention mask for H3 from measurement rather than guesswork.
 Forked at ComfyUI v0.30.1, including the local `raw_latent_t` addition on
 `MiniMaxH3ImageToVideo`.
 
+The AV sigma-shift node requires ComfyUI v0.31.0 or newer for
+`ModelSamplingAV` support.
+
 ## Nodes
 
 Node ids and display names carry a `Zi` suffix so both these and the stock nodes
@@ -47,6 +50,13 @@ routes once per globally aligned 128-query tile, scores globally aligned
 tiles per head. Text, references, audio, mixed boundary tiles, and non-video Q
 tiles remain dense. Reports are written to
 `output/h3_hybrid_sparse/<run_tag>_<timestamp>/`.
+
+The `timing` input defaults to enabled. On CUDA it records deferred event pairs
+for direct LUT construction, V FP8 preparation, Q/K int8 quantization, the
+low-level Sparse Sage kernel, and total hybrid attention; events are synchronized
+once at request end. CUDA event time overlaps request wall time; the reported
+ratio is indicative rather than an exact decomposition. CPU tests remain
+un-timed unless a fake event factory is injected.
 
 Phase A is SM89-only and requires the compiled `spas_sage_attn` package. It
 implements `sage128` only. Compatibility measurement, dense per-head fallback,

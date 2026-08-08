@@ -14,6 +14,7 @@ sys.path.insert(0, _PACK)
 sys.path.insert(0, _ROOT)
 
 from h3_attention.hybrid import (  # noqa: E402
+    DeferredCudaTiming,
     HybridSparseBackend,
     HybridSparseConfig,
     HybridStatsCollector,
@@ -23,6 +24,8 @@ from h3_attention.hybrid import (  # noqa: E402
 )
 from h3_runtime.context import RUNTIME_KEY, RuntimeSnapshot  # noqa: E402
 from h3_sparse_attention.nodes import MiniMaxH3HybridSparseAttention  # noqa: E402
+from h3_attention.hybrid.report import render  # noqa: E402
+from h3_attention.hybrid.sparse_sage import quantize_qk  # noqa: E402
 
 
 def check(value, message):
@@ -77,11 +80,18 @@ class FakeSparseKernel:
         self.fail = fail
         self.calls = []
 
-    def __call__(self, q, k, v, **kwargs):
+    def __call__(self, q, k, v, output, *args):
         if self.fail:
             raise RuntimeError("synthetic sparse failure")
-        self.calls.append((q, k, v, kwargs))
-        return q.clone()
+        self.calls.append((q, k, v, output, args))
+        output.zero_()
+
+
+def fake_v_preparer(v, *_):
+    b, h, sequence, dim = v.shape
+    padded = (sequence + 127) // 128 * 128
+    return (torch.zeros((b, h, dim, padded), dtype=torch.float8_e4m3fn),
+            torch.ones((b, h, dim), dtype=torch.float32))
 
 
 class Collector:
@@ -92,15 +102,99 @@ class Collector:
         self.records.append(dict(metadata))
 
 
+class FakeTimingEvent:
+    def __init__(self, clock, events):
+        self.clock = clock
+        self.events = events
+        self.value = None
+
+    def record(self):
+        self.clock[0] += 1.0
+        self.value = self.clock[0]
+        self.events.append(("record", self.value))
+
+    def synchronize(self):
+        self.events.append(("synchronize", self.value))
+
+    def elapsed_time(self, other):
+        return other.value - self.value
+
+
+def test_deferred_timing():
+    print("deferred CUDA timing seam")
+    clock = [0.0]
+    events = []
+    factory = lambda **kwargs: FakeTimingEvent(clock, events)
+    collector = HybridStatsCollector("output", "timing")
+    config = HybridSparseConfig(timing=True)
+    api = SparseSageAPI(version="0.1.test", low_level_f16=FakeSparseKernel(),
+                        low_level_f32=FakeSparseKernel())
+    hybrid = HybridSparseBackend(
+        config, api=api, collector=collector, event_factory=factory,
+        allow_cpu_for_tests=True,
+        v_preparer=fake_v_preparer,
+        qk_quantizer=quantize_qk,
+    )
+    collector.on_request_reset(2)
+    q, k, v = fused_hnd()
+    prepared = hybrid.prepare(q, k, v, layer_index=0, transformer_options=options())
+    hybrid.execute(prepared)
+    with mock.patch("h3_attention.hybrid.report.os.makedirs"), \
+            mock.patch("h3_attention.hybrid.report.open", mock.mock_open()):
+        collector.on_request_end(2, 2.0)
+    check(sum(item[0] == "synchronize" for item in events) == 1,
+          "request end synchronizes only the last completed event")
+    summary = collector._timing._resolved
+    check(summary["call_count"] == 1 and all(
+        summary["stages"][stage]["count"] == 1
+        for stage in ("direct_lut_construction", "v_fp8_preparation",
+                      "q_k_int8_quantization", "sparse_sage_low_level_kernel",
+                      "total_hybrid_attention")
+    ), "all deferred timing stages resolve once")
+    check(summary["attention_cuda_to_request_wall_ratio"] is not None,
+          "timing summary includes the caveated CUDA/wall ratio")
+    report_text = render({
+        "mode": "sage128",
+        "summary": {
+            "requested_video_budget": 0.5,
+            "layer_count": 1,
+            "expected_layer_count": 50,
+            "step_count": 1,
+            "mean_video_tile_density": 0.5,
+            "mean_full_mask_density": 0.6,
+            "min_full_mask_density": 0.6,
+            "max_full_mask_density": 0.6,
+            "timing": summary,
+        },
+    })
+    check(report_text.count("q_k_int8_quantization:") == 1
+          and "Stage times are nested" in report_text,
+          "human report lists each timing stage once with nesting caveat")
+
+    disabled_factory_calls = []
+    disabled = DeferredCudaTiming(
+        False,
+        event_factory=lambda **kwargs: disabled_factory_calls.append(kwargs),
+    )
+    disabled.begin_request(3, cuda=True)
+    disabled.end(disabled.begin("total_hybrid_attention"))
+    disabled_summary = disabled.resolve(1.0)
+    check(not disabled_factory_calls and disabled_summary["call_count"] == 0,
+          "disabled timing allocates no CUDA events")
+
+
 def backend(kernel=None, collector=None, budget=0.5):
     kernel = kernel or FakeSparseKernel()
-    api = SparseSageAPI(version="0.1.test", block_sparse=kernel)
+    api = SparseSageAPI(version="0.1.test", low_level_f16=kernel,
+                        low_level_f32=kernel)
     config = HybridSparseConfig(video_budget=budget)
     return HybridSparseBackend(
         config,
         api=api,
         collector=collector,
         allow_cpu_for_tests=True,
+        v_preparer=fake_v_preparer,
+        qk_quantizer=quantize_qk,
     ), kernel
 
 
@@ -112,20 +206,23 @@ def test_prepare_execute_lifetime():
     source = q.untyped_storage().data_ptr()
     prepared = hybrid.prepare(q, k, v, layer_index=7, transformer_options=options())
     sparse = prepared.sparse
-    check(sparse.q.untyped_storage().data_ptr() != source,
-          "prepared Q does not retain fused QKV storage")
-    check(sparse.k.untyped_storage().data_ptr() != source,
-          "prepared K does not retain fused QKV storage")
-    check(sparse.v.untyped_storage().data_ptr() != source,
-          "prepared V does not retain fused QKV storage")
-    check(sparse.mask_id.shape == (1, 2, 3, 6) and sparse.mask_id.is_contiguous(),
-          "prepared mask is contiguous per-head 128Q x 64KV geometry")
+    check(all(
+        not torch.is_tensor(value) or value.untyped_storage().data_ptr() != source
+        for value in vars(sparse).values()
+    ), "prepared carrier retains no view into fused QKV storage")
+    check(sparse.q_int8.dtype == torch.int8 and sparse.k_int8.dtype == torch.int8,
+          "prepared Q/K are quantized int8 buffers")
+    check(sparse.v_fp8.dtype == torch.float8_e4m3fn,
+          "prepared V is FP8")
+    check(sparse.lut.shape == (1, 2, 3, 6) and sparse.lut.is_contiguous()
+          and sparse.valid_block_num.dtype == torch.int32,
+          "prepared LUT and valid counts are contiguous int32 geometry")
     del q, k, v
     output = hybrid.execute(prepared)
     check(output.shape == (1, 2, 384, 128), "hybrid backend returns HND output")
     check(output.dtype == torch.bfloat16, "output dtype matches H3 input")
-    check(len(kernel.calls) == 1 and kernel.calls[0][3]["tensor_layout"] == "HND",
-          "public Sparse Sage API is called once in HND layout")
+    check(len(kernel.calls) == 1 and kernel.calls[0][4][6:9] == (1, 0, 1),
+          "low-level Sparse Sage ABI receives HND non-causal mode")
     check(len(collector.records) == 1 and collector.records[0]["layer"] == 7,
           "successful execution records layer structural statistics")
 
@@ -204,8 +301,15 @@ def test_report_files():
               "request end writes report.txt")
 
 
-def _dense_reference(q, k, v, block_mask):
+def _dense_reference(q, k, v, lut, valid):
     sequence = q.shape[-2]
+    block_mask = torch.zeros(lut.shape, dtype=torch.bool, device=lut.device)
+    for q_index in range(lut.shape[-2]):
+        count = valid[..., q_index].max().item()
+        if count:
+            indices = torch.cumsum(lut[..., q_index, :int(count)], dim=-1)
+            block_mask[..., q_index, :] = torch.nn.functional.one_hot(
+                indices.long(), num_classes=lut.shape[-1]).any(dim=-2)
     token_mask = block_mask.repeat_interleave(128, dim=-2).repeat_interleave(64, dim=-1)
     token_mask = token_mask[..., :sequence, :sequence]
     scores = torch.matmul(q.float(), k.float().transpose(-1, -2)) * (128 ** -0.5)
@@ -226,7 +330,8 @@ def optional_cuda_numerical():
             q, k, v, layer_index=0,
             transformer_options=options(256, 128, torch.device("cuda")),
         )
-        reference = _dense_reference(q, k, v, prepared.sparse.mask_id)
+        reference = _dense_reference(q, k, v, prepared.sparse.lut,
+                                     prepared.sparse.valid_block_num)
         output = hybrid.execute(prepared)
         error = ((output.float() - reference.float()).square().mean().sqrt()
                  / reference.float().square().mean().sqrt().clamp_min(1e-8)).item()
@@ -238,6 +343,7 @@ def main():
     test_strict_errors()
     test_dependency_and_disabled_node()
     test_report_files()
+    test_deferred_timing()
     optional_cuda_numerical()
     print("\nall hybrid attention tests passed")
 

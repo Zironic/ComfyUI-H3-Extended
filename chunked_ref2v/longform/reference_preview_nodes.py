@@ -11,7 +11,6 @@ from comfy_api.latest import ComfyExtension, io
 
 from ..geometry import HarnessGeometry
 from . import chunk_aligned_audio_refs, runner
-from .audio_runtime import resolve_audio_aligned_overlap
 from .chunk_stream import chunk_count_for
 from .nodes import (
     _describe_ffmpeg,
@@ -138,10 +137,9 @@ class MiniMaxH3LongFormReferenceVideoPreview(
             ),
         ]
 
-        # Anchor above align_audio_chunks so that widget stays last: Comfy maps
-        # widgets_values by position, and the preview widgets already have saved
-        # positions in existing workflows.
-        anchors = ("align_audio_chunks", "ref_images")
+        # Keep preview widgets ahead of the autogrow inputs while preserving
+        # their existing relative positions in saved workflows.
+        anchors = ("ref_images",)
         insert_at = next(
             (
                 index
@@ -151,9 +149,7 @@ class MiniMaxH3LongFormReferenceVideoPreview(
             len(inputs),
         )
         inputs[insert_at:insert_at] = preview_inputs
-        # Appended past the anchors on purpose. Inserting here would shift
-        # align_audio_chunks and break every saved workflow's widgets_values;
-        # appending leaves every existing index alone.
+        # Appended past the anchors on purpose so existing indices stay stable.
         inputs.append(_decoder_input())
         return _replace_inputs(schema, inputs)
 
@@ -173,7 +169,6 @@ class MiniMaxH3LongFormReferenceVideoPreview(
         height=768,
         chunk_frames=90,
         overlap_frames=4,
-        align_audio_chunks=False,
         carry=runner.CARRY_OVERLAP,
         ref_image_size="native",
         cond_cache="auto",
@@ -197,11 +192,6 @@ class MiniMaxH3LongFormReferenceVideoPreview(
         current_preview_decoder=DECODER_AUTO,
         unique_id=None,
     ) -> io.NodeOutput:
-        overlap_frames, alignment_note = resolve_audio_aligned_overlap(
-            chunk_frames, overlap_frames, align_audio_chunks,
-        )
-        if alignment_note:
-            logging.warning("%s %s", LOG, alignment_note)
         geometry = HarnessGeometry(
             chunk_frames=chunk_frames,
             overlap_frames=overlap_frames,
@@ -292,7 +282,7 @@ class MiniMaxH3LongFormReferenceVideoPreview(
                 runtime_config={
                     "attention": attention,
                     "activation": activation,
-                    "audio_carry_frames": overlap_frames,
+                    "audio_carry_policy": "video_floor_v1",
                     "audio_output": True,
                     "audio_reference_mode": (
                         "chunk_aligned"
@@ -311,6 +301,33 @@ class MiniMaxH3LongFormReferenceVideoPreview(
             deactivate(token)
 
         audio_start, audio_count = summary["audio_overlap_latent"]
+        audio_carry = summary["audio_carry"]
+        if carry == runner.CARRY_NONE:
+            carry_report = ["video carry none", "audio carry none"]
+        else:
+            residual_note = (
+                "exact"
+                if abs(audio_carry["residual_ms"]) < 0.0005
+                else "audio shorter"
+            )
+            carry_report = [
+                "video carry %d frames / %d latent%s / %.2f ms"
+                % (
+                    audio_carry["video_frames"],
+                    audio_carry["video_latents"],
+                    "" if audio_carry["video_latents"] == 1 else "s",
+                    audio_carry["video_ms"],
+                ),
+                "audio carry %d latents / %.2f ms; source [%d:%d]"
+                % (
+                    audio_count,
+                    audio_carry["audio_ms"],
+                    audio_start,
+                    audio_start + audio_count,
+                ),
+                "AV residual %.2f ms, %s"
+                % (audio_carry["residual_ms"], residual_note),
+            ]
         report_lines = [
             "MiniMax H3 LongFormReferenceVideo",
             "profile   %s" % summary["profile"],
@@ -335,13 +352,10 @@ class MiniMaxH3LongFormReferenceVideoPreview(
                 if chunk_align_audio_references
                 else "complete references reused per chunk"
             ),
-            "audio     %d samples at %d Hz; O=%d -> latent [%d:%d]"
+            "audio     %d samples at %d Hz"
             % (
                 summary["audio_samples"],
                 summary["audio_sample_rate"],
-                overlap_frames,
-                audio_start,
-                audio_start + audio_count,
             ),
             "references %d"
             % len(summary.get("reference_notes", [])),
@@ -353,8 +367,7 @@ class MiniMaxH3LongFormReferenceVideoPreview(
                 ffmpeg_location.strip() or None
             ),
         ]
-        if alignment_note:
-            report_lines.append("align     %s" % alignment_note)
+        report_lines[3:3] = carry_report
         report_lines.extend(
             "ref       %s" % note
             for note in summary.get("reference_notes", [])

@@ -48,7 +48,7 @@ LOG_PREFIX = "[H3 Extended] n+1 resume"
 
 # Bump when the stored payload or the validity rule changes in a way that makes
 # older directories unsafe to reuse.
-CHUNK_SCHEMA = 2
+CHUNK_SCHEMA = 3
 
 SAMPLES_DIR = "samples"
 
@@ -74,33 +74,33 @@ def legal_reference_frames(chunk_frames):
     ]
 
 
-def group_aligned_slice(chunk_frames, reference_frames):
-    """`(latent_start, latent_count)` decoding to exactly `reference_frames`.
+def group_aligned_slice(chunk_frames, video_reference_frames):
+    """`(latent_start, latent_count)` decoding to exactly `video_reference_frames`.
 
     Raises rather than silently decoding a partial group, because the failure is
     invisible: a mid-group start still returns frames, just not the frames a
     full decode would have produced at those positions.
     """
     chunk_frames = int(chunk_frames)
-    reference_frames = int(reference_frames)
-    if not 0 < reference_frames <= chunk_frames:
-        raise ValueError("reference_frames must be in (0, chunk_frames]")
-    if (chunk_frames - reference_frames) % VAE_GROUP_FRAMES:
+    video_reference_frames = int(video_reference_frames)
+    if not 0 < video_reference_frames <= chunk_frames:
+        raise ValueError("video_reference_frames must be in (0, chunk_frames]")
+    if (chunk_frames - video_reference_frames) % VAE_GROUP_FRAMES:
         raise ValueError(
             "R=%d is not VAE-group aligned for C=%d; the tail would start "
             "mid-group and decode incorrectly. Legal: %s"
-            % (reference_frames, chunk_frames,
+            % (video_reference_frames, chunk_frames,
                ", ".join(str(v) for v in legal_reference_frames(chunk_frames))))
 
     latent_t = video_latent_t(chunk_frames)
-    groups_before = (chunk_frames - reference_frames) // VAE_GROUP_FRAMES
+    groups_before = (chunk_frames - video_reference_frames) // VAE_GROUP_FRAMES
     latent_start = groups_before * VAE_GROUP_POSITIONS
     spans = latent_frame_spans(latent_t)
     covered = sum(spans[latent_start:])
-    if covered != reference_frames:
+    if covered != video_reference_frames:
         raise ValueError(
             "internal: positions %d-%d cover %d frames, expected %d"
-            % (latent_start, latent_t - 1, covered, reference_frames))
+            % (latent_start, latent_t - 1, covered, video_reference_frames))
     return latent_start, latent_t - latent_start
 
 
@@ -142,7 +142,8 @@ def _meta_path(root, index):
 
 
 def save_chunk(root, index, *, video_latent, audio_latent, seed, prompt_sha,
-               parent_sha, reference_frames, chunk_frames):
+               parent_sha, video_reference_frames,
+               audio_reference_latents, chunk_frames):
     """Persist one completed chunk plus everything the scan needs to judge it."""
     try:
         from .runner import _save
@@ -156,13 +157,16 @@ def save_chunk(root, index, *, video_latent, audio_latent, seed, prompt_sha,
     })
     video_sha = latent_digest(video_latent)
     audio_sha = latent_digest(audio_latent)
+    if video_reference_frames is None or audio_reference_latents is None:
+        raise ValueError("both resolved N+1 reference lengths are required")
     meta = {
         "schema": CHUNK_SCHEMA,
         "index": int(index),
         "seed": int(seed),
         "prompt_sha256": prompt_sha,
         "parent_sha256": parent_sha,
-        "reference_frames": int(reference_frames),
+        "video_reference_frames": int(video_reference_frames),
+        "audio_reference_latents": int(audio_reference_latents),
         "chunk_frames": int(chunk_frames),
         "video_sha256": video_sha,
         "audio_sha256": audio_sha,
@@ -220,12 +224,15 @@ def invalidate_from(root, start, chunk_count):
 # ------------------------------------------------------------------ the scan
 
 def resume_point(root, *, chunk_count, chunk_digests, chunk_seeds,
-                 reference_frames, chunk_frames):
+                 video_reference_frames, audio_reference_latents,
+                 chunk_frames):
     """Index of the first chunk that must be regenerated.
 
     Returns `chunk_count` when every chunk on disk is still valid, in which case
     the run has nothing to sample and only needs reassembly.
     """
+    if video_reference_frames is None or audio_reference_latents is None:
+        raise ValueError("both resolved N+1 reference lengths are required")
     chunk_count = int(chunk_count)
     if len(chunk_digests) != chunk_count or len(chunk_seeds) != chunk_count:
         raise ValueError("resume identity must contain one digest and seed per chunk")
@@ -240,7 +247,9 @@ def resume_point(root, *, chunk_count, chunk_digests, chunk_seeds,
             return index
         if int(meta.get("chunk_frames", -1)) != int(chunk_frames):
             return index
-        if int(meta.get("reference_frames", -1)) != int(reference_frames):
+        if int(meta.get("video_reference_frames", -1)) != int(video_reference_frames):
+            return index
+        if int(meta.get("audio_reference_latents", -1)) != int(audio_reference_latents):
             return index
         if meta.get("prompt_sha256") != chunk_digests[index]:
             return index

@@ -9,8 +9,8 @@ import json
 import os
 import shutil
 import sys
-import tempfile
 import unittest
+import uuid
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "chunked_ref2v"))
@@ -62,7 +62,8 @@ class _FakeStore:
 
     def write(self, index, *, prompt, seed, parent_sha, video_sha,
               audio_sha=None,
-              chunk_frames=141, reference_frames=90, schema=None):
+              chunk_frames=141, video_reference_frames=90,
+              audio_reference_latents=160, schema=None):
         audio_sha = audio_sha or "audio-%d" % index
         meta = {
             "schema": resume.CHUNK_SCHEMA if schema is None else schema,
@@ -70,7 +71,8 @@ class _FakeStore:
             "seed": seed,
             "prompt_sha256": resume.prompt_digest(prompt),
             "parent_sha256": parent_sha,
-            "reference_frames": reference_frames,
+            "video_reference_frames": video_reference_frames,
+            "audio_reference_latents": audio_reference_latents,
             "chunk_frames": chunk_frames,
             "video_sha256": video_sha,
             "audio_sha256": audio_sha,
@@ -86,7 +88,11 @@ class _FakeStore:
 
 class ResumeScanTest(unittest.TestCase):
     def setUp(self):
-        self.root = tempfile.mkdtemp(prefix="h3resume")
+        self.root = os.path.join(
+            ROOT, ".agent", "tmp", "nplusone-tests", "h3resume-%s" % uuid.uuid4().hex,
+        )
+        os.makedirs(os.path.dirname(self.root), exist_ok=True)
+        os.makedirs(self.root, exist_ok=False)
         self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
         self.prompts = ["chunk %d" % i for i in range(5)]
         self.seeds = [1000 + i for i in range(5)]
@@ -124,7 +130,8 @@ class ResumeScanTest(unittest.TestCase):
         return resume.resume_point(
             self.root, chunk_count=5,
             chunk_digests=[resume.prompt_digest(text) for text in self.prompts],
-            chunk_seeds=self.seeds, reference_frames=90, chunk_frames=141)
+            chunk_seeds=self.seeds, video_reference_frames=90,
+            audio_reference_latents=160, chunk_frames=141)
 
     def test_untouched_run_needs_no_sampling(self):
         self.assertEqual(self.scan(), 5)
@@ -175,11 +182,20 @@ class ResumeScanTest(unittest.TestCase):
         resume.load_chunk = tampered
         self.assertEqual(self.scan(), 2)
 
-    def test_changed_reference_frames_invalidates_everything(self):
+    def test_changed_reference_lengths_invalidate_everything(self):
         got = resume.resume_point(
             self.root, chunk_count=5,
             chunk_digests=[resume.prompt_digest(text) for text in self.prompts],
-            chunk_seeds=self.seeds, reference_frames=39, chunk_frames=141)
+            chunk_seeds=self.seeds, video_reference_frames=39,
+            audio_reference_latents=160, chunk_frames=141)
+        self.assertEqual(got, 0)
+
+    def test_changed_audio_reference_length_invalidates_everything(self):
+        got = resume.resume_point(
+            self.root, chunk_count=5,
+            chunk_digests=[resume.prompt_digest(text) for text in self.prompts],
+            chunk_seeds=self.seeds, video_reference_frames=90,
+            audio_reference_latents=120, chunk_frames=141)
         self.assertEqual(got, 0)
 
     def test_old_schema_invalidates(self):

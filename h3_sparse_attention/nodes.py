@@ -75,6 +75,7 @@ class MiniMaxH3HybridSparseAttention(io.ComfyNode):
                     min=128, max=16384, step=256,
                 ),
                 io.String.Input("run_tag", default="hybrid50"),
+                io.Boolean.Input("timing", default=True),
             ],
             outputs=[io.Model.Output()],
         )
@@ -82,7 +83,7 @@ class MiniMaxH3HybridSparseAttention(io.ComfyNode):
     @classmethod
     def execute(cls, model, enabled=True, mode="sage128", video_budget=0.5,
                 strict=True, activation="mlp_chunked_bf16",
-                chunk_rows=DEFAULT_CHUNK_ROWS, run_tag="hybrid50") -> io.NodeOutput:
+                chunk_rows=DEFAULT_CHUNK_ROWS, run_tag="hybrid50", timing=True) -> io.NodeOutput:
         if not enabled:
             return io.NodeOutput(model)
 
@@ -91,6 +92,7 @@ class MiniMaxH3HybridSparseAttention(io.ComfyNode):
             video_budget=float(video_budget),
             strict=bool(strict),
             run_tag=run_tag,
+            timing=bool(timing),
         )
         environment = RuntimeEnvironment.detect()
         api = preflight_sparse_sage(

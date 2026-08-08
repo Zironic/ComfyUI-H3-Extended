@@ -78,6 +78,8 @@ def test_geometry_patterns_and_compaction():
     )
     assert block_mask.seq_lengths == (64, 256)
     assert block_mask.kv_indices[0, 0, 0, :2].tolist() == [1, 3]
+    lut, valid = bench.block_mask_to_lut(sample)
+    assert valid.item() == 2 and lut[0, 0, 0, :2].tolist() == [1, 2]
 
 
 def test_hybrid_gather_plan():
@@ -108,6 +110,92 @@ def test_hybrid_gather_plan():
             assert not row[geometry.pure_video_kv_start:].any()
     selected_flex = plan["flex_mask"][:, :, plan["flex_q_rows"]]
     assert selected_flex.shape[2] == len(plan["flex_q_rows"])
+
+
+def test_sparse_prepare_uses_direct_router():
+    target = layout()
+    calls = []
+
+    class Router:
+        def build_lut(self, q, k, received_layout, budget):
+            calls.append((q, k, received_layout, budget))
+            q_tiles = bench.tile_geometry(received_layout).q_tiles
+            kv_tiles = bench.tile_geometry(received_layout).kv_tiles
+            lut = torch.ones((1, bench.HEADS, q_tiles, kv_tiles), dtype=torch.int32)
+            valid = torch.full((1, bench.HEADS, q_tiles), kv_tiles, dtype=torch.int32)
+            return lut, valid, {"requested_video_budget": float(budget)}
+
+    prepared_args = {}
+
+    class Sparse:
+        def prepare(self, q, k, v, lut, valid, **kwargs):
+            prepared_args.update({"q": q, "k": k, "v": v, "lut": lut,
+                                  "valid": valid, **kwargs})
+            return object()
+
+        @staticmethod
+        def execute(_prepared):
+            return torch.empty(0)
+
+    context = {
+        "torch": torch,
+        "layout": target,
+        "device": torch.device("cpu"),
+        "router": Router(),
+        "sparse": Sparse(),
+    }
+    call = bench._prepare_call(
+        context, "sparse_sage_128x64", 0.5, 0.0, 0.0, 64, "uniform", 7
+    )
+    call.execute()
+    assert len(calls) == 1
+    q, k, received_layout, budget = calls[0]
+    assert q.dtype == torch.bfloat16 and q.shape == k.shape
+    assert received_layout is target and budget == 0.5
+    assert prepared_args["lut"].dtype == torch.int32
+    assert prepared_args["valid"].dtype == torch.int32
+    assert prepared_args["metadata"] == {"requested_video_budget": 0.5}
+
+
+def test_sparse_timing_field_aggregation():
+    summaries = [
+        {"stages": {
+            stage: {"mean_ms": value}
+            for stage, value in zip(bench.SPARSE_TIMING_STAGES, (1, 5, 9, 13, 17))
+        }},
+        {"stages": {
+            stage: {"mean_ms": value}
+            for stage, value in zip(bench.SPARSE_TIMING_STAGES, (3, 7, 11, 15, 19))
+        }},
+        {"stages": {
+            stage: {"mean_ms": value}
+            for stage, value in zip(bench.SPARSE_TIMING_STAGES, (2, 6, 10, 14, 18))
+        }},
+    ]
+    fields = bench._aggregate_timing_fields(summaries)
+    assert fields == {
+        "%s_ms" % stage: float(index * 4 + 2)
+        for index, stage in enumerate(bench.SPARSE_TIMING_STAGES)
+    }
+
+
+def test_flex_compile_boundary():
+    calls = []
+    compiled = object()
+
+    class FakeTorch:
+        @staticmethod
+        def compile(function, **kwargs):
+            calls.append((function, kwargs))
+            return compiled
+
+    def flex_attention():
+        raise AssertionError("stand-in must not execute")
+
+    assert bench.compile_flex_attention(FakeTorch, flex_attention) is compiled
+    assert calls == [(flex_attention, {"fullgraph": True})]
+    assert bench.flex_kernel_options(64) == {"BLOCK_M": 64, "BLOCK_N": 64}
+    assert bench.flex_kernel_options(128) == {"BLOCK_M": 128, "BLOCK_N": 64}
 
 
 def test_sweep_break_even_and_reports():
@@ -146,6 +234,9 @@ def main():
     test_fraction_parsing()
     test_geometry_patterns_and_compaction()
     test_hybrid_gather_plan()
+    test_sparse_prepare_uses_direct_router()
+    test_sparse_timing_field_aggregation()
+    test_flex_compile_boundary()
     test_sweep_break_even_and_reports()
     print("all hybrid sparse benchmark tests passed")
 

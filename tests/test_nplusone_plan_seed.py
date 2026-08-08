@@ -1,4 +1,4 @@
-"""Plan v3: the run seed and the derived per-chunk seeds.
+"""Plan v4: independent AV references plus derived per-chunk seeds.
 
 These are the fields the resume scan keys on, so they are tested without torch
 or Comfy - the geometry module is deliberately import-light for this reason.
@@ -61,14 +61,16 @@ class PlanSeedTest(unittest.TestCase):
         self.geometry, self.planner = _load()
 
     def build(self, **kwargs):
-        params = dict(output_seconds=58, chunk_frames=141, reference_frames=90,
+        params = dict(output_seconds=58, chunk_frames=141, video_reference_frames=90,
+                      audio_reference_seconds=4.0,
                       seed=413146064173853)
         params.update(kwargs)
         return self.planner.build_nplusone_chunk_prompt_plan(**params)
 
     def test_plan_carries_seed_and_one_seed_per_chunk(self):
         plan = self.build()
-        self.assertEqual(plan["version"], 3)
+        self.assertEqual(plan["version"], 4)
+        self.assertEqual(plan["audio_reference_latents"], 160)
         self.assertEqual(plan["seed"], 413146064173853)
         self.assertEqual(len(plan["chunk_seeds"]), plan["chunk_count"])
         self.assertEqual(

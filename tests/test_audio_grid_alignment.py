@@ -1,10 +1,4 @@
-"""CPU checks for the shared video/audio chunk grid.
-
-Video frames are 1/24 s and H3 audio latents 1/40 s, so a chunk boundary sits on
-both grids only when the stride is a multiple of three frames. The video path
-already refuses an unaligned profile; these pin the audio half, which used to
-round silently.
-"""
+"""CPU checks for conservative carry and experimental grid diagnostics."""
 
 from __future__ import annotations
 
@@ -26,7 +20,7 @@ from chunked_ref2v.geometry import (
 )
 from chunked_ref2v.longform.audio_runtime import (
     audio_latent_boundary,
-    resolve_audio_aligned_overlap,
+    audio_carry_latents_for_video_frames,
 )
 
 
@@ -44,8 +38,19 @@ class AudioBoundaryTests(unittest.TestCase):
             if audio_boundary_is_exact(stride):
                 self.assertEqual(error_ms, 0.0)
 
+    def test_carry_count_is_the_maximum_whole_audio_latent_count(self):
+        for video_frames, expected in ((4, 6), (8, 13), (12, 20)):
+            count = audio_carry_latents_for_video_frames(video_frames)
+            self.assertEqual(count, expected)
+        for video_frames in range(1, 200):
+            count = audio_carry_latents_for_video_frames(video_frames)
+            self.assertLessEqual(count * FPS, video_frames * AUDIO_LATENT_FPS)
+            self.assertGreater(
+                (count + 1) * FPS, video_frames * AUDIO_LATENT_FPS
+            )
 
-class AlignedOverlapTests(unittest.TestCase):
+
+class ExperimentalAlignedOverlapTests(unittest.TestCase):
     def test_known_aligned_profiles_for_the_default_chunk_length(self):
         aligned = [
             overlap
@@ -60,12 +65,12 @@ class AlignedOverlapTests(unittest.TestCase):
         self.assertEqual(aligned_overlap_frames(90, 9), 9)
         self.assertEqual(aligned_overlap_frames(90, 21), 21)
 
-    def test_the_workflow_profile_snaps_to_the_nearer_aligned_overlap(self):
+    def test_the_diagnostic_helper_finds_the_nearer_aligned_overlap(self):
         # O=17 (stride 73) rounds its carry up by a third of a latent.
         self.assertFalse(audio_boundary_is_exact(90 - 17))
         self.assertEqual(aligned_overlap_frames(90, 17), 21)
 
-    def test_the_node_default_snaps_up_as_well(self):
+    def test_the_diagnostic_helper_can_snap_the_node_default(self):
         self.assertFalse(audio_boundary_is_exact(90 - 4))
         self.assertEqual(aligned_overlap_frames(90, 4), 9)
 
@@ -87,34 +92,14 @@ class AlignedOverlapTests(unittest.TestCase):
             aligned_overlap_frames(5, 1)
 
 
-class ResolveOverlapTests(unittest.TestCase):
-    def test_disabled_keeps_the_overlap_but_reports_the_defect(self):
-        overlap, note = resolve_audio_aligned_overlap(90, 17, False)
-        self.assertEqual(overlap, 17)
-        self.assertIn("off-grid", note)
-        self.assertIn("align_audio_chunks", note)
-
-    def test_disabled_and_already_aligned_says_nothing(self):
-        self.assertEqual(resolve_audio_aligned_overlap(90, 9, False), (9, None))
-
-    def test_enabled_snaps_and_warns_that_the_result_changes(self):
-        overlap, note = resolve_audio_aligned_overlap(90, 17, True)
-        self.assertEqual(overlap, 21)
-        self.assertIn("17 -> 21", note)
-        self.assertIn("run directory", note)
-
-    def test_enabled_on_an_aligned_profile_is_a_silent_no_op(self):
-        self.assertEqual(resolve_audio_aligned_overlap(90, 21, True), (21, None))
-
-
-class WidgetOrderTests(unittest.TestCase):
-    """Comfy maps widgets_values by position, so a new widget must be last."""
+class PreviewWidgetOrderTests(unittest.TestCase):
+    """Preview widgets remain ahead of autogrow inputs without an AV toggle."""
 
     def build(self, base_names, preview_names):
         # Mirrors reference_preview_nodes.define_schema's insertion rule without
         # importing the node module, which needs the whole Comfy runtime.
         inputs = list(base_names)
-        anchors = ("align_audio_chunks", "ref_images")
+        anchors = ("ref_images",)
         insert_at = next(
             (i for i, name in enumerate(inputs) if name in anchors),
             len(inputs),
@@ -122,8 +107,8 @@ class WidgetOrderTests(unittest.TestCase):
         inputs[insert_at:insert_at] = preview_names
         return inputs
 
-    def test_align_toggle_stays_after_every_previously_saved_widget(self):
-        base = ["ffmpeg_location", "save_frames", "align_audio_chunks", "ref_images"]
+    def test_preview_widgets_anchor_on_reference_images(self):
+        base = ["ffmpeg_location", "save_frames", "ref_images"]
         preview = ["chunk_align_audio_references", "live_preview_width"]
         merged = self.build(base, preview)
 
@@ -134,14 +119,12 @@ class WidgetOrderTests(unittest.TestCase):
                 "save_frames",
                 "chunk_align_audio_references",
                 "live_preview_width",
-                "align_audio_chunks",
                 "ref_images",
             ],
         )
-        widgets = [name for name in merged if name != "ref_images"]
-        self.assertEqual(widgets[-1], "align_audio_chunks")
+        self.assertNotIn("align_audio_chunks", merged)
 
-    def test_older_schema_without_the_toggle_still_anchors_on_ref_images(self):
+    def test_shorter_schema_still_anchors_on_ref_images(self):
         base = ["ffmpeg_location", "save_frames", "ref_images"]
         merged = self.build(base, ["live_preview_width"])
         self.assertEqual(merged[-1], "ref_images")

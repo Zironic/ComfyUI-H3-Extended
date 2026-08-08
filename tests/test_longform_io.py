@@ -1,7 +1,12 @@
 import json
 import os
+import sys
 import tempfile
 import unittest
+
+import comfy.options
+comfy.options.enable_args_parsing()
+_ARGV, sys.argv = list(sys.argv), [sys.argv[0], "--cpu"]
 
 import torch
 
@@ -11,7 +16,12 @@ from chunked_ref2v.longform.chunk_stream import (
     frames_needed_for,
     plan_chunks,
 )
-from chunked_ref2v.longform.manifest import RunManifest, identity_hash
+from chunked_ref2v.longform.manifest import (
+    RunManifest,
+    SCHEMA_VERSION,
+    identity_hash,
+    object_fingerprint,
+)
 from chunked_ref2v.longform.reference_runner import (
     _pack_blocks,
     _paired_audio,
@@ -60,6 +70,50 @@ class ManifestTests(unittest.TestCase):
 
     def test_hash_is_order_independent(self):
         self.assertEqual(identity_hash({"a": 1, "b": 2}), identity_hash({"b": 2, "a": 1}))
+
+    def test_schema_two_is_rejected(self):
+        with tempfile.TemporaryDirectory() as root:
+            os.makedirs(root, exist_ok=True)
+            with open(os.path.join(root, "manifest.json"), "w", encoding="utf-8") as fh:
+                json.dump({"schema_version": 2, "identity_hash": "old", "identity": {}}, fh)
+            with self.assertRaises(RuntimeError):
+                RunManifest(root, {"source": "a"}).ensure()
+
+    def test_model_sampling_identity_includes_effective_class_and_shifts(self):
+        class SamplingA:
+            def __init__(self, shift=12.0, audio_shift=3.0):
+                self.shift = shift
+                self.audio_shift = audio_shift
+
+        class SamplingB(SamplingA):
+            pass
+
+        class Model:
+            def __init__(self, sampling):
+                self.sampling = sampling
+                self.model_options = {"transformer_options": {
+                    "minimax_h3_sigma_shift_video": 12.0,
+                    "minimax_h3_sigma_shift_audio": sampling.audio_shift,
+                }}
+
+            def get_model_object(self, name):
+                assert name == "model_sampling"
+                return self.sampling
+
+        first = object_fingerprint(Model(SamplingA()))
+        video_shift = object_fingerprint(Model(SamplingA(10.0, 3.0)))
+        audio_shift = object_fingerprint(Model(SamplingA(12.0, 2.0)))
+        sampling_class = object_fingerprint(Model(SamplingB()))
+        self.assertEqual(first["model_sampling"]["shift"], 12.0)
+        self.assertEqual(first["model_sampling"]["audio_shift"], 3.0)
+        self.assertEqual(first["minimax_h3_sigma_shift_video"], 12.0)
+        self.assertEqual(first["minimax_h3_sigma_shift_audio"], 3.0)
+        self.assertNotIn("h3_video_shift", first)
+        self.assertNotIn("h3_audio_shift", first)
+        self.assertNotEqual(identity_hash(first), identity_hash(video_shift))
+        self.assertNotEqual(identity_hash(first), identity_hash(audio_shift))
+        self.assertNotEqual(identity_hash(first), identity_hash(sampling_class))
+        self.assertEqual(SCHEMA_VERSION, 3)
 
 
 class ConditioningPersistenceTests(unittest.TestCase):
@@ -157,4 +211,5 @@ class WriterTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
+    sys.argv = _ARGV
     unittest.main()

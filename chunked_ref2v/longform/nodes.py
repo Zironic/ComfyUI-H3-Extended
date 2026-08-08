@@ -70,8 +70,15 @@ class MiniMaxH3LongFormRef2V(io.ComfyNode):
                                       "are quantized by the 17-frame grid: 4, 5, 9, "
                                       "13, 17, 21, 22, 26...; anything else raises "
                                       "UnalignedProfileError.")),
-                io.Combo.Input("carry", options=list(runner.CARRY_MODES),
-                               default="direct_latent_overlap"),
+                io.Combo.Input(
+                    "carry", options=list(runner.CARRY_MODES),
+                    default="direct_latent_overlap",
+                    tooltip=(
+                        "direct_latent_frame carries one video latent; "
+                        "direct_latent_overlap carries every video latent in "
+                        "overlap_frames; none disables generated carry."
+                    ),
+                ),
                 io.Combo.Input("ref_image_size", options=["native", "match", "max"], default="native"),
                 io.Combo.Input("cond_cache", options=list(COND_CACHE_MODES), default="auto"),
                 io.Combo.Input("attention", options=list(memory.ATTENTION_MODES), default="auto"),
@@ -243,10 +250,39 @@ class MiniMaxH3LongFormRef2V(io.ComfyNode):
             runtime_config={"attention": attention, "activation": activation},
         )
 
+        audio_carry = summary["audio_carry"]
+        if carry == runner.CARRY_NONE:
+            carry_report = ["video carry none", "audio carry none"]
+        else:
+            residual_note = (
+                "exact"
+                if abs(audio_carry["residual_ms"]) < 0.0005
+                else "audio shorter"
+            )
+            carry_report = [
+                "video carry %d frames / %d latent%s / %.2f ms"
+                % (
+                    audio_carry["video_frames"],
+                    audio_carry["video_latents"],
+                    "" if audio_carry["video_latents"] == 1 else "s",
+                    audio_carry["video_ms"],
+                ),
+                "audio carry %d latents / %.2f ms; source [%d:%d]"
+                % (
+                    audio_carry["audio_latents"],
+                    audio_carry["audio_ms"],
+                    audio_carry["audio_start"],
+                    audio_carry["audio_start"] + audio_carry["audio_latents"],
+                ),
+                "AV residual %.2f ms, %s"
+                % (audio_carry["residual_ms"], residual_note),
+            ]
+
         report = "\n".join([
             "MiniMax H3 long-form Ref2V",
             "profile   %s" % summary["profile"],
             "carry     %s" % carry,
+        ] + carry_report + [
             "canvas    %dx%d (%.2f MP, %.3f:1) from source %dx%d (%.3f:1)%s" % (
                 canvas[0], canvas[1], canvas[0] * canvas[1] / 1e6,
                 canvas[0] / canvas[1], metadata.display_width,

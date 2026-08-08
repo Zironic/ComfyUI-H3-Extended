@@ -18,7 +18,7 @@ from .sparse_sage import (
     load_sparse_sage_api,
     preflight_sparse_sage,
 )
-from .stats import HybridStatsCollector
+from .stats import DeferredCudaTiming, HybridStatsCollector, TIMING_STAGES
 
 __all__ = [
     "HybridSparseBackend",
@@ -39,4 +39,6 @@ __all__ = [
     "load_sparse_sage_api",
     "preflight_sparse_sage",
     "HybridStatsCollector",
+    "DeferredCudaTiming",
+    "TIMING_STAGES",
 ]

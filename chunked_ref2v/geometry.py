@@ -118,13 +118,11 @@ def find_exact_overlap_slice(latent_t, stride_frames, overlap_frames):
 
 
 def audio_boundary_is_exact(stride_frames, fps=FPS, audio_latent_fps=AUDIO_LATENT_FPS):
-    """Whether a chunk boundary lands on a whole audio latent position.
+    """Whether a boundary coincides on the video and audio grids.
 
-    Video frames are 1/24 s and audio latents 1/40 s, so the two grids only
-    coincide every three frames. On a stride that misses, the audio carry slice
-    rounds to the nearest latent and the model is handed a continuation that is
-    up to a third of a latent (8.3 ms) out of step with its own video, while the
-    video carry stays exact. Nothing downstream detects that.
+    This remains useful for diagnostics and experimental profiles. Production
+    carry does not require equality: video owns the overlap and audio uses the
+    largest whole 40 Hz duration that fits inside it.
     """
     return (int(stride_frames) * int(audio_latent_fps)) % int(fps) == 0
 

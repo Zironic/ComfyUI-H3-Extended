@@ -24,52 +24,76 @@ class NPlusOneChunkPromptTimelineTests(unittest.TestCase):
         self.assertEqual(plan["target_frames"], 288)
         self.assertEqual(plan["chunk_count"], 3)
         self.assertEqual(plan["chunk_prompts"], ["a", "b", "c"])
-        self.assertIn("reference_frames", plan)
+        self.assertIn("video_reference_frames", plan)
+        self.assertEqual(plan["audio_reference_latents"], 160)
         self.assertEqual(plan["schedule"], "full_chunks")
         self.assertEqual(plan["continuation_policy"], POLICY_AV_CONTINUATION)
-        self.assertEqual(plan["reference_frames"], 90)
+        self.assertEqual(plan["video_reference_frames"], 90)
         self.assertNotIn("overlap_frames", plan)
         self.assertNotIn("stride_frames", plan)
 
-    def test_reference_frames_snap_to_legal_if_not_exact(self):
-        plan = build_nplusone_chunk_prompt_plan(
-            output_seconds=10,
-            chunk_frames=141,
-            reference_frames=80,
+    def test_audio_reference_defaults_are_capped_to_chunk_capacity(self):
+        self.assertEqual(
+            build_nplusone_chunk_prompt_plan(
+                output_seconds=10, chunk_frames=141,
+            )["audio_reference_latents"],
+            160,
         )
-        self.assertEqual(plan["reference_frames"], 90)
+        short = build_nplusone_chunk_prompt_plan(output_seconds=2, chunk_frames=22)
+        self.assertEqual(short["audio_reference_seconds"], 4.0)
+        self.assertEqual(short["audio_reference_latents"], 37)
 
-    def test_reference_frames_respects_reference_input_range(self):
+    def test_video_reference_frames_snap_to_legal_if_not_exact(self):
         plan = build_nplusone_chunk_prompt_plan(
             output_seconds=10,
             chunk_frames=141,
-            reference_frames=40,
+            video_reference_frames=80,
         )
-        self.assertEqual(plan["reference_frames"], 90)
+        self.assertEqual(plan["video_reference_frames"], 73)
+
+    def test_video_reference_frames_use_video_only_geometry(self):
+        plan = build_nplusone_chunk_prompt_plan(
+            output_seconds=10,
+            chunk_frames=141,
+            video_reference_frames=40,
+        )
+        self.assertEqual(plan["video_reference_frames"], 39)
+
+    def test_video_reference_frames_do_not_require_audio_exact_boundaries(self):
+        plan = build_nplusone_chunk_prompt_plan(
+            output_seconds=10, chunk_frames=141, video_reference_frames=21,
+        )
+        self.assertEqual(plan["video_reference_frames"], 22)
+
+    def test_video_chunk_length_does_not_require_audio_alignment(self):
+        plan = build_nplusone_chunk_prompt_plan(
+            output_seconds=10, chunk_frames=124, video_reference_frames=21,
+        )
+        self.assertEqual(plan["chunk_frames"], 124)
 
     def test_strict_chunk_rejects_illegal_length(self):
         with self.assertRaises(ValueError):
             build_nplusone_chunk_prompt_plan(
                 output_seconds=10,
-                chunk_frames=124,
-                reference_frames=60,
+                chunk_frames=120,
+                video_reference_frames=60,
             )
 
-    def test_reference_frames_full_chunk_and_partial_records(self):
+    def test_video_reference_frames_full_chunk_and_partial_records(self):
         self.assertEqual(
             build_nplusone_chunk_prompt_plan(
                 output_seconds=10,
                 chunk_frames=141,
-                reference_frames=60,
-            )["reference_frames"],
-            90,
+                video_reference_frames=60,
+            )["video_reference_frames"],
+            56,
         )
         self.assertEqual(
             build_nplusone_chunk_prompt_plan(
                 output_seconds=10,
                 chunk_frames=141,
-                reference_frames=141,
-            )["reference_frames"],
+                video_reference_frames=141,
+            )["video_reference_frames"],
             141,
         )
 
@@ -112,9 +136,9 @@ class NPlusOneChunkPromptTimelineTests(unittest.TestCase):
         plan = build_nplusone_chunk_prompt_plan(
             output_seconds=12,
             chunk_frames=141,
-            reference_frames=90,
+            video_reference_frames=90,
         )
-        plan["reference_frames"] = 81
+        plan["video_reference_frames"] = 81
         with self.assertRaises(ValueError):
             validate_nplusone_chunk_prompt_plan(plan)
 
@@ -123,14 +147,14 @@ class NPlusOneChunkPromptTimelineTests(unittest.TestCase):
             output_seconds=12,
             chunk_frames=141,
             global_prompt="plan",
-            reference_frames=90,
+            video_reference_frames=90,
         )
         prompts = prompts_for_av_continuation_plan(
             plan,
             "fallback",
             output_seconds=1,
             chunk_frames=90,
-            reference_frames=39,
+            video_reference_frames=39,
         )
         self.assertEqual(prompts, ["plan", "plan", "plan"])
 
@@ -172,12 +196,13 @@ class NPlusOneChunkPromptTimelineTests(unittest.TestCase):
                 "chunk_frames",
                 "global_prompt",
                 "chunk_prompts_json",
-                "reference_frames",
+                "video_reference_frames",
                 "seed",
+                "audio_reference_seconds",
             ],
         )
 
-    def test_schema_outputs_append_reference_frames(self):
+    def test_schema_outputs_keep_video_reference_frames_position(self):
         schema = MiniMaxH3NPlusOneChunkPromptTimeline.define_schema()
         names = [getattr(item, "id", getattr(item, "name", None)) for item in schema.outputs]
         self.assertEqual(
@@ -187,7 +212,7 @@ class NPlusOneChunkPromptTimelineTests(unittest.TestCase):
                 "output_seconds",
                 "chunk_frames",
                 "report",
-                "reference_frames",
+                "video_reference_frames",
                 "seed",
             ],
         )

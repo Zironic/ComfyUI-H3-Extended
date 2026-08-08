@@ -44,9 +44,6 @@ const OVERLAP_FRAMES = Array.from(
     { length: 180 - 4 + 1 },
     (_, index) => index + 4,
 ).filter((frames) => OVERLAP_RESIDUES.has(frames % 17));
-const AUDIO_ALIGNED_OVERLAP_FRAMES = OVERLAP_FRAMES.filter(
-    (frames) => frames % 3 === 0,
-);
 
 function audioBoundaryExact(frameIndex) {
     return (Number(frameIndex) * AUDIO_LATENT_FPS) % FPS === 0;
@@ -192,28 +189,12 @@ function setWidgetValue(node, widget, value) {
     );
 }
 
-function audioAlignmentEnabled(node) {
-    const widget = node.widgets?.find(
-        (candidate) => candidate.name === "align_audio_chunks",
-    );
-    // New schemas default this to true. Treat a missing widget as false so old
-    // node definitions still retain their previous selector behavior.
-    return widget ? Boolean(widget.value) : false;
-}
-
 function activeChunkFrames(node) {
-    if (node.__h3StrictAvNPlusOne) {
-        return AUDIO_ALIGNED_CHUNK_FRAMES;
-    }
-    return audioAlignmentEnabled(node)
-        ? AUDIO_ALIGNED_CHUNK_FRAMES
-        : CHUNK_FRAMES;
+    return node.__h3StrictAvNPlusOne ? AUDIO_ALIGNED_CHUNK_FRAMES : CHUNK_FRAMES;
 }
 
-function activeOverlapFrames(node) {
-    return audioAlignmentEnabled(node)
-        ? AUDIO_ALIGNED_OVERLAP_FRAMES
-        : OVERLAP_FRAMES;
+function activeOverlapFrames() {
+    return OVERLAP_FRAMES;
 }
 
 function activeReferenceFrames(node) {
@@ -222,6 +203,17 @@ function activeReferenceFrames(node) {
     );
     if (!Number.isFinite(chunkFrames)) {
         return [];
+    }
+    if (node.__h3StrictAvNPlusOne || nodeClassName(node) === AV_CONTINUATION_PLAN_NODE || nodeClassName(node) === AV_CONTINUATION_NODE) {
+        const spans = latentFrameSpans(videoLatentT(Math.trunc(chunkFrames)));
+        const total = spans.reduce((sum, value) => sum + value, 0);
+        const references = [total];
+        let suffix = total;
+        for (const span of spans) {
+            suffix -= span;
+            if (suffix > 0 && (total - suffix) % 17 === 0) references.push(suffix);
+        }
+        return references.sort((left, right) => left - right);
     }
     const references = legalReferenceFrames(Math.trunc(chunkFrames));
     if (!isAVContinuationNode(node)) {
@@ -245,7 +237,7 @@ function hasAvContinuationInput(node) {
 function hasAvContinuationShape(node) {
     const widgets = node?.widgets || [];
     return (
-        widgets.some((widget) => widget?.name === "reference_frames") &&
+        widgets.some((widget) => widget?.name === "video_reference_frames" || widget?.name === "reference_frames") &&
         (widgets.some((widget) => widget?.name === "chunk_prompts_json") ||
             hasAvContinuationInput(node))
     );
@@ -265,11 +257,11 @@ function syncFrameChoices(node) {
     const chunkWidget = node.widgets?.find((widget) => widget.name === "chunk_frames");
     const overlapWidget = node.widgets?.find((widget) => widget.name === "overlap_frames");
     const referenceWidget = node.widgets?.find(
-        (widget) => widget.name === "reference_frames",
+        (widget) => widget.name === "video_reference_frames" || widget.name === "reference_frames",
     );
     if (!chunkWidget) return;
 
-    const preferLarger = audioAlignmentEnabled(node) || node.__h3StrictAvNPlusOne;
+    const preferLarger = node.__h3StrictAvNPlusOne;
     const chunks = activeChunkFrames(node);
     makeComboWidget(chunkWidget, chunks);
     setWidgetValue(
@@ -281,7 +273,6 @@ function syncFrameChoices(node) {
     );
 
         if (overlapWidget) {
-            const aligned = audioAlignmentEnabled(node) || node.__h3StrictAvNPlusOne;
             const overlaps = activeOverlapFrames(node).filter(
                 (frames) => frames < Number(chunkWidget.value),
             );
@@ -295,7 +286,7 @@ function syncFrameChoices(node) {
             overlapWidget,
             overlaps.includes(Number(overlapWidget.value))
                 ? Number(overlapWidget.value)
-                : nearestAllowed(overlapWidget.value, overlaps, aligned),
+                : nearestAllowed(overlapWidget.value, overlaps),
         );
     }
 
@@ -315,16 +306,14 @@ function syncFrameChoices(node) {
 function installLegalSelectors(node) {
     const chunkWidget = node.widgets?.find((widget) => widget.name === "chunk_frames");
     const overlapWidget = node.widgets?.find((widget) => widget.name === "overlap_frames");
-    const referenceWidget = node.widgets?.find((widget) => widget.name === "reference_frames");
-    const alignWidget = node.widgets?.find((widget) => widget.name === "align_audio_chunks");
+    const referenceWidget = node.widgets?.find((widget) => widget.name === "video_reference_frames" || widget.name === "reference_frames");
     if (!chunkWidget) return;
 
     if (!chunkWidget.__h3LegalFramesWrapped) {
         const originalCallback = chunkWidget.callback;
         chunkWidget.callback = function (value, ...args) {
-            const aligned = audioAlignmentEnabled(node) || node.__h3StrictAvNPlusOne;
             const allowed = activeChunkFrames(node);
-            const legal = nearestAllowed(value, allowed, aligned);
+            const legal = nearestAllowed(value, allowed, node.__h3StrictAvNPlusOne);
             const next = legal === undefined ? value : String(legal);
             this.value = next;
             const result = originalCallback?.call(this, next, ...args);
@@ -338,11 +327,10 @@ function installLegalSelectors(node) {
     if (overlapWidget && !overlapWidget.__h3LegalFramesWrapped) {
         const originalCallback = overlapWidget.callback;
         overlapWidget.callback = function (value, ...args) {
-            const aligned = audioAlignmentEnabled(node);
             const allowed = activeOverlapFrames(node).filter(
                 (frames) => frames < Number(chunkWidget.value),
             );
-            const legal = nearestAllowed(value, allowed, aligned);
+            const legal = nearestAllowed(value, allowed);
             const next = legal === undefined ? value : String(legal);
             this.value = next;
             const result = originalCallback?.call(this, next, ...args);
@@ -365,18 +353,6 @@ function installLegalSelectors(node) {
             return result;
         };
         referenceWidget.__h3ReferenceFramesWrapped = true;
-    }
-
-    if (alignWidget && !alignWidget.__h3AudioAlignmentWrapped) {
-        const originalCallback = alignWidget.callback;
-        alignWidget.callback = function (value, ...args) {
-            this.value = value;
-            const result = originalCallback?.call(this, value, ...args);
-            this.value = value;
-            syncFrameChoices(node);
-            return result;
-        };
-        alignWidget.__h3AudioAlignmentWrapped = true;
     }
 
     syncFrameChoices(node);

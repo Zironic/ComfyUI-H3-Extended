@@ -24,16 +24,21 @@ function positiveInt(value, fallback) {
 function calculateSchedule(node) {
     const outputSeconds = positiveInt(getWidget(node, "output_seconds")?.value, 30);
     const chunkFrames = positiveInt(getWidget(node, "chunk_frames")?.value, 141);
-    const referenceFrames = positiveInt(
-        getWidget(node, "reference_frames")?.value,
+    const videoReferenceFrames = positiveInt(
+        getWidget(node, "video_reference_frames")?.value,
         90,
+    );
+    const audioReferenceSeconds = Math.max(
+        0.025,
+        Number(getWidget(node, "audio_reference_seconds")?.value ?? 4.0),
     );
     const targetFrames = outputSeconds * FPS;
     const chunkCount = Math.max(1, Math.ceil(targetFrames / chunkFrames));
     return {
         outputSeconds,
         chunkFrames,
-        referenceFrames,
+        videoReferenceFrames,
+        audioReferenceSeconds,
         targetFrames,
         chunkCount,
     };
@@ -228,7 +233,7 @@ class NPlusOnePromptEditor {
     // ----------------------------------------------------------- data plumbing
 
     bindGeometryWidgets() {
-        for (const name of ["output_seconds", "chunk_frames", "reference_frames"]) {
+        for (const name of ["output_seconds", "chunk_frames", "video_reference_frames", "audio_reference_seconds"]) {
             const widget = getWidget(this.node, name);
             if (!widget || widget.__h3NPlusOneWrapped) continue;
             const original = widget.callback;
@@ -344,13 +349,14 @@ class NPlusOnePromptEditor {
 
     renderSummary(schedule) {
         const referenceSummary =
-            schedule.referenceFrames === schedule.chunkFrames
-                ? `${schedule.referenceFrames} (${formatSeconds(schedule.referenceFrames)}) complete previous chunk`
-                : `${schedule.referenceFrames} (${formatSeconds(schedule.referenceFrames)}) tail`;
+            schedule.videoReferenceFrames === schedule.chunkFrames
+                ? `${schedule.videoReferenceFrames} (${formatSeconds(schedule.videoReferenceFrames)}) complete previous chunk`
+                : `${schedule.videoReferenceFrames} (${formatSeconds(schedule.videoReferenceFrames)}) video tail`;
         this.summaryEl.textContent = [
             `${schedule.chunkCount} chunks`,
             `C=${schedule.chunkFrames}`,
-            `R=${referenceSummary}`,
+            `V=${referenceSummary}`,
+            `A=${schedule.audioReferenceSeconds.toFixed(3)}s history`,
             "no overlap",
             "N+1 AV continuation",
             `${schedule.outputSeconds}s`,
@@ -375,9 +381,9 @@ class NPlusOnePromptEditor {
             const continuationText =
                 index === 0
                     ? "static refs only"
-                    : schedule.referenceFrames === schedule.chunkFrames
+                    : schedule.videoReferenceFrames === schedule.chunkFrames
                     ? `N+1 AV continuation | previous complete previous chunk`
-                    : `N+1 AV continuation | previous ${formatSeconds(schedule.referenceFrames)} tail`;
+                    : `N+1 AV continuation | previous ${formatSeconds(schedule.videoReferenceFrames)} video tail + ${schedule.audioReferenceSeconds.toFixed(3)}s audio history`;
 
             const label = document.createElement("div");
             label.style.cssText = "margin-bottom:6px;font-size:11px;color:#aaa";

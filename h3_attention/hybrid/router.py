@@ -151,7 +151,7 @@ class SparseTileRouter:
             retained_video_kv_tiles=retained,
         )
 
-    def build_mask(self, q, k, layout, video_budget):
+    def build_lut(self, q, k, layout, video_budget):
         if q.ndim != 4 or k.ndim != 4:
             raise SparseRouterError("tile router expects HND rank-4 Q/K")
         if q.shape != k.shape:
@@ -170,28 +170,48 @@ class SparseTileRouter:
             )
 
         batch, heads = q.shape[:2]
-        mask = torch.ones(
-            (batch, heads, geometry.q_tiles, geometry.kv_tiles),
-            dtype=torch.bool,
-            device=q.device,
-        )
         pure_kv = geometry.pure_video_kv_tiles
         retained = min(pure_kv, math.ceil(float(video_budget) * pure_kv))
         metadata = self._metadata(geometry, video_budget, retained)
-        if float(video_budget) == 1.0:
-            return mask, metadata
-
-        q_means = self._mean_pool(q, Q_TILE)
-        k_means = self._mean_pool(k, KV_TILE)
-        scores = torch.matmul(
-            q_means[..., geometry.pure_video_q_start:, :],
-            k_means[..., geometry.pure_video_kv_start:, :].transpose(-1, -2),
+        # Every row is represented directly as sorted block indices.  The
+        # low-level kernel consumes deltas, so [0, 1, 1, ...] is the dense row.
+        dense = torch.arange(geometry.kv_tiles, device=q.device, dtype=torch.int32)
+        dense_delta = torch.cat((dense[:1], dense[1:] - dense[:-1]))
+        lut = dense_delta.view(1, 1, 1, -1).expand(
+            batch, heads, geometry.q_tiles, -1
+        ).clone()
+        valid = torch.full(
+            (batch, heads, geometry.q_tiles), geometry.kv_tiles,
+            dtype=torch.int32, device=q.device
         )
-        selected = torch.zeros_like(scores, dtype=torch.bool)
-        selected.scatter_(-1, torch.topk(scores, retained, dim=-1).indices, True)
-        mask[
-            ...,
-            geometry.pure_video_q_start:,
-            geometry.pure_video_kv_start:,
-        ] = selected
-        return mask, metadata
+        context = dense[: geometry.pure_video_kv_start]
+        if retained == pure_kv:
+            selected = context
+        else:
+            q_means = self._mean_pool(q, Q_TILE)
+            k_means = self._mean_pool(k, KV_TILE)
+            scores = torch.matmul(
+                q_means[..., geometry.pure_video_q_start:, :],
+                k_means[..., geometry.pure_video_kv_start:, :].transpose(-1, -2),
+            )
+            selected = torch.topk(scores, retained, dim=-1).indices.sort(dim=-1).values
+            selected = selected.to(torch.int32) + geometry.pure_video_kv_start
+
+        if retained < pure_kv:
+            # Context tiles are a dense prefix.  Selected video tiles are
+            # sorted absolute indices, then converted to deltas in one batch.
+            previous = context[-1] if context.numel() else 0
+            sparse_rows = torch.cat((
+                dense_delta[: geometry.pure_video_kv_start].view(1, 1, 1, -1).expand(
+                    batch, heads, geometry.pure_video_q_tiles, -1
+                ),
+                torch.cat((
+                    selected[..., :, :1] - previous,
+                    selected[..., :, 1:] - selected[..., :, :-1],
+                ), dim=-1),
+            ), dim=-1)
+            lut[..., geometry.pure_video_q_start:, : sparse_rows.shape[-1]].copy_(
+                sparse_rows
+            )
+            valid[..., geometry.pure_video_q_start:] = geometry.pure_video_kv_start + retained
+        return lut.contiguous(), valid.contiguous(), metadata

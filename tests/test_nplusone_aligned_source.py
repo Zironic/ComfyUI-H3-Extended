@@ -103,13 +103,13 @@ class NPlusOneAlignedSourceTests(unittest.TestCase):
             getattr(item, "id", getattr(item, "name", None))
             for item in schema.inputs
         ]
-        self.assertIn("reference_frames", names)
+        self.assertIn("video_reference_frames", names)
         self.assertIn("aligned_source_video", names)
         self.assertIn("aligned_source_audio", names)
         self.assertIn("aligned_source_video_size", names)
         self.assertGreater(
             names.index("aligned_source_video"),
-            names.index("reference_frames"),
+            names.index("video_reference_frames"),
         )
 
 
