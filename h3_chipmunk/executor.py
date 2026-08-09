@@ -1,17 +1,10 @@
 from __future__ import annotations
 
-import math
 import torch
 
-import comfy.ops
 import comfy.quant_ops
-from comfy.quant_ops import QuantizedTensor, TensorWiseINT8Layout
 
-from ..h3_activation_memory.linear import (
-    ConvRotTwoSliceMLP,
-    acquire_linear,
-    _convrot_parts,
-)
+from ..h3_activation_memory.linear import acquire_linear, _convrot_parts
 from .selector import logical_swiglu, select_top_groups
 
 
@@ -31,9 +24,7 @@ def _segment_kind(snapshot, start: int, stop: int):
 def _must_dense(config, snapshot, layer_index: int):
     step = int(getattr(snapshot, "step_index", -1))
     total = int(getattr(snapshot, "total_steps", 0))
-    if step < 0:
-        return True
-    if layer_index < int(config.first_dense_layers):
+    if step < 0 or layer_index < int(config.first_dense_layers):
         return True
     if step < int(config.first_dense_steps):
         return True
@@ -43,7 +34,7 @@ def _must_dense(config, snapshot, layer_index: int):
 
 
 class ConvRotGroupWeights:
-    """Acquire one H3 MLP's ConvRot carriers for a block invocation."""
+    """Acquire H3 ConvRot INT8 MLP carriers for one block invocation."""
 
     def __init__(self, mlp, sample):
         self.mlp = mlp
@@ -77,7 +68,11 @@ class ConvRotGroupWeights:
         logical_indices = logical_indices.long()
         rows = torch.cat((logical_indices, logical_indices + self.ffn), dim=0)
         q = self.fc1_q.index_select(0, rows).contiguous()
-        scale = self.fc1_s if self.fc1_s.numel() == 1 else self.fc1_s.index_select(0, rows).contiguous()
+        scale = (
+            self.fc1_s
+            if self.fc1_s.numel() == 1
+            else self.fc1_s.index_select(0, rows).contiguous()
+        )
         expanded = comfy.quant_ops.ck.int8_linear(
             x, q, scale, None, x.dtype,
             convrot=True, convrot_groupsize=256,
@@ -85,8 +80,7 @@ class ConvRotGroupWeights:
         return logical_swiglu(expanded)
 
     def selected_fc2(self, activation, logical_indices):
-        logical_indices = logical_indices.long()
-        q = self.fc2_q.index_select(1, logical_indices).contiguous()
+        q = self.fc2_q.index_select(1, logical_indices.long()).contiguous()
         return comfy.quant_ops.ck.int8_linear(
             activation, q, self.fc2_s, None, activation.dtype,
             convrot=True, convrot_groupsize=256,
@@ -111,26 +105,21 @@ def _logical_indices(groups: torch.Tensor, count: int, feature_group: int):
     return (groups[:, None] * feature_group + offsets[None]).reshape(-1)
 
 
-def _selector(weights: ConvRotGroupWeights, h: torch.Tensor, cache, config):
-    """Chipmunk-style cheap selector using fc1 of token-group means."""
+def _selector(weights, h, cache, config):
     tg = int(config.token_group_rows)
-    means = []
-    for a in range(0, h.shape[0], tg):
-        means.append(h[a:min(h.shape[0], a + tg)].mean(dim=0))
-    means = torch.stack(means, dim=0)
-    mid = weights.full_fc1(means)
-    act = logical_swiglu(mid)
+    means = torch.stack([
+        h[a:min(h.shape[0], a + tg)].mean(dim=0)
+        for a in range(0, h.shape[0], tg)
+    ], dim=0)
+    act = logical_swiglu(weights.full_fc1(means))
     fg = int(config.feature_group)
     if act.shape[-1] % fg:
         raise ChipmunkExecutionError("H3 FFN is not feature-group aligned")
     grouped = act.float().reshape(act.shape[0], act.shape[1] // fg, fg).mean(dim=-1)
-    if cache.selector_summary is None:
-        scores = grouped.abs()
-    else:
-        scores = (grouped - cache.selector_summary.float()).abs()
-    indices, counts = select_top_groups(
-        scores, config.top_fraction, config.random_groups
-    )
+    scores = grouped.abs() if cache.selector_summary is None else (
+        grouped - cache.selector_summary.float()
+    ).abs()
+    indices, counts = select_top_groups(scores, config.top_fraction, config.random_groups)
     cache.selector_summary = grouped.to(torch.bfloat16)
     cache.selected_groups = indices
     cache.selected_counts = counts
@@ -138,10 +127,6 @@ def _selector(weights: ConvRotGroupWeights, h: torch.Tensor, cache, config):
 
 
 def _selected_activation_all_groups(weights, h, indices, counts, config):
-    """Packed cache: list represented as dense [rows, kept_features] tensor.
-
-    Counts are currently uniform because top-k returns a fixed keep count.
-    """
     tg = int(config.token_group_rows)
     fg = int(config.feature_group)
     pieces = []
@@ -159,19 +144,15 @@ def _delta_update(weights, h, cache, config):
     tg = int(config.token_group_rows)
     fg = int(config.feature_group)
     out = cache.output
-    activation_offset = 0
     for gi, a in enumerate(range(0, h.shape[0], tg)):
         b = min(h.shape[0], a + tg)
         logical = _logical_indices(indices[gi], int(counts[gi].item()), fg)
         current = weights.selected_activation(h[a:b], logical)
         old = cache.activation[a:b]
-        # Two selected ConvRot fc2 calls deliberately preserve the quantized
-        # contribution semantics better than quantizing a BF16 delta once.
         old_part = weights.selected_fc2(old, logical)
         new_part = weights.selected_fc2(current, logical)
         out[a:b].sub_(old_part).add_(new_part)
         cache.activation[a:b].copy_(current)
-        activation_offset += current.shape[0]
     cache.output = out
     return out
 
@@ -204,16 +185,19 @@ def run_chipmunk_chunk(
                     cache.output = out.detach().clone()
                     cache.refresh_step = step
                     cache.update_step = step
-                    session.record(
-                        step=step, layer=layer_index, chunk=chunk_index, kind=kind,
-                        path="dense_refresh", active_fraction=float(indices.shape[1] * config.feature_group / weights.ffn),
-                        selector_mean=float(scores.mean().item()),
-                    )
+                    active = float(indices.shape[1] * config.feature_group / weights.ffn)
+                session.record(
+                    step=step, layer=layer_index, chunk=chunk_index, kind=kind,
+                    path="dense_refresh", active_fraction=active,
+                    selector_mean=float(scores.mean().item()),
+                )
             except Exception as exc:
                 cache.clear()
                 cache.fallback_calls += 1
-                session.record(step=step, layer=layer_index, chunk=chunk_index, kind=kind,
-                               path="dense_refresh_no_cache", reason=f"{type(exc).__name__}: {exc}")
+                session.record(
+                    step=step, layer=layer_index, chunk=chunk_index, kind=kind,
+                    path="dense_refresh_no_cache", reason=f"{type(exc).__name__}: {exc}",
+                )
                 if config.strict and config.mode == "reference_delta":
                     raise
         return out, "chipmunk_dense"
@@ -223,21 +207,36 @@ def run_chipmunk_chunk(
         cache.dense_calls += 1
         try:
             with ConvRotGroupWeights(block.mlp, h[:1]) as weights:
+                previous_indices = None if cache.selected_groups is None else cache.selected_groups.clone()
+                previous_counts = None if cache.selected_counts is None else cache.selected_counts.clone()
+                previous_activation = cache.activation
+                delta_rms = float("nan")
+                if previous_indices is not None and previous_activation is not None:
+                    current_previous = _selected_activation_all_groups(
+                        weights, h, previous_indices, previous_counts, config
+                    )
+                    if current_previous.shape == previous_activation.shape:
+                        delta_rms = float(
+                            (current_previous.float() - previous_activation.float())
+                            .square().mean().sqrt().item()
+                        )
                 indices, counts, scores = _selector(weights, h, cache, config)
-                current = _selected_activation_all_groups(weights, h, indices, counts, config)
-                if cache.activation is not None and cache.activation.shape == current.shape:
-                    delta_rms = float((current.float() - cache.activation.float()).square().mean().sqrt().item())
-                else:
-                    delta_rms = float("nan")
-                cache.activation = current.detach().clone()
+                cache.activation = _selected_activation_all_groups(
+                    weights, h, indices, counts, config
+                ).detach().clone()
                 cache.output = out.detach().clone()
-                session.record(step=step, layer=layer_index, chunk=chunk_index, kind=kind,
-                               path="measure", active_fraction=float(indices.shape[1] * config.feature_group / weights.ffn),
-                               selector_mean=float(scores.mean().item()), selected_delta_rms=delta_rms)
+                active = float(indices.shape[1] * config.feature_group / weights.ffn)
+            session.record(
+                step=step, layer=layer_index, chunk=chunk_index, kind=kind,
+                path="measure", active_fraction=active,
+                selector_mean=float(scores.mean().item()), selected_delta_rms=delta_rms,
+            )
         except Exception as exc:
             cache.fallback_calls += 1
-            session.record(step=step, layer=layer_index, chunk=chunk_index, kind=kind,
-                           path="measure_fallback", reason=f"{type(exc).__name__}: {exc}")
+            session.record(
+                step=step, layer=layer_index, chunk=chunk_index, kind=kind,
+                path="measure_fallback", reason=f"{type(exc).__name__}: {exc}",
+            )
             if config.strict:
                 raise
         return out, "chipmunk_measure"
@@ -245,10 +244,15 @@ def run_chipmunk_chunk(
     try:
         with ConvRotGroupWeights(block.mlp, h[:1]) as weights:
             out = _delta_update(weights, h, cache, config)
+            active = float(
+                cache.selected_groups.shape[1] * config.feature_group / weights.ffn
+            )
         cache.sparse_calls += 1
         cache.update_step = step
-        session.record(step=step, layer=layer_index, chunk=chunk_index, kind=kind,
-                       path="sparse_delta", active_fraction=float(cache.selected_groups.shape[1] * config.feature_group / weights.ffn))
+        session.record(
+            step=step, layer=layer_index, chunk=chunk_index, kind=kind,
+            path="sparse_delta", active_fraction=active,
+        )
         return out, "chipmunk_sparse_delta"
     except Exception as exc:
         cache.clear()
@@ -256,6 +260,8 @@ def run_chipmunk_chunk(
         if config.strict:
             raise
         out = dense_runner(h)
-        session.record(step=step, layer=layer_index, chunk=chunk_index, kind=kind,
-                       path="dense_fallback", reason=f"{type(exc).__name__}: {exc}")
+        session.record(
+            step=step, layer=layer_index, chunk=chunk_index, kind=kind,
+            path="dense_fallback", reason=f"{type(exc).__name__}: {exc}",
+        )
         return out, "chipmunk_dense_fallback"
