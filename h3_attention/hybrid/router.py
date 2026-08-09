@@ -1,9 +1,15 @@
 """Direct Sparse-Sage tile routing for MiniMax H3 hybrid attention."""
 
-import math
 from dataclasses import dataclass
 
 import torch
+
+from .adaptive import (
+    AdaptiveDensityError,
+    allocate_adaptive_rows,
+    resolve_density_plan,
+)
+from .config import DENSITY_ADAPTIVE_BUDGET, DENSITY_FIXED
 
 Q_TILE = 128
 KV_TILE = 64
@@ -63,26 +69,24 @@ class SparseMaskMetadata:
     pure_video_q_tiles: int
     pure_video_kv_tiles: int
     retained_video_kv_tiles: int
+    density_mode: str = DENSITY_FIXED
+    configured_minimum_video_kv_tiles: int = 0
+    configured_maximum_video_kv_tiles: int = 0
+    configured_minimum_video_tile_density: float = 0.0
+    configured_maximum_video_tile_density: float = 0.0
+    adaptive_temperature: float = 1.0
+    adaptive_target_mass: float = 1.0
+    allocation: str = "fixed_topk"
 
     def as_dict(self):
-        return {
-            "requested_video_budget": self.requested_video_budget,
-            "actual_video_tile_density": self.actual_video_tile_density,
-            "full_mask_density": self.full_mask_density,
-            "dense_q_tiles": self.dense_q_tiles,
-            "sparse_q_tiles": self.sparse_q_tiles,
-            "q_tiles": self.q_tiles,
-            "kv_tiles": self.kv_tiles,
-            "pure_video_q_tiles": self.pure_video_q_tiles,
-            "pure_video_kv_tiles": self.pure_video_kv_tiles,
-            "retained_video_kv_tiles": self.retained_video_kv_tiles,
-        }
+        return dict(vars(self))
 
 
 class SparseTileRouter:
-    """Build one per-head route for each global 128-token query tile."""
+    """Build a per-head route for each global 128-token query tile."""
 
-    def __init__(self):
+    def __init__(self, config=None):
+        self.config = config
         self._geometry_cache = {}
 
     @staticmethod
@@ -100,33 +104,28 @@ class SparseTileRouter:
         cached = self._geometry_cache.get(signature)
         if cached is not None:
             return cached
-
         sequence = int(layout.seq_len)
         video_start, video_stop = (int(x) for x in layout.video_range)
         if sequence <= 0:
             raise SparseRouterError("packed sequence is empty")
         if not (0 <= video_start < video_stop == sequence):
             raise SparseRouterError(
-                "Sparse Sage requires H3 target video to be the final packed segment; "
-                "got video=%s sequence=%d" % (tuple(layout.video_range), sequence)
+                "Sparse Sage requires H3 target video to be the final packed "
+                "segment; got video=%s sequence=%d"
+                % (tuple(layout.video_range), sequence)
             )
-
-        q_tiles = (sequence + Q_TILE - 1) // Q_TILE
-        kv_tiles = (sequence + KV_TILE - 1) // KV_TILE
-        pure_q_start = (video_start + Q_TILE - 1) // Q_TILE
-        pure_kv_start = (video_start + KV_TILE - 1) // KV_TILE
         geometry = SparseTileGeometry(
             signature=signature,
             sequence=sequence,
-            q_tiles=q_tiles,
-            kv_tiles=kv_tiles,
-            pure_video_q_start=pure_q_start,
-            pure_video_kv_start=pure_kv_start,
+            q_tiles=(sequence + Q_TILE - 1) // Q_TILE,
+            kv_tiles=(sequence + KV_TILE - 1) // KV_TILE,
+            pure_video_q_start=(video_start + Q_TILE - 1) // Q_TILE,
+            pure_video_kv_start=(video_start + KV_TILE - 1) // KV_TILE,
         )
         if not geometry.pure_video_q_tiles or not geometry.pure_video_kv_tiles:
             raise SparseRouterError(
-                "packed layout has no pure-video Sparse Sage tiles: video=%s sequence=%d"
-                % (tuple(layout.video_range), sequence)
+                "packed layout has no pure-video Sparse Sage tiles: video=%s "
+                "sequence=%d" % (tuple(layout.video_range), sequence)
             )
         self._geometry_cache[signature] = geometry
         return geometry
@@ -148,28 +147,75 @@ class SparseTileRouter:
         return pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=-2)
 
     @staticmethod
-    def _metadata(geometry, video_budget, retained):
+    def _metadata(geometry, video_budget, plan):
+        # Shared-block reporting in h3_runtime.block_dispatch still passes the
+        # established scalar retained count. Preserve that internal contract
+        # for fixed compiled routing while allowing eager adaptive callers to
+        # pass a complete DensityPlan.
+        if isinstance(plan, int):
+            retained = int(plan)
+            plan = DensityPlan(
+                DENSITY_FIXED, retained, retained, retained, 1.0, 1.0
+            )
         pure_q = geometry.pure_video_q_tiles
         pure_kv = geometry.pure_video_kv_tiles
-        sparse_q = pure_q if retained < pure_kv else 0
-        dense_q = geometry.q_tiles - sparse_q
+        sparse_q = pure_q if plan.target < pure_kv else 0
         non_video_kv = geometry.kv_tiles - pure_kv
         true_blocks = (
             (geometry.q_tiles - pure_q) * geometry.kv_tiles
-            + pure_q * (non_video_kv + retained)
+            + pure_q * (non_video_kv + plan.target)
         )
         return SparseMaskMetadata(
             requested_video_budget=float(video_budget),
-            actual_video_tile_density=float(retained) / pure_kv,
-            full_mask_density=float(true_blocks) / (geometry.q_tiles * geometry.kv_tiles),
-            dense_q_tiles=dense_q,
+            actual_video_tile_density=float(plan.target) / pure_kv,
+            full_mask_density=float(true_blocks)
+            / (geometry.q_tiles * geometry.kv_tiles),
+            dense_q_tiles=geometry.q_tiles - sparse_q,
             sparse_q_tiles=sparse_q,
             q_tiles=geometry.q_tiles,
             kv_tiles=geometry.kv_tiles,
             pure_video_q_tiles=pure_q,
             pure_video_kv_tiles=pure_kv,
-            retained_video_kv_tiles=retained,
+            retained_video_kv_tiles=plan.target,
+            density_mode=plan.mode,
+            configured_minimum_video_kv_tiles=plan.minimum,
+            configured_maximum_video_kv_tiles=plan.maximum,
+            configured_minimum_video_tile_density=float(plan.minimum) / pure_kv,
+            configured_maximum_video_tile_density=float(plan.maximum) / pure_kv,
+            adaptive_temperature=plan.temperature,
+            adaptive_target_mass=plan.target_mass,
+            allocation=(
+                "mass_bisection_exact_budget"
+                if plan.mode == DENSITY_ADAPTIVE_BUDGET
+                else "fixed_topk"
+            ),
         )
+
+    @staticmethod
+    def _dense_lut(source, geometry, metadata):
+        batch, heads = source.shape[:2]
+        dense = torch.arange(
+            geometry.kv_tiles, device=source.device, dtype=torch.int32
+        )
+        delta = torch.cat((dense[:1], dense[1:] - dense[:-1]))
+        lut = delta.view(1, 1, 1, -1).expand(
+            batch, heads, geometry.q_tiles, -1
+        ).clone()
+        valid = torch.full(
+            (batch, heads, geometry.q_tiles),
+            geometry.kv_tiles,
+            dtype=torch.int32,
+            device=source.device,
+        )
+        return lut.contiguous(), valid.contiguous(), metadata
+
+    def _plan(self, video_budget, geometry):
+        try:
+            return resolve_density_plan(
+                self.config, video_budget, geometry.pure_video_kv_tiles
+            )
+        except AdaptiveDensityError as exc:
+            raise SparseRouterError(str(exc)) from exc
 
     def build_lut(self, q, k, layout, video_budget):
         if q.ndim != 4 or k.ndim != 4:
@@ -181,30 +227,25 @@ class SparseTileRouter:
             )
         if not 0.0 < float(video_budget) <= 1.0:
             raise SparseRouterError("video_budget must be in (0, 1]")
-
         geometry = self.geometry(layout)
         if q.shape[-2] != geometry.sequence:
             raise SparseRouterError(
                 "runtime layout sequence %d does not match Q/K sequence %d"
                 % (geometry.sequence, q.shape[-2])
             )
-
-        retained = min(
-            geometry.pure_video_kv_tiles,
-            math.ceil(float(video_budget) * geometry.pure_video_kv_tiles),
-        )
-        if retained == geometry.pure_video_kv_tiles:
-            return self._build_lut_from_summaries(
-                q, k, geometry, video_budget
-            )
-        q_means = self._mean_pool(q, Q_TILE)
-        k_means = self._mean_pool(k, KV_TILE)
+        plan = self._plan(video_budget, geometry)
+        metadata = self._metadata(geometry, video_budget, plan)
+        if plan.target == geometry.pure_video_kv_tiles:
+            return self._dense_lut(q, geometry, metadata)
         return self._build_lut_from_summaries(
-            q_means, k_means, geometry, video_budget
+            self._mean_pool(q, Q_TILE),
+            self._mean_pool(k, KV_TILE),
+            geometry,
+            video_budget,
         )
 
     def build_lut_from_summaries(self, q_summary, k_summary, layout, video_budget):
-        """Build the identical route from projection-emitted tile means."""
+        """Build the same route from projection-emitted tile means."""
         if q_summary.ndim != 4 or k_summary.ndim != 4:
             raise SparseRouterError("tile router summaries must be rank-4 HND tensors")
         if q_summary.shape[:2] != k_summary.shape[:2]:
@@ -215,7 +256,6 @@ class SparseTileRouter:
             raise SparseRouterError("Q/K router summary devices differ")
         if not 0.0 < float(video_budget) <= 1.0:
             raise SparseRouterError("video_budget must be in (0, 1]")
-
         geometry = self.geometry(layout)
         expected_q = (geometry.q_tiles, q_summary.shape[-1])
         expected_k = (geometry.kv_tiles, k_summary.shape[-1])
@@ -233,13 +273,44 @@ class SparseTileRouter:
             q_summary, k_summary, geometry, video_budget
         )
 
+    @staticmethod
+    def _pack_rows(indices, counts, geometry, dense, dense_delta):
+        batch, heads = indices.shape[:2]
+        rank = torch.arange(
+            indices.shape[-1], device=indices.device, dtype=torch.int32
+        )
+        active = rank < counts[..., None]
+        absolute = indices.to(torch.int32) + geometry.pure_video_kv_start
+        sentinel = torch.full_like(absolute, geometry.kv_tiles)
+        selected = sort_selected_indices(
+            torch.where(active, absolute, sentinel)
+        )
+        last = torch.gather(
+            selected,
+            dim=-1,
+            index=(counts.to(torch.long) - 1)[..., None],
+        )
+        selected = torch.where(active, selected, last)
+        context_count = geometry.pure_video_kv_start
+        context = dense[:context_count]
+        previous = context[-1] if context.numel() else 0
+        selected_delta = torch.cat((
+            selected[..., :1] - previous,
+            selected[..., 1:] - selected[..., :-1],
+        ), dim=-1)
+        if not context_count:
+            return selected_delta
+        context_delta = dense_delta[:context_count].view(
+            1, 1, 1, -1
+        ).expand(batch, heads, geometry.pure_video_q_tiles, -1)
+        return torch.cat((context_delta, selected_delta), dim=-1)
+
     def _build_lut_from_summaries(self, q_means, k_means, geometry, video_budget):
         batch, heads = q_means.shape[:2]
-        pure_kv = geometry.pure_video_kv_tiles
-        retained = min(pure_kv, math.ceil(float(video_budget) * pure_kv))
-        metadata = self._metadata(geometry, video_budget, retained)
-        # Every row is represented directly as sorted block indices.  The
-        # low-level kernel consumes deltas, so [0, 1, 1, ...] is the dense row.
+        plan = self._plan(video_budget, geometry)
+        metadata = self._metadata(geometry, video_budget, plan)
+        if plan.target == geometry.pure_video_kv_tiles:
+            return self._dense_lut(q_means, geometry, metadata)
         dense = torch.arange(
             geometry.kv_tiles, device=q_means.device, dtype=torch.int32
         )
@@ -248,37 +319,34 @@ class SparseTileRouter:
             batch, heads, geometry.q_tiles, -1
         ).clone()
         valid = torch.full(
-            (batch, heads, geometry.q_tiles), geometry.kv_tiles,
-            dtype=torch.int32, device=q_means.device
+            (batch, heads, geometry.q_tiles),
+            geometry.kv_tiles,
+            dtype=torch.int32,
+            device=q_means.device,
         )
-        context = dense[: geometry.pure_video_kv_start]
-        if retained == pure_kv:
-            selected = context
+        scores = torch.matmul(
+            q_means[..., geometry.pure_video_q_start:, :],
+            k_means[..., geometry.pure_video_kv_start:, :].transpose(-1, -2),
+        )
+        if plan.mode == DENSITY_FIXED:
+            indices = torch.topk(scores, plan.target, dim=-1).indices
+            counts = torch.full(
+                scores.shape[:-1],
+                plan.target,
+                dtype=torch.int32,
+                device=scores.device,
+            )
         else:
-            scores = torch.matmul(
-                q_means[..., geometry.pure_video_q_start:, :],
-                k_means[..., geometry.pure_video_kv_start:, :].transpose(-1, -2),
+            counts, indices = allocate_adaptive_rows(
+                scores, plan, q_means.shape[-1]
             )
-            selected = sort_selected_indices(
-                torch.topk(scores, retained, dim=-1).indices
-            )
-            selected = selected.to(torch.int32) + geometry.pure_video_kv_start
-
-        if retained < pure_kv:
-            # Context tiles are a dense prefix.  Selected video tiles are
-            # sorted absolute indices, then converted to deltas in one batch.
-            previous = context[-1] if context.numel() else 0
-            sparse_rows = torch.cat((
-                dense_delta[: geometry.pure_video_kv_start].view(1, 1, 1, -1).expand(
-                    batch, heads, geometry.pure_video_q_tiles, -1
-                ),
-                torch.cat((
-                    selected[..., :, :1] - previous,
-                    selected[..., :, 1:] - selected[..., :, :-1],
-                ), dim=-1),
-            ), dim=-1)
-            lut[..., geometry.pure_video_q_start:, : sparse_rows.shape[-1]].copy_(
-                sparse_rows
-            )
-            valid[..., geometry.pure_video_q_start:] = geometry.pure_video_kv_start + retained
+        sparse_rows = self._pack_rows(
+            indices, counts, geometry, dense, dense_delta
+        )
+        lut[..., geometry.pure_video_q_start:, :sparse_rows.shape[-1]].copy_(
+            sparse_rows
+        )
+        valid[..., geometry.pure_video_q_start:] = (
+            geometry.pure_video_kv_start + counts
+        )
         return lut.contiguous(), valid.contiguous(), metadata
