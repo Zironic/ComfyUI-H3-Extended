@@ -20,7 +20,7 @@ def _mean(records, key):
     return sum(float(row[key]) for row in records) / len(records) if records else 0.0
 
 
-def summarize(records, seconds=None, timing=None):
+def summarize(records, seconds=None, timing=None, route_summary=None):
     layers = sorted({int(row["layer"]) for row in records})
     steps = sorted({int(row["step"]) for row in records if int(row["step"]) >= 0})
     full = [float(row["full_mask_density"]) for row in records]
@@ -41,6 +41,7 @@ def summarize(records, seconds=None, timing=None):
         "max_full_mask_density": max(full) if full else None,
         "min_video_tile_density": min(video) if video else None,
         "max_video_tile_density": max(video) if video else None,
+        "adaptive_routing": route_summary,
         "request_seconds": None if seconds is None else float(seconds),
         "timing": timing or {
             "enabled": False,
@@ -59,6 +60,10 @@ def summarize(records, seconds=None, timing=None):
             ),
         },
     }
+
+
+def _percent(value):
+    return 100.0 * float(value)
 
 
 def render(payload):
@@ -84,6 +89,89 @@ def render(payload):
             "max packed mask density: %.3f%%" % (
                 100 * summary["max_full_mask_density"]),
         ])
+
+    routing = summary.get("adaptive_routing") or {}
+    if routing.get("observed"):
+        lines.extend(["", "Adaptive routing telemetry"])
+        if routing.get("mixed_geometry"):
+            lines.append(
+                "adaptive telemetry unavailable: %s"
+                % routing.get("error", "mixed route geometries")
+            )
+        else:
+            changed = int(routing.get("rows_changed_from_target", 0))
+            row_count = int(routing.get("row_count", 0))
+            lines.extend([
+                "adaptive reallocation observed: %s" % (
+                    "yes" if routing.get("adaptive_reallocation_observed") else "no"
+                ),
+                "adaptive rows: %d across %d attention calls" % (
+                    row_count, int(routing.get("records", 0))
+                ),
+                "target row K: %d / %d (%.3f%%)" % (
+                    int(routing["target_video_kv_tiles"]),
+                    int(routing["pure_video_kv_tiles"]),
+                    _percent(routing["target_video_tile_density"]),
+                ),
+                "actual row K: min %d | p05 %d | p25 %d | p50 %d | "
+                "p75 %d | p95 %d | max %d" % (
+                    int(routing["min_video_kv_tiles"]),
+                    int(routing["p05_video_kv_tiles"]),
+                    int(routing["p25_video_kv_tiles"]),
+                    int(routing["p50_video_kv_tiles"]),
+                    int(routing["p75_video_kv_tiles"]),
+                    int(routing["p95_video_kv_tiles"]),
+                    int(routing["max_video_kv_tiles"]),
+                ),
+                "actual row density: min %.3f%% | p05 %.3f%% | p25 %.3f%% | "
+                "p50 %.3f%% | p75 %.3f%% | p95 %.3f%% | max %.3f%%" % (
+                    _percent(routing["min_video_tile_density"]),
+                    _percent(routing["p05_video_tile_density"]),
+                    _percent(routing["p25_video_tile_density"]),
+                    _percent(routing["p50_video_tile_density"]),
+                    _percent(routing["p75_video_tile_density"]),
+                    _percent(routing["p95_video_tile_density"]),
+                    _percent(routing["max_video_tile_density"]),
+                ),
+                "row K mean/std: %.3f / %.3f; unique K values: %d" % (
+                    float(routing["mean_video_kv_tiles"]),
+                    float(routing["std_video_kv_tiles"]),
+                    int(routing["unique_video_kv_tile_counts"]),
+                ),
+                "rows below/equal/above target: %d / %d / %d; changed %d (%.3f%%)" % (
+                    int(routing["rows_below_target"]),
+                    int(routing["rows_equal_target"]),
+                    int(routing["rows_above_target"]),
+                    changed,
+                    _percent(routing["rows_changed_from_target_rate"]),
+                ),
+                "rows at min/max rails: %d (%.3f%%) / %d (%.3f%%)" % (
+                    int(routing["rows_at_minimum_rail"]),
+                    _percent(routing["rows_at_minimum_rail_rate"]),
+                    int(routing["rows_at_maximum_rail"]),
+                    _percent(routing["rows_at_maximum_rail_rate"]),
+                ),
+            ])
+            for step in routing.get("per_step", ()):
+                lines.append(
+                    "adaptive step %d: K min %d / p50 %d / max %d, std %.3f, "
+                    "changed %.3f%%, min-rail %.3f%%, max-rail %.3f%%"
+                    % (
+                        int(step["step_index"]),
+                        int(step["min_video_kv_tiles"]),
+                        int(step["p50_video_kv_tiles"]),
+                        int(step["max_video_kv_tiles"]),
+                        float(step["std_video_kv_tiles"]),
+                        _percent(step["rows_changed_from_target_rate"]),
+                        _percent(step["rows_at_minimum_rail_rate"]),
+                        _percent(step["rows_at_maximum_rail_rate"]),
+                    )
+                )
+            lines.append(
+                "per-layer adaptive row distributions are in "
+                "summary.adaptive_routing.per_layer in report.json."
+            )
+
     lines.extend([
         "",
         "Phase A uses direct 128Q x 64KV Sparse Sage routing.",
@@ -155,7 +243,7 @@ def render(payload):
 
 
 def write_request(output_root, run_tag, timestamp, request_id, records, seconds=None,
-                  timing=None):
+                  timing=None, route_summary=None):
     tag = validate_run_tag(run_tag)
     directory = os.path.join(output_root, "%s_%s" % (tag, timestamp))
     os.makedirs(directory, exist_ok=False)
@@ -164,7 +252,9 @@ def write_request(output_root, run_tag, timestamp, request_id, records, seconds=
         "mode": "sage128",
         "run_tag": tag,
         "request_id": int(request_id),
-        "summary": summarize(records, seconds, timing),
+        "summary": summarize(
+            records, seconds, timing, route_summary=route_summary
+        ),
         "records": list(records),
     }
     with open(os.path.join(directory, "report.json"), "w", encoding="utf-8") as handle:
