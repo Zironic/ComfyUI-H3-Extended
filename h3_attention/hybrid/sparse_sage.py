@@ -20,6 +20,15 @@ class SparseSageAPI:
     low_level_f32: object
     v_fused: object = None
 
+    @property
+    def signature(self):
+        return (
+            str(self.version),
+            id(self.low_level_f16),
+            id(self.low_level_f32),
+            id(self.v_fused),
+        )
+
 
 @dataclass
 class PreparedSparseSage:

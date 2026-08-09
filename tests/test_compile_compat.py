@@ -177,6 +177,17 @@ def test_shared_block_compile_request_and_configuration():
             "configured shared block compiler remains recognized",
         )
         check(len(calls) == 1, "shared dispatcher is not installed twice")
+        try:
+            compile_compat.configure_shared_block_inductor(
+                model,
+                backend="changed-hybrid",
+                activation_config="convrot",
+            )
+        except RuntimeError as exc:
+            check("configured differently" in str(exc),
+                  "changed compile configuration is rejected")
+        else:
+            raise AssertionError("changed compile configuration retained stale dispatcher")
     finally:
         compile_compat.install_shared_block_dispatch = original
 

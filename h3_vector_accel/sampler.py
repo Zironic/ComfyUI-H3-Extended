@@ -1,6 +1,6 @@
 """Deterministic Euler-compatible H3 vector acceleration loop."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 import time
 
@@ -16,6 +16,7 @@ from .fingerprint import (
 )
 from .policy import make_policy
 from .predictor import make_predictor
+from .repairability import ProfileCompatibility, RepairabilityProfile
 
 
 @dataclass(frozen=True)
@@ -24,6 +25,8 @@ class H3SamplingContext:
     is_h3_flow_av: bool
     latent_shapes: object = None
     audio_scale: float | None = None
+    video_shift: float | None = None
+    audio_shift: float | None = None
     model_fingerprint: str = "unknown"
 
 
@@ -112,11 +115,20 @@ def resolve_h3_sampling(model, latent_shapes=None) -> H3SamplingContext:
             audio_scale = float(audio_scale)
         except (TypeError, ValueError):
             audio_scale = None
+    video_shift = getattr(sampling, "shift", None)
+    audio_shift = getattr(sampling, "audio_shift", None)
+    try:
+        video_shift = None if video_shift is None else float(video_shift)
+        audio_shift = None if audio_shift is None else float(audio_shift)
+    except (TypeError, ValueError):
+        video_shift = audio_shift = None
     return H3SamplingContext(
         sampling,
         is_flow_av,
         latent_shapes,
         audio_scale,
+        video_shift,
+        audio_shift,
         model_fingerprint(sampling_owner),
     )
 
@@ -208,8 +220,22 @@ def sample_vector_accel(model, x, sigmas, extra_args=None, callback=None, disabl
         if not context.latent_shapes or len(context.latent_shapes) < 2:
             raise RuntimeError("forecast methods require video and audio latent_shapes")
 
-    predictor = make_predictor(config.method) if config.method != "native" else None
-    policy = make_policy(config)
+    profile = None
+    if config.policy == "adaptive_repair":
+        profile = RepairabilityProfile.load(config.repairability_profile)
+        profile.validate_compatibility(ProfileCompatibility(
+            model_fingerprint=context.model_fingerprint,
+            sigma_hash=sigma_hash(sigma_values),
+            video_shift=context.video_shift,
+            audio_shift=context.audio_shift,
+            nominal_steps=logical_steps,
+            predictor_method=config.method,
+            conditioning_mode=config.conditioning_mode,
+        ))
+        config = replace(config, adaptive_profile_hash=profile.hash)
+
+    predictor = make_predictor(config.method, latent_shapes=context.latent_shapes) if config.method != "native" else None
+    policy = make_policy(config, profile=profile, logical_steps=logical_steps)
     policy.reset()
     if predictor is not None:
         predictor.reset()
@@ -233,7 +259,11 @@ def sample_vector_accel(model, x, sigmas, extra_args=None, callback=None, disabl
     for i in range(logical_steps):
         sigma = sigma_values[i]
         sigma_next = sigma_values[i + 1]
-        decision = policy.decide(i)
+        decision = policy.decide(
+            i,
+            predictor_ready=bool(predictor is not None and predictor.ready()),
+            diagnostics_state=diagnostics.policy_state(),
+        )
         counterfactual = None
         fallback_reason = None
         use_forecast = False
@@ -254,7 +284,7 @@ def sample_vector_accel(model, x, sigmas, extra_args=None, callback=None, disabl
         if use_forecast:
             denoised = x - _sigma_broadcast(sigma, x) * counterfactual.derivative
             x_next = predictor.integrate(x, sigma, sigma_next, counterfactual)
-            actual_anchor_index = len(predictor.history) - 1
+            actual_anchor_index = true_nfe - 1
         else:
             model_started = time.perf_counter()
             denoised = model(x, sigma * s_in, **extra_args)
@@ -264,13 +294,20 @@ def sample_vector_accel(model, x, sigmas, extra_args=None, callback=None, disabl
                 raise RuntimeError(f"model returned a non-finite derivative at step {i}")
             true_nfe += 1
             if predictor is not None:
-                diagnostics.observe_actual_anchor(i, _scalar_sigma(sigma), x=x,
-                                                  actual_derivative=derivative,
-                                                  counterfactual=counterfactual,
-                                                  previous_actual_sigma=predictor.last_actual_sigma,
-                                                  fallback_reason=fallback_reason)
+                previous_actual_sigma = predictor.last_actual_sigma
+                anchor_row = diagnostics.observe_actual_anchor(
+                    i, _scalar_sigma(sigma), x=x,
+                    actual_derivative=derivative,
+                    counterfactual=counterfactual,
+                    previous_actual_sigma=previous_actual_sigma,
+                    fallback_reason=fallback_reason,
+                    policy_reason=decision.reason,
+                    policy_risk=decision.risk,
+                )
+                prediction_metrics = anchor_row.get("prediction_metrics")
+                policy.observe_actual(i, prediction_metrics=prediction_metrics)
                 predictor.observe_actual(x, sigma, derivative)
-                actual_anchor_index = len(predictor.history) - 1
+                actual_anchor_index = true_nfe - 1
             else:
                 actual_anchor_index = i
             x_next = x + derivative * (sigma_next - sigma)
@@ -285,6 +322,9 @@ def sample_vector_accel(model, x, sigmas, extra_args=None, callback=None, disabl
             "h3_vector_actual_anchor_index": actual_anchor_index,
             "h3_vector_method": config.method,
             "h3_vector_profile": config.evaluation_profile,
+            "h3_vector_policy": config.policy,
+            "h3_vector_policy_reason": decision.reason,
+            "h3_vector_policy_risk": decision.risk,
             "h3_vector_fallback_reason": fallback_reason,
         }
         if callback is not None:
@@ -297,7 +337,12 @@ def sample_vector_accel(model, x, sigmas, extra_args=None, callback=None, disabl
         diagnostics.observe_step(i, _scalar_sigma(sigma), use_forecast, true_nfe,
                                  fallback_reason=fallback_reason,
                                  actual_anchor_index=actual_anchor_index,
-                                 method=config.method, profile=config.evaluation_profile)
+                                 method=config.method, profile=config.evaluation_profile,
+                                 policy=config.policy, policy_reason=decision.reason,
+                                 policy_risk=decision.risk,
+                                 video_risk=decision.video_risk,
+                                 audio_risk=decision.audio_risk)
+        policy.observe_step(use_forecast)
         x = x_next
     wall_seconds = time.perf_counter() - started
     diagnostics.finish_run(

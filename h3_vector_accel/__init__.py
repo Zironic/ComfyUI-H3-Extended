@@ -6,6 +6,13 @@ from .predictor import (
     HoldPredictor,
     LinearVelocityPredictor,
     Prediction,
+    VDEPredictor,
+)
+from .repairability import (
+    NativeTrajectory,
+    RepairabilityProfile,
+    capture_native_trajectory,
+    run_repairability_sweep,
 )
 from .sampler import H3SamplingContext, resolve_h3_sampling, sample_vector_accel
 
@@ -16,6 +23,11 @@ __all__ = [
     "Prediction",
     "HoldPredictor",
     "LinearVelocityPredictor",
+    "VDEPredictor",
+    "NativeTrajectory",
+    "RepairabilityProfile",
+    "capture_native_trajectory",
+    "run_repairability_sweep",
     "H3SamplingContext",
     "resolve_h3_sampling",
     "sample_vector_accel",

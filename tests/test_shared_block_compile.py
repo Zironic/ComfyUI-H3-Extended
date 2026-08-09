@@ -31,7 +31,7 @@ def _topology():
     return BlockTopology(
         hidden_size=512, ffn_size=512, timestep_dim=64, heads=2, head_dim=128,
         norm_eps=1e-5, qk_norm_eps=1e-6, adaln_apply_silu=True,
-        adaln_out_features=9216, rope_strides=(128, 1, 2, 3), has_rope=True,
+        adaln_out_features=9216, rope_strides=(192, 4, 2, 1), has_rope=True,
         router_geometry=geometry, video_budget=0.5,
         mod_segments=((0, 128, 0), (128, 256, 1)),
         mlp_chunks=((0, 128, 0), (128, 256, 1)),
@@ -118,8 +118,46 @@ def test_signature_rejects_metadata_and_accepts_structural_fake_blocks():
     else:
         raise AssertionError("changed carrier shape was accepted")
 
+    changed = list(_carriers())
+    changed[5] = _tensor((1,), torch.float32)
+    try:
+        build_block_signature(tuple(changed), topology)
+    except H3BlockError as exc:
+        assert "exactly 768" in str(exc)
+    else:
+        raise AssertionError("scalar QKV scale was accepted")
+
+    changed = list(_carriers())
+    changed[5] = _tensor((768, 1), torch.float32)
+    try:
+        build_block_signature(tuple(changed), topology)
+    except H3BlockError as exc:
+        assert "exactly 768" in str(exc)
+    else:
+        raise AssertionError("multidimensional QKV scale was accepted")
+
+
+def test_runtime_contract_rejects_specialization_drift():
+    topology = _topology()
+    compiled = make_compiled_block(
+        topology,
+        _carriers(),
+        compiler=lambda fn, **_kwargs: fn,
+    )
+    x = _tensor((256, 512), torch.bfloat16)
+    t_emb = _tensor((1, 64), torch.bfloat16)
+    rope = _tensor((1, 256, 1, 48, 2, 2), torch.bfloat16)
+    compiled(x, t_emb, rope, _carriers())
+    try:
+        compiled(x, _tensor((1, 64), torch.float16), rope, _carriers())
+    except H3BlockError as exc:
+        assert "timestep" in str(exc)
+    else:
+        raise AssertionError("FP16 timestep specialization was accepted")
+
 
 if __name__ == "__main__":
     test_shared_callable_reuses_one_graph_for_distinct_bindings()
     test_signature_rejects_metadata_and_accepts_structural_fake_blocks()
+    test_runtime_contract_rejects_specialization_drift()
     print("shared block CPU tests passed")

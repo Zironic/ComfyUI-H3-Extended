@@ -15,6 +15,35 @@ BACKEND_MARKER = "minimax_h3_cuda_only_inductor"
 REQUEST_MARKER = "minimax_h3_shared_block_compile_requested"
 
 
+def _installation_signature(value):
+    if value is None:
+        return None
+    signature = getattr(value, "installation_signature", None)
+    if callable(signature):
+        signature = signature()
+    if signature is not None:
+        return signature
+    signature = getattr(value, "signature", None)
+    if callable(signature):
+        signature = signature()
+    if signature is not None:
+        return signature
+    return (
+        type(value).__module__,
+        type(value).__qualname__,
+        getattr(value, "name", value if isinstance(value, str) else None),
+    )
+
+
+def _compile_signature(compile_config, backend, activation_config):
+    return (
+        tuple(sorted(compile_config.items())),
+        _installation_signature(backend),
+        _installation_signature(activation_config),
+        (cuda_only_inductor.__module__, cuda_only_inductor.__qualname__),
+    )
+
+
 def _tensor_devices(value, devices):
     if torch.is_tensor(value):
         devices.add(value.device.type)
@@ -77,8 +106,6 @@ def configure_shared_block_inductor(
     adaln_provider=None,
     block_cache=None,
 ):
-    if model_patcher.model_options.get(BACKEND_MARKER):
-        return True
     compile_config = model_patcher.model_options.get(REQUEST_MARKER)
     if not compile_config:
         return False
@@ -92,6 +119,16 @@ def configure_shared_block_inductor(
         raise RuntimeError(
             "H3 shared block compilation does not yet support FirstBlockCache"
         )
+    desired_signature = _compile_signature(
+        compile_config, backend, activation_config
+    )
+    installed_signature = model_patcher.model_options.get(BACKEND_MARKER)
+    if installed_signature is not None:
+        if installed_signature == desired_signature:
+            return True
+        raise RuntimeError(
+            "H3 shared block compilation is already configured differently"
+        )
 
     model_patcher.remove_wrappers_with_key(WrappersMP.APPLY_MODEL, COMPILE_KEY)
     install_shared_block_dispatch(
@@ -101,7 +138,7 @@ def configure_shared_block_inductor(
         cuda_only_inductor,
     )
     model_patcher.model_options.pop("disable_dynamic_vbar_prefetch", None)
-    model_patcher.model_options[BACKEND_MARKER] = True
+    model_patcher.model_options[BACKEND_MARKER] = desired_signature
     logging.info(
         "%s Inductor will reuse one CUDA tensor program across all H3 main blocks",
         LOG_PREFIX,

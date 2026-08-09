@@ -2,6 +2,7 @@
 
 import os
 import sys
+from collections import OrderedDict
 from types import SimpleNamespace
 
 import torch
@@ -182,6 +183,84 @@ def test_install_replaces_fifty_block_closures_with_one_dispatcher():
     }) == 1
 
 
+def test_staged_carriers_must_not_overlap():
+    stream = object()
+    backing = torch.empty((32,), dtype=torch.bfloat16)
+    first = SimpleNamespace(handle=(stream,))
+    second = SimpleNamespace(handle=(stream,))
+    try:
+        dispatch._validate_acquired_storage((
+            ("first", first, (backing[:20],)),
+            ("second", second, (backing[16:],)),
+        ))
+    except dispatch.UnsafeSharedCarriers as exc:
+        assert "first" in str(exc) and "second" in str(exc)
+    else:
+        raise AssertionError("overlapping staged carriers were accepted")
+
+    dispatch._validate_acquired_storage((
+        ("first", first, (backing[:16],)),
+        ("second", second, (backing[16:],)),
+    ))
+    resident = SimpleNamespace(handle=(None,))
+    dispatch._validate_acquired_storage((
+        ("first", resident, (backing[:20],)),
+        ("second", resident, (backing[16:],)),
+    ))
+
+
+def test_variant_cache_is_bounded_and_resettable():
+    shared = object.__new__(dispatch.SharedBlockDispatcher)
+    shared._variants = OrderedDict()
+    shared._compile_counts = {}
+    shared.compile_backend = lambda graph, inputs: graph.forward
+    original_build = dispatch.build_block_signature
+    original_runtime = dispatch.validate_runtime_signature
+    original_make = dispatch.make_compiled_block
+    dispatch.build_block_signature = lambda carriers, topology: topology.signature
+    dispatch.validate_runtime_signature = lambda topology, x, t_emb, rope: (topology.signature,)
+    dispatch.make_compiled_block = lambda *args, **kwargs: object()
+    try:
+        for index in range(dispatch.MAX_SHARED_VARIANTS + 2):
+            topology = SimpleNamespace(signature=(index,))
+            shared._variant(topology, (), None, None, None)
+        assert len(shared._variants) == dispatch.MAX_SHARED_VARIANTS
+        assert (((0,), ((0,),))) not in shared._variants
+        shared.reset()
+        assert not shared._variants and not shared._compile_counts
+    finally:
+        dispatch.build_block_signature = original_build
+        dispatch.validate_runtime_signature = original_runtime
+        dispatch.make_compiled_block = original_make
+
+
+def test_unsafe_staging_falls_back_to_eager():
+    class Dispatcher:
+        activation_config = SimpleNamespace(signature=("activation",))
+
+        def __init__(self):
+            self.staged_carriers_unsafe = False
+            self.calls = 0
+
+        def __call__(self, *args):
+            self.calls += 1
+            self.staged_carriers_unsafe = True
+            raise dispatch.UnsafeSharedCarriers("synthetic overlap")
+
+    eager_calls = []
+
+    def eager(*args):
+        eager_calls.append(args)
+        return "eager"
+
+    shared = Dispatcher()
+    forward = dispatch.make_shared_forward(object(), 0, shared, eager)
+    args = (object(), object(), (), object(), {})
+    assert forward(*args) == "eager"
+    assert forward(*args) == "eager"
+    assert shared.calls == 1 and len(eager_calls) == 2
+
+
 if __name__ == "__main__":
     original_quantized = dispatch.QuantizedTensor
     original_layout = dispatch.TensorWiseINT8Layout
@@ -190,6 +269,9 @@ if __name__ == "__main__":
     try:
         test_fifty_blocks_share_one_execution_signature()
         test_install_replaces_fifty_block_closures_with_one_dispatcher()
+        test_staged_carriers_must_not_overlap()
+        test_variant_cache_is_bounded_and_resettable()
+        test_unsafe_staging_falls_back_to_eager()
     finally:
         dispatch.QuantizedTensor = original_quantized
         dispatch.TensorWiseINT8Layout = original_layout

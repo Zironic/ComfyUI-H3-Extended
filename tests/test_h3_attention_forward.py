@@ -339,6 +339,28 @@ def test_patch_install():
     check(h3_patch.install(p) == 0, "re-installing is idempotent")
 
 
+def test_patch_configuration_identity():
+    print("patch configuration identity")
+
+    class Backend:
+        name = "hybrid_sparse"
+
+        def __init__(self, budget):
+            self.installation_signature = (self.name, float(budget))
+
+    p = build_patcher()
+    h3_patch.install(p, backend=Backend(0.5))
+    check(h3_patch.install(p, backend=Backend(0.5)) == 0,
+          "equivalent backend signatures remain idempotent")
+    try:
+        h3_patch.install(p, backend=Backend(0.25))
+    except h3_patch.H3PatchError as exc:
+        check("already patched" in str(exc),
+              "changed backend signature raises a configuration conflict")
+    else:
+        raise AssertionError("changed backend signature retained stale closures")
+
+
 def test_patch_conflict():
     print("patch conflict")
     p = build_patcher()
@@ -409,6 +431,7 @@ def main():
         test_projector_observer_fallback()
         test_deferred_projection_stage_counts()
         test_patch_install()
+        test_patch_configuration_identity()
         test_patch_conflict()
         test_patch_validation()
         test_training_rejected()

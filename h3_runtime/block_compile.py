@@ -15,6 +15,8 @@ from typing import NamedTuple
 import torch
 import torch.nn.functional as F
 
+import comfy.model_management
+
 try:
     from ..h3_activation_memory.config import ActivationMemoryConfig, MODE_CONVROT_2SLICE
     from ..h3_activation_memory.linear import (
@@ -200,13 +202,25 @@ def _contiguous_stride(shape):
 
 
 def _meta(tensor):
-    return (tuple(int(x) for x in tensor.shape), tuple(int(x) for x in tensor.stride()), tensor.dtype)
+    return (
+        tuple(int(x) for x in tensor.shape),
+        tuple(int(x) for x in tensor.stride()),
+        tensor.dtype,
+        str(tensor.device),
+    )
 
 
 @dataclass(frozen=True)
 class BlockSignature:
     topology: tuple
     carriers: tuple
+
+
+@dataclass(frozen=True)
+class RuntimeSignature:
+    x: tuple
+    t_emb: tuple
+    rope: tuple
 
 
 def _expect(name, tensor, shape, dtypes=None):
@@ -219,13 +233,16 @@ def _expect(name, tensor, shape, dtypes=None):
         raise H3BlockError("%s dtype mismatch: got %s" % (name, tensor.dtype))
 
 
-def _scale_shape_ok(name, tensor, rows):
+def _scale_shape_ok(name, tensor, rows, *, allow_scalar):
     if tensor.dtype != torch.float32:
         raise H3BlockError("%s dtype mismatch: expected torch.float32, got %s" % (name, tensor.dtype))
     shape = tuple(int(x) for x in tensor.shape)
-    if tensor.numel() != 1 and (not shape or shape[0] != int(rows)):
-        raise H3BlockError("%s must be scalar or have %d leading scales" % (name, rows))
-    if tuple(int(x) for x in tensor.stride()) != _contiguous_stride(shape):
+    accepted = shape == (int(rows),) or (allow_scalar and shape == (1,))
+    if not accepted:
+        if allow_scalar:
+            raise H3BlockError("%s must have exactly 1 or %d values" % (name, rows))
+        raise H3BlockError("%s must have exactly %d values" % (name, rows))
+    if not tensor.is_contiguous():
         raise H3BlockError("%s must be contiguous" % name)
 
 
@@ -238,20 +255,20 @@ def build_block_signature(carriers, topology: BlockTopology) -> BlockSignature:
     hidden, ffn, tdim = topology.hidden_size, topology.ffn_size, topology.timestep_dim
     inner = topology.heads * topology.head_dim
     adaln_width = topology.adaln_expand * hidden * topology.adaln_modalities
-    _expect("adaln_weight", values[0], (adaln_width, tdim), {torch.float16, torch.bfloat16, torch.float32})
-    _expect("adaln_bias", values[1], (adaln_width,), {torch.float16, torch.bfloat16, torch.float32})
-    _expect("norm1_weight", values[2], (hidden,), {torch.float16, torch.bfloat16, torch.float32})
-    _expect("norm2_weight", values[3], (hidden,), {torch.float16, torch.bfloat16, torch.float32})
+    _expect("adaln_weight", values[0], (adaln_width, tdim), {torch.bfloat16})
+    _expect("adaln_bias", values[1], (adaln_width,), {torch.bfloat16})
+    _expect("norm1_weight", values[2], (hidden,), {torch.bfloat16})
+    _expect("norm2_weight", values[3], (hidden,), {torch.bfloat16})
     _expect("qkv_qdata", values[4], (3 * inner, hidden), {torch.int8})
-    _scale_shape_ok("qkv_scale", values[5], 3 * inner)
-    _expect("q_norm_weight", values[6], (topology.head_dim,), {torch.float16, torch.bfloat16, torch.float32})
-    _expect("k_norm_weight", values[7], (topology.head_dim,), {torch.float16, torch.bfloat16, torch.float32})
+    _scale_shape_ok("qkv_scale", values[5], 3 * inner, allow_scalar=False)
+    _expect("q_norm_weight", values[6], (topology.head_dim,), {torch.bfloat16})
+    _expect("k_norm_weight", values[7], (topology.head_dim,), {torch.bfloat16})
     _expect("out_qdata", values[8], (hidden, inner), {torch.int8})
-    _scale_shape_ok("out_scale", values[9], hidden)
+    _scale_shape_ok("out_scale", values[9], hidden, allow_scalar=True)
     _expect("fc1_qdata", values[10], (2 * ffn, hidden), {torch.int8})
-    _scale_shape_ok("fc1_scale", values[11], 2 * ffn)
+    _scale_shape_ok("fc1_scale", values[11], 2 * ffn, allow_scalar=True)
     _expect("fc2_qdata", values[12], (hidden, ffn), {torch.int8})
-    _scale_shape_ok("fc2_scale", values[13], hidden)
+    _scale_shape_ok("fc2_scale", values[13], hidden, allow_scalar=True)
     if inner % topology.convrot_groupsize or ffn % (2 * topology.convrot_groupsize) or hidden % topology.convrot_groupsize:
         raise H3BlockError("ConvRot dimensions must be group-aligned (hidden=256, ffn=512)")
     return BlockSignature(topology.signature, tuple(_meta(value) for value in values))
@@ -266,6 +283,36 @@ def validate_block_signature(signature, carriers, topology: BlockTopology) -> Bl
     if current.carriers != signature.carriers:
         raise H3BlockError("H3 block carrier metadata signature mismatch")
     return current
+
+
+def validate_runtime_signature(topology: BlockTopology, x, t_emb, rope) -> RuntimeSignature:
+    if not all(torch.is_tensor(value) for value in (x, t_emb, rope)):
+        raise H3BlockError("shared H3 block runtime inputs must be tensors")
+    if (x.ndim != 2 or tuple(int(value) for value in x.shape) != (
+            int(topology.router_geometry.sequence), int(topology.hidden_size))):
+        raise H3BlockError("shared H3 block requires [sequence, hidden] input")
+    if x.dtype != torch.bfloat16 or x.device.type not in ("cuda", "meta"):
+        raise H3BlockError("shared H3 block requires a rank-2 CUDA BF16 input")
+    if not x.is_contiguous():
+        raise H3BlockError("shared H3 block input must be contiguous")
+    if (t_emb.ndim != 2 or int(t_emb.shape[0]) <= 0
+            or int(t_emb.shape[1]) != int(topology.timestep_dim)):
+        raise H3BlockError("shared H3 block timestep input has an invalid shape")
+    if t_emb.dtype != torch.bfloat16 or t_emb.device != x.device or not t_emb.is_contiguous():
+        raise H3BlockError("shared H3 block timestep input must be contiguous CUDA BF16")
+    expected_rope = (1, int(x.shape[0]), 1, 48, 2, 2)
+    if (topology.head_dim != 128 or tuple(int(value) for value in rope.shape) != expected_rope
+            or rope.dtype != torch.bfloat16 or rope.device != x.device):
+        raise H3BlockError("shared H3 block requires H3's 96-wide split-half RoPE")
+    rope_strides = (
+        int(rope.stride(1)), int(rope.stride(3)),
+        int(rope.stride(4)), int(rope.stride(5)),
+    )
+    if rope_strides != tuple(int(value) for value in topology.rope_strides):
+        raise H3BlockError("shared H3 block RoPE strides differ from its topology")
+    if x.device.type == "cuda" and comfy.model_management.in_training:
+        raise H3BlockError("shared H3 block compilation is inference-only")
+    return RuntimeSignature(_meta(x), _meta(t_emb), _meta(rope))
 
 
 def _rms_norm(x, weight, eps):
@@ -349,21 +396,34 @@ def _tensor_block(topology: BlockTopology, x, t_emb, rope, carriers):
 
 
 class CompiledBlock:
-    def __init__(self, topology, signature, compiled):
+    def __init__(self, topology, signature, runtime_signature, compiled):
         self.topology = topology
         self.signature = signature
+        self.runtime_signature = runtime_signature
         self._compiled = compiled
 
     def __call__(self, x, t_emb, rope, carriers):
-        validate_block_signature(self.signature, carriers, self.topology)
+        runtime_signature = validate_runtime_signature(self.topology, x, t_emb, rope)
+        if self.runtime_signature is None:
+            self.runtime_signature = runtime_signature
+        elif self.runtime_signature != runtime_signature:
+            raise H3BlockError("H3 block runtime tensor signature mismatch")
+        signature = validate_block_signature(self.signature, carriers, self.topology)
+        devices = {metadata[3] for metadata in signature.carriers}
+        if devices != {runtime_signature.x[3]}:
+            raise H3BlockError("H3 block carriers must share the runtime input device")
         return self._compiled(x, t_emb, rope, *carrier_tuple(carriers))
 
 
 def make_compiled_block(topology: BlockTopology, carriers=None, *, compiler=torch.compile,
-                        backend=None) -> CompiledBlock:
+                        backend=None, runtime_tensors=None) -> CompiledBlock:
     """Create one fullgraph/dynamic=False callable for one static topology."""
 
     signature = build_block_signature(carriers, topology) if carriers is not None else None
+    runtime_signature = (
+        validate_runtime_signature(topology, *runtime_tensors)
+        if runtime_tensors is not None else None
+    )
 
     def kernel(x, t_emb, rope, *carrier_values):
         return _tensor_block(topology, x, t_emb, rope, carrier_values)
@@ -380,14 +440,15 @@ def make_compiled_block(topology: BlockTopology, carriers=None, *, compiler=torc
                 if self.signature is None:
                     self.signature = build_block_signature(carriers, self.topology)
                 return super().__call__(x, t_emb, rope, carriers)
-        return _Lazy(topology, None, compiled)
-    return CompiledBlock(topology, signature, compiled)
+        return _Lazy(topology, None, runtime_signature, compiled)
+    return CompiledBlock(topology, signature, runtime_signature, compiled)
 
 
 compile_shared_block = make_compiled_block
 
 __all__ = [
-    "H3BlockError", "BlockCarriers", "BlockTopology", "BlockSignature",
+    "H3BlockError", "BlockCarriers", "BlockTopology", "BlockSignature", "RuntimeSignature",
     "carrier_tuple", "build_block_signature", "validate_block_signature",
+    "validate_runtime_signature",
     "CompiledBlock", "make_compiled_block", "compile_shared_block",
 ]

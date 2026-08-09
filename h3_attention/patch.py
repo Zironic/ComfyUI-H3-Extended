@@ -76,6 +76,28 @@ def key_for(index):
     return "%s.%d.attn.forward" % (BLOCKS_ATTR, index)
 
 
+def installation_signature(value):
+    if value is None:
+        return None
+    signature = getattr(value, "installation_signature", None)
+    if callable(signature):
+        signature = signature()
+    if signature is not None:
+        return signature
+    if callable(value):
+        function = getattr(value, "__func__", value)
+        return (
+            getattr(function, "__module__", type(function).__module__),
+            getattr(function, "__qualname__", type(function).__qualname__),
+            id(function),
+        )
+    return (
+        type(value).__module__,
+        type(value).__qualname__,
+        getattr(value, "name", None),
+    )
+
+
 def install(model_patcher, backend=None, attention=None, projector=None):
     """Patch every main block. Idempotent; foreign ownership is an error."""
     modules = validate(model_patcher)
@@ -83,6 +105,11 @@ def install(model_patcher, backend=None, attention=None, projector=None):
 
     desired_backend = getattr(backend, "name", None)
     desired_projector = getattr(projector, "name", None)
+    desired_signature = (
+        installation_signature(backend),
+        installation_signature(projector),
+        installation_signature(attention),
+    )
     ours = [
         index for index in range(len(modules))
         if getattr(existing.get(key_for(index)), "_h3_attention", False)
@@ -96,8 +123,13 @@ def install(model_patcher, backend=None, attention=None, projector=None):
             getattr(existing[key_for(index)], "_h3_projector", None)
             for index in ours
         }
+        installed_signatures = {
+            getattr(existing[key_for(index)], "_h3_installation_signature", None)
+            for index in ours
+        }
         if (installed_backends == {desired_backend}
-                and installed_projectors == {desired_projector}):
+                and installed_projectors == {desired_projector}
+                and installed_signatures == {desired_signature}):
             logging.info("[H3 attention] block forwards already patched (%d)", len(modules))
             return 0
         raise H3PatchError(
@@ -119,15 +151,17 @@ def install(model_patcher, backend=None, attention=None, projector=None):
             % (conflicts[0], len(conflicts) - 1))
 
     for index, attn in enumerate(modules):
+        forward = make_forward(
+            attn,
+            index,
+            backend=backend,
+            attention=attention,
+            projector=projector,
+        )
+        forward._h3_installation_signature = desired_signature
         model_patcher.add_object_patch(
             key_for(index),
-            make_forward(
-                attn,
-                index,
-                backend=backend,
-                attention=attention,
-                projector=projector,
-            ),
+            forward,
         )
 
     logging.info(

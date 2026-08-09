@@ -59,6 +59,49 @@ class HybridSparseBackend:
             low_level_selector=low_level_selector,
         )
 
+    @staticmethod
+    def _callable_signature(value):
+        if value is None:
+            return None
+        function = getattr(value, "__func__", value)
+        return (
+            getattr(function, "__module__", type(function).__module__),
+            getattr(function, "__qualname__", type(function).__qualname__),
+            id(function),
+        )
+
+    @property
+    def installation_signature(self):
+        collector = self.collector
+        projector = self.projector
+        api = self.executor.api
+        return (
+            self.name,
+            self.config.signature,
+            (type(self.router).__module__, type(self.router).__qualname__),
+            None if collector is None else (
+                type(collector).__module__,
+                type(collector).__qualname__,
+                str(collector.output_root),
+                str(collector.run_tag),
+            ),
+            getattr(api, "signature", (
+                str(getattr(api, "version", "unknown")),
+                id(getattr(api, "low_level_f16", None)),
+                id(getattr(api, "low_level_f32", None)),
+                id(getattr(api, "v_fused", None)),
+            )),
+            self._callable_signature(self.executor.qk_quantizer),
+            self._callable_signature(self.executor.v_preparer),
+            self._callable_signature(self.executor.low_level_selector),
+            None if projector is None else (
+                type(projector).__module__,
+                type(projector).__qualname__,
+                getattr(projector, "name", None),
+                self._callable_signature(getattr(projector, "tensor_core", None)),
+            ),
+        )
+
     def prepare(self, q, k, v, *, layer_index, transformer_options):
         snapshot = get_runtime_snapshot(transformer_options)
         if snapshot is None:

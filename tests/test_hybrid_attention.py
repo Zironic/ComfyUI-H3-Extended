@@ -2,6 +2,7 @@
 
 import os
 import sys
+import inspect
 from types import SimpleNamespace
 from unittest import mock
 
@@ -27,6 +28,7 @@ from h3_runtime.context import RUNTIME_KEY, RuntimeSnapshot  # noqa: E402
 from h3_sparse_attention.nodes import MiniMaxH3HybridSparseAttention  # noqa: E402
 from h3_attention.hybrid.report import render  # noqa: E402
 from h3_attention.hybrid.sparse_sage import quantize_qk  # noqa: E402
+from h3_attention.hybrid import sparse_quant  # noqa: E402
 
 
 def check(value, message):
@@ -353,6 +355,40 @@ def test_node_mode_schema():
         and compile_backend.default == "off",
         "shared block compilation is explicit and backward compatible",
     )
+    chunk_rows = next(item for item in schema.inputs if item.id == "chunk_rows")
+    check(chunk_rows.min == 256, "node chunk minimum matches activation validation")
+
+
+def test_node_rejects_invalid_compile_configuration_before_preflight():
+    print("node compile validation")
+    marker = object()
+    with mock.patch(
+        "h3_sparse_attention.nodes.RuntimeEnvironment.detect",
+        side_effect=AssertionError("preflight must not run"),
+    ):
+        cases = (
+            ({"compile_backend": "bogus"}, "compile backend"),
+            ({"compile_backend": "inductor"}, "sage128_fused_qkv"),
+            ({
+                "compile_backend": "inductor",
+                "mode": "sage128_fused_qkv",
+            }, "convrot_2slice"),
+            ({"chunk_rows": 128}, "chunk_rows"),
+        )
+        for kwargs, expected in cases:
+            try:
+                MiniMaxH3HybridSparseAttention.execute(marker, **kwargs)
+            except ValueError as exc:
+                check(expected in str(exc), "%s fails before preflight" % expected)
+            else:
+                raise AssertionError("invalid node configuration was accepted")
+
+
+def test_sparse_quant_uses_i64_pointer_arithmetic():
+    print("sparse quant pointer width")
+    source = inspect.getsource(sparse_quant._quantize_blocks.fn)
+    check(source.count(".to(tl.int64)") >= 15,
+          "Q/K source, mean, output, and scale offsets use int64")
 
 
 def test_report_files():
@@ -421,6 +457,8 @@ def main():
     test_strict_errors()
     test_dependency_and_disabled_node()
     test_node_mode_schema()
+    test_node_rejects_invalid_compile_configuration_before_preflight()
+    test_sparse_quant_uses_i64_pointer_arithmetic()
     test_report_files()
     test_deferred_timing()
     test_per_step_timing()

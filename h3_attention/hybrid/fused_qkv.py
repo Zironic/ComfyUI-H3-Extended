@@ -771,6 +771,19 @@ class FusedQKVProjector:
     def __init__(self, tensor_core=None):
         self.tensor_core = tensor_core
 
+    @property
+    def installation_signature(self):
+        if self.tensor_core is None:
+            tensor_core = None
+        else:
+            function = getattr(self.tensor_core, "__func__", self.tensor_core)
+            tensor_core = (
+                getattr(function, "__module__", type(function).__module__),
+                getattr(function, "__qualname__", type(function).__qualname__),
+                id(function),
+            )
+        return (self.name, tensor_core)
+
     def bind(self, module):
         if self.tensor_core is None:
             return _register_fused_qkv_module(module)

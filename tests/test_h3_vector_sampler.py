@@ -83,6 +83,19 @@ class GuardPredictor:
         return x + prediction.derivative * (float(sigma_next) - float(sigma))
 
 
+class AdaptiveProfile:
+    hash = "a" * 64
+
+    def validate_compatibility(self, context):
+        return True
+
+    def tolerance(self, preset):
+        return 1.0
+
+    def survival(self, progress):
+        return {"video": 1.0, "audio": 1.0}
+
+
 def constant_velocity(value=2.0):
     return lambda x, sigma: torch.full_like(x, value)
 
@@ -258,6 +271,20 @@ class SamplerTests(unittest.TestCase):
         first = sample_vector_accel(FakeModel(constant_velocity()), self.x.clone(), self.sigmas, config=config)
         second = sample_vector_accel(FakeModel(constant_velocity()), self.x.clone(), self.sigmas, config=config)
         self.assertTrue(torch.equal(first, second))
+
+    def test_adaptive_profile_drives_one_forecast_then_actual(self):
+        model = FakeModel(constant_velocity())
+        config = SamplerConfig(
+            method="linear_velocity", evaluation_profile="native_20",
+            policy="adaptive_repair", repairability_profile="measured.json",
+        )
+        with mock.patch(
+            "h3_vector_accel.sampler.RepairabilityProfile.load",
+            return_value=AdaptiveProfile(),
+        ):
+            out = sample_vector_accel(model, self.x.clone(), self.sigmas, config=config)
+        self.assertTrue(torch.equal(out, torch.full_like(self.x, -40.0)))
+        self.assertEqual(model.calls, 13)
 
 
 if __name__ == "__main__":

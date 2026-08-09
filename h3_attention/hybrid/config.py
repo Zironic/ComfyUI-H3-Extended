@@ -27,3 +27,13 @@ class HybridSparseConfig:
             raise ValueError("video_budget must be finite and in (0, 1]")
         if not str(self.run_tag).strip():
             raise ValueError("run_tag must not be empty")
+
+    @property
+    def signature(self):
+        return (
+            self.mode,
+            float(self.video_budget),
+            bool(self.strict),
+            str(self.run_tag),
+            bool(self.timing),
+        )

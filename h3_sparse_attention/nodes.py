@@ -6,12 +6,18 @@ import folder_paths
 from comfy_api.latest import ComfyExtension, io
 
 try:
-    from ..h3_activation_memory.config import DEFAULT_CHUNK_ROWS, DEFAULT_MODE
+    from ..h3_activation_memory.config import (
+        DEFAULT_CHUNK_ROWS,
+        DEFAULT_MODE,
+        MIN_CHUNK_ROWS,
+        MODE_CONVROT_2SLICE,
+    )
     from ..h3_attention.hybrid import (
         HybridSparseBackend,
         HybridSparseConfig,
         HybridStatsCollector,
         IMPLEMENTED_MODES,
+        MODE_SAGE128_FUSED_QKV,
         preflight_sparse_sage,
     )
     from ..h3_memory_optimizer.attention import (
@@ -23,12 +29,18 @@ try:
     from ..h3_memory_optimizer.patch import apply
     from ..h3_runtime.compile_compat import request_shared_block_compile
 except ImportError:
-    from h3_activation_memory.config import DEFAULT_CHUNK_ROWS, DEFAULT_MODE
+    from h3_activation_memory.config import (
+        DEFAULT_CHUNK_ROWS,
+        DEFAULT_MODE,
+        MIN_CHUNK_ROWS,
+        MODE_CONVROT_2SLICE,
+    )
     from h3_attention.hybrid import (
         HybridSparseBackend,
         HybridSparseConfig,
         HybridStatsCollector,
         IMPLEMENTED_MODES,
+        MODE_SAGE128_FUSED_QKV,
         preflight_sparse_sage,
     )
     from h3_memory_optimizer.attention import (
@@ -74,7 +86,7 @@ class MiniMaxH3HybridSparseAttention(io.ComfyNode):
                 ),
                 io.Int.Input(
                     "chunk_rows", default=DEFAULT_CHUNK_ROWS,
-                    min=128, max=16384, step=256,
+                    min=MIN_CHUNK_ROWS, max=16384, step=256,
                 ),
                 io.String.Input("run_tag", default="hybrid50"),
                 io.Boolean.Input("timing", default=True),
@@ -96,6 +108,8 @@ class MiniMaxH3HybridSparseAttention(io.ComfyNode):
                 compile_backend="off") -> io.NodeOutput:
         if not enabled:
             return io.NodeOutput(model)
+        if compile_backend not in ("off", "inductor"):
+            raise ValueError("unknown compile backend %r" % compile_backend)
 
         hybrid_config = HybridSparseConfig(
             mode=mode,
@@ -104,12 +118,27 @@ class MiniMaxH3HybridSparseAttention(io.ComfyNode):
             run_tag=run_tag,
             timing=bool(timing),
         )
+        optimizer_config = MemoryOptimizerConfig(
+            attention=ATTENTION_EXISTING,
+            activation=activation,
+            chunk_rows=int(chunk_rows),
+            activation_strict=bool(strict),
+        )
+        if compile_backend == "inductor":
+            if hybrid_config.mode != MODE_SAGE128_FUSED_QKV:
+                raise ValueError(
+                    "Inductor requires the sage128_fused_qkv attention mode"
+                )
+            if optimizer_config.activation != MODE_CONVROT_2SLICE:
+                raise ValueError(
+                    "Inductor requires mlp_chunked_convrot_2slice activation"
+                )
+        collector = HybridStatsCollector(_output_root(), hybrid_config.run_tag)
         environment = RuntimeEnvironment.detect()
         api = preflight_sparse_sage(
             cuda_available=lambda: environment.cuda_available,
             capability_getter=lambda: environment.capability,
         )
-        collector = HybridStatsCollector(_output_root(), hybrid_config.run_tag)
         backend = HybridSparseBackend(
             hybrid_config,
             api=api,
@@ -123,12 +152,6 @@ class MiniMaxH3HybridSparseAttention(io.ComfyNode):
             reason="explicit Phase A direct 128Q x 64KV Sparse Sage experiment",
             environment=environment,
             projector=backend.projector,
-        )
-        optimizer_config = MemoryOptimizerConfig(
-            attention=ATTENTION_EXISTING,
-            activation=activation,
-            chunk_rows=int(chunk_rows),
-            activation_strict=bool(strict),
         )
         patched = model.clone()
         if compile_backend == "inductor":

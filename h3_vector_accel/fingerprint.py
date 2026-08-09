@@ -53,7 +53,13 @@ def configuration_payload(config: SamplerConfig, sigmas=None, model_identity=Non
             "min_direction_cosine": config.min_direction_cosine,
         },
         "fallback_on_guard": config.fallback_on_guard,
+        "policy": config.policy,
         "quality_preset": config.quality_preset,
+        "repairability_profile": config.repairability_profile,
+        "conditioning_mode": config.conditioning_mode,
+        "safety_factor": config.safety_factor,
+        "recovery_actual_steps": config.recovery_actual_steps,
+        "max_consecutive_forecasts": config.max_consecutive_forecasts,
         "adaptive_profile_hash": config.adaptive_profile_hash,
     }
     if sigmas is not None:

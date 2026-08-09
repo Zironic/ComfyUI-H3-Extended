@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
 import logging
 import math
@@ -14,7 +15,7 @@ from comfy.quant_ops import QuantizedTensor, TensorWiseINT8Layout
 try:
     from ..h3_activation_memory.chunks import iter_mod_chunks, validate_mod_segments
     from ..h3_activation_memory.config import MODE_CONVROT_2SLICE
-    from ..h3_activation_memory.linear import acquire_linear
+    from ..h3_activation_memory.linear import _stream_from_handle, acquire_linear
     from ..h3_activation_memory.observer import OBSERVER_KEY as ACTIVATION_OBSERVER_KEY
     from ..h3_activation_memory.stats import get_stats
     from ..h3_attention.hybrid.config import MODE_SAGE128_FUSED_QKV
@@ -22,7 +23,7 @@ try:
 except ImportError:
     from h3_activation_memory.chunks import iter_mod_chunks, validate_mod_segments
     from h3_activation_memory.config import MODE_CONVROT_2SLICE
-    from h3_activation_memory.linear import acquire_linear
+    from h3_activation_memory.linear import _stream_from_handle, acquire_linear
     from h3_activation_memory.observer import OBSERVER_KEY as ACTIVATION_OBSERVER_KEY
     from h3_activation_memory.stats import get_stats
     from h3_attention.hybrid.config import MODE_SAGE128_FUSED_QKV
@@ -32,7 +33,9 @@ from .block_compile import (
     BlockCarriers,
     BlockTopology,
     H3BlockError,
+    build_block_signature,
     make_compiled_block,
+    validate_runtime_signature,
 )
 from .context import get_runtime_snapshot
 from .timing import timed_stage
@@ -41,6 +44,11 @@ from .timing import timed_stage
 LOG_PREFIX = "[H3 compile]"
 DISPATCHER_KEY = "minimax_h3_shared_block_dispatcher"
 BLOCKS_ATTR = "diffusion_model.blocks"
+MAX_SHARED_VARIANTS = 8
+
+
+class UnsafeSharedCarriers(H3BlockError):
+    """Acquired carriers overlap reusable staged-weight storage."""
 
 
 def _tensor_meta(tensor):
@@ -48,6 +56,7 @@ def _tensor_meta(tensor):
         tuple(int(value) for value in tensor.shape),
         tuple(int(value) for value in tensor.stride()),
         tensor.dtype,
+        str(tensor.device),
     )
 
 
@@ -68,7 +77,7 @@ def _quantized_parts(weight, name):
         raise H3BlockError("%s has invalid ConvRot carrier dtypes" % name)
     if not qdata.is_contiguous() or not scale.is_contiguous():
         raise H3BlockError("%s ConvRot carriers must be contiguous" % name)
-    return qdata, scale
+    return qdata, scale.reshape(-1).contiguous()
 
 
 def _plain_weight(weight, name):
@@ -133,6 +142,36 @@ def validate_identical_blocks(blocks):
     return expected
 
 
+def _storage_span(tensor):
+    if tensor.device.type == "meta" or tensor.numel() == 0:
+        return None
+    start = int(tensor.data_ptr())
+    return str(tensor.device), start, start + int(tensor.numel()) * int(tensor.element_size())
+
+
+def _validate_acquired_storage(bindings):
+    staged = [
+        (name, tensors)
+        for name, acquired, tensors in bindings
+        if _stream_from_handle(acquired.handle) is not None
+    ]
+    for index, (left_name, left_tensors) in enumerate(staged):
+        for right_name, right_tensors in staged[index + 1:]:
+            for left in left_tensors:
+                left_span = _storage_span(left)
+                if left_span is None:
+                    continue
+                for right in right_tensors:
+                    right_span = _storage_span(right)
+                    if (right_span is not None and left_span[0] == right_span[0]
+                            and left_span[1] < right_span[2]
+                            and right_span[1] < left_span[2]):
+                        raise UnsafeSharedCarriers(
+                            "%s and %s use overlapping staged-weight storage"
+                            % (left_name, right_name)
+                        )
+
+
 @dataclass
 class _Lease:
     block: object
@@ -175,15 +214,32 @@ class _Lease:
             out_qdata, out_scale = _quantized_parts(out.weight, "out_proj")
             fc1_qdata, fc1_scale = _quantized_parts(fc1.weight, "mlp.fc1")
             fc2_qdata, fc2_scale = _quantized_parts(fc2.weight, "mlp.fc2")
+            adaln_weight = _plain_weight(adaln.weight, "adaln_proj.linear")
+            adaln_bias = _plain_weight(adaln.bias, "adaln_proj.linear.bias")
+            norm1_weight = _plain_weight(norm1.weight, "norm1")
+            norm2_weight = _plain_weight(norm2.weight, "norm2")
+            q_norm_weight = _plain_weight(q_norm.weight, "q_norm")
+            k_norm_weight = _plain_weight(k_norm.weight, "k_norm")
+            _validate_acquired_storage((
+                ("adaln_proj.linear", adaln, (adaln_weight, adaln_bias)),
+                ("norm1", norm1, (norm1_weight,)),
+                ("norm2", norm2, (norm2_weight,)),
+                ("qkv_proj", qkv, (qkv_qdata, qkv_scale)),
+                ("q_norm", q_norm, (q_norm_weight,)),
+                ("k_norm", k_norm, (k_norm_weight,)),
+                ("out_proj", out, (out_qdata, out_scale)),
+                ("mlp.fc1", fc1, (fc1_qdata, fc1_scale)),
+                ("mlp.fc2", fc2, (fc2_qdata, fc2_scale)),
+            ))
             self.carriers = BlockCarriers(
-                _plain_weight(adaln.weight, "adaln_proj.linear"),
-                _plain_weight(adaln.bias, "adaln_proj.linear.bias"),
-                _plain_weight(norm1.weight, "norm1"),
-                _plain_weight(norm2.weight, "norm2"),
+                adaln_weight,
+                adaln_bias,
+                norm1_weight,
+                norm2_weight,
                 qkv_qdata,
                 qkv_scale,
-                _plain_weight(q_norm.weight, "q_norm"),
-                _plain_weight(k_norm.weight, "k_norm"),
+                q_norm_weight,
+                k_norm_weight,
                 out_qdata,
                 out_scale,
                 fc1_qdata,
@@ -213,8 +269,9 @@ class SharedBlockDispatcher:
         self.activation_config = activation_config
         self.compile_backend = compile_backend
         self.block_signature = validate_identical_blocks(self.blocks)
-        self._variants = {}
+        self._variants = OrderedDict()
         self._compile_counts = {}
+        self._unsafe_staging = False
 
     def _topology(self, block, x, t_emb, mod_segments, rope_freqs, layout):
         if rope_freqs is None:
@@ -264,10 +321,14 @@ class SharedBlockDispatcher:
             activation_config=self.activation_config,
         )
 
-    def _variant(self, topology, carriers):
-        key = topology.signature
+    def _variant(self, topology, carriers, x, t_emb, rope):
+        key = (
+            build_block_signature(carriers, topology),
+            validate_runtime_signature(topology, x, t_emb, rope),
+        )
         variant = self._variants.get(key)
         if variant is not None:
+            self._variants.move_to_end(key)
             return variant
         counter = {"count": 0}
 
@@ -280,9 +341,34 @@ class SharedBlockDispatcher:
                 )
             return self.compile_backend(graph_module, example_inputs)
 
-        variant = make_compiled_block(topology, carriers, backend=backend)
+        variant = make_compiled_block(
+            topology,
+            carriers,
+            backend=backend,
+            runtime_tensors=(x, t_emb, rope),
+        )
         self._variants[key] = variant
+        if len(self._variants) > MAX_SHARED_VARIANTS:
+            evicted, _variant = self._variants.popitem(last=False)
+            self._compile_counts.pop(evicted, None)
         return variant
+
+    @property
+    def staged_carriers_unsafe(self):
+        return self._unsafe_staging
+
+    def reset(self):
+        self._variants.clear()
+        self._compile_counts.clear()
+
+    def _disable_unsafe_staging(self, exc):
+        if not self._unsafe_staging:
+            logging.warning(
+                "%s shared compilation disabled: %s; using eager blocks",
+                LOG_PREFIX,
+                exc,
+            )
+        self._unsafe_staging = True
 
     def _record(self, layer_index, topology, snapshot):
         collector = self.backend.collector
@@ -348,12 +434,19 @@ class SharedBlockDispatcher:
         topology = self._topology(
             block, x, t_emb, mod_segments, rope_freqs, snapshot.layout
         )
+        validate_runtime_signature(topology, x, t_emb, rope_freqs)
         result = None
         with timed_stage(transformer_options, "total_dit_block"):
             lease = _Lease(block, x, t_emb)
-            lease.__enter__()
             try:
-                variant = self._variant(topology, lease.carriers)
+                lease.__enter__()
+            except UnsafeSharedCarriers as exc:
+                self._disable_unsafe_staging(exc)
+                raise
+            try:
+                variant = self._variant(
+                    topology, lease.carriers, x, t_emb, rope_freqs
+                )
                 result = variant(x, t_emb, rope_freqs, lease.carriers)
             finally:
                 lease.release(guard=result)
@@ -370,15 +463,24 @@ class SharedBlockDispatcher:
 
 def make_shared_forward(block, layer_index, dispatcher, original_forward):
     def forward(x, t_emb, mod_segments, rope_freqs, transformer_options={}):
-        return dispatcher(
-            layer_index,
-            block,
-            x,
-            t_emb,
-            mod_segments,
-            rope_freqs,
-            transformer_options,
-        )
+        if dispatcher.staged_carriers_unsafe:
+            return original_forward(
+                x, t_emb, mod_segments, rope_freqs, transformer_options
+            )
+        try:
+            return dispatcher(
+                layer_index,
+                block,
+                x,
+                t_emb,
+                mod_segments,
+                rope_freqs,
+                transformer_options,
+            )
+        except UnsafeSharedCarriers:
+            return original_forward(
+                x, t_emb, mod_segments, rope_freqs, transformer_options
+            )
 
     forward._h3_activation_memory = True
     forward._h3_activation_config = dispatcher.activation_config.signature
@@ -449,6 +551,7 @@ def install_shared_block_dispatch(
 
 __all__ = [
     "H3BlockError",
+    "UnsafeSharedCarriers",
     "block_execution_signature",
     "validate_identical_blocks",
     "SharedBlockDispatcher",

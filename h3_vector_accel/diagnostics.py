@@ -155,6 +155,7 @@ class RunDiagnostics:
         self._last_actual_step = int(step)
         if fallback_reason:
             self._fallback_count += 1
+        return row
 
     def observe_step(self, step, sigma, forecast, true_nfe, fallback_reason=None, **metadata):
         self._true_nfe = int(true_nfe)

@@ -26,22 +26,27 @@ def _quantize_blocks(
     block_size: tl.constexpr,
     subtract_mean: tl.constexpr,
 ):
-    block = tl.program_id(0)
-    head = tl.program_id(1)
-    batch = tl.program_id(2)
-    rows = block * block_size + tl.arange(0, block_size)
-    cols = tl.arange(0, head_dim)
+    block = tl.program_id(0).to(tl.int64)
+    head = tl.program_id(1).to(tl.int64)
+    batch = tl.program_id(2).to(tl.int64)
+    rows = block * block_size + tl.arange(0, block_size).to(tl.int64)
+    cols = tl.arange(0, head_dim).to(tl.int64)
     row_mask = rows < sequence
     source = (
         x_ptr
-        + batch * stride_b
-        + head * stride_h
-        + rows[:, None] * stride_n
+        + batch * stride_b.to(tl.int64)
+        + head * stride_h.to(tl.int64)
+        + rows[:, None] * stride_n.to(tl.int64)
         + cols[None, :]
     )
     value = tl.load(source, mask=row_mask[:, None], other=0.0).to(tl.float32)
     if subtract_mean:
-        mean = tl.load(mean_ptr + batch * mean_b + head * mean_h + cols)
+        mean = tl.load(
+            mean_ptr
+            + batch * mean_b.to(tl.int64)
+            + head * mean_h.to(tl.int64)
+            + cols
+        )
         value -= mean[None, :]
         value = tl.where(row_mask[:, None], value, 0.0)
 
@@ -50,13 +55,19 @@ def _quantize_blocks(
     quantized += 0.5 * tl.where(quantized >= 0, 1, -1)
     destination = (
         out_ptr
-        + batch * out_b
-        + head * out_h
-        + rows[:, None] * out_n
+        + batch * out_b.to(tl.int64)
+        + head * out_h.to(tl.int64)
+        + rows[:, None] * out_n.to(tl.int64)
         + cols[None, :]
     )
     tl.store(destination, quantized.to(tl.int8), mask=row_mask[:, None])
-    tl.store(scale_ptr + batch * scale_b + head * scale_h + block, scale)
+    tl.store(
+        scale_ptr
+        + batch * scale_b.to(tl.int64)
+        + head * scale_h.to(tl.int64)
+        + block,
+        scale,
+    )
 
 
 def _run(x, block_size, mean=None):
