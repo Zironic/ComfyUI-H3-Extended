@@ -56,12 +56,7 @@ def make_forward(block, layer_index, config, session, original_forward=None):
         held.__enter__()
         try:
             def measure_activation_runner(value):
-                """Compute logical SwiGLU activations from already-held fc1 tiles.
-
-                This is intentionally fc1-only. Reusing the held tiles avoids a
-                second Comfy weight lease / staging cycle for every measured or
-                shadow-validated chunk.
-                """
+                """Compute logical SwiGLU activations from already-held fc1 tiles."""
                 pieces = []
                 for tile in held.tiles:
                     expanded = held.convrot_linear(
@@ -72,6 +67,34 @@ def make_forward(block, layer_index, config, session, original_forward=None):
                     )
                     pieces.append(logical_swiglu(expanded))
                 return torch.cat(pieces, dim=-1)
+
+            def shadow_fc2_runner(selected_activation, logical_indices):
+                """Project selected logical features using already-held fc2 tiles.
+
+                Unselected logical features are represented as zeros. This avoids
+                reacquiring/staging fc2 for every sampled shadow window while
+                preserving complete ConvRot-256 groups and the same two-slice
+                weight representation used by the exact dense path.
+                """
+                tile_widths = [int(tile["fc2_weight"].shape[1]) for tile in held.tiles]
+                ffn = sum(tile_widths)
+                full = selected_activation.new_zeros((selected_activation.shape[0], ffn))
+                full.index_copy_(1, logical_indices.long(), selected_activation)
+                result = None
+                offset = 0
+                for tile, width in zip(held.tiles, tile_widths):
+                    partial = held.convrot_linear(
+                        full[:, offset:offset + width].contiguous(),
+                        tile["fc2_weight"],
+                        tile["fc2_scale"],
+                        input_act=None,
+                    )
+                    if result is None:
+                        result = partial
+                    else:
+                        result.add_(partial)
+                    offset += width
+                return result
 
             for chunk_index, chunk in enumerate(chunks):
                 with timed_stage(transformer_options, "norm2_modulation"):
@@ -99,6 +122,7 @@ def make_forward(block, layer_index, config, session, original_forward=None):
                     config=config,
                     dense_runner=dense_runner,
                     measure_activation_runner=measure_activation_runner,
+                    shadow_fc2_runner=shadow_fc2_runner,
                     # At this point x is the exact post-attention residual and
                     # has not yet received the MLP gate. shadow_validate uses it
                     # only to score post-block error, never to alter execution.
