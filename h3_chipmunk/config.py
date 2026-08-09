@@ -20,6 +20,9 @@ SHADOW_DEPTH_PROFILE = (
     (25, 30, 0.50),
     (30, 50, 1.00),
 )
+# Validate one fully active layer at the dense boundary. Its error is the
+# numerical/requantization floor of the shadow path rather than sparsity error.
+SHADOW_CONTROL_LAYER = 30
 DEFAULT_SHADOW_LAYER_STRIDE = 5
 DEFAULT_SHADOW_SAMPLE_ROWS = 128
 
@@ -96,9 +99,11 @@ class H3ChipmunkConfig:
         layer_index = int(layer_index)
         if not (int(self.layer_start) <= layer_index < int(self.layer_stop)):
             return False
+        if layer_index == SHADOW_CONTROL_LAYER:
+            return True
         if self.shadow_fraction_for_layer(layer_index) >= 1.0:
             return False
-        sparse_stop = min(int(self.layer_stop), 30)
+        sparse_stop = min(int(self.layer_stop), SHADOW_CONTROL_LAYER)
         last_sparse = sparse_stop - 1
         return (
             layer_index == last_sparse
