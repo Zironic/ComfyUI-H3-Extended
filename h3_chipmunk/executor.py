@@ -249,9 +249,6 @@ def _selector_from_activation(
     indices, counts = select_top_groups(scores, fraction, config.random_groups)
 
     if config.mode in ("measure", "shadow_validate"):
-        # Diagnostic summaries stay on GPU. In shadow_validate the selected row
-        # window is small enough that its recurrent state can also remain on GPU,
-        # avoiding the synchronous CPU-cache path entirely.
         cache.selector_summary = act.to(torch.bfloat16).detach()
         if config.mode == "shadow_validate" and store_selection:
             cache.selected_groups = indices.detach().clone()
@@ -382,23 +379,24 @@ def _shadow_refresh(
     sample_h = h[start:stop]
     logical_full = measure_activation_runner(sample_h)
     mean_logical = measure_activation_runner(sample_h.mean(dim=0, keepdim=True))
-    fraction = config.shadow_fraction_for_layer(layer_index)
+    requested = config.shadow_fraction_for_layer(layer_index)
     indices, counts, scores, had_previous = _selector_from_activation(
         mean_logical,
         cache,
         config,
-        top_fraction=fraction,
+        top_fraction=requested,
     )
     logical = _logical_indices(indices[0], int(indices.shape[1]), config.feature_group)
     selected = logical_full.index_select(-1, logical).contiguous()
     cache.activation = selected.detach().clone()
     cache.output = dense_out[start:stop].detach().clone()
-    return start, stop, fraction, scores, had_previous
+    actual = float(logical.numel() / logical_full.shape[-1])
+    return start, stop, requested, actual, scores, had_previous
 
 
 def _shadow_delta(
-    *, block, h, dense_out, residual_base, gate, cache, config,
-    layer_index, measure_activation_runner,
+    *, h, dense_out, residual_base, gate, cache, config, layer_index,
+    measure_activation_runner, shadow_fc2_runner,
 ):
     start, stop = _shadow_sample_bounds(h.shape[0], config)
     sample_h = h[start:stop]
@@ -411,11 +409,8 @@ def _shadow_delta(
     old_selected = cache.activation
     approx = cache.output
 
-    # Use the same selected-column ConvRot fc2 operation as reference_delta so
-    # shadow error measures the actual approximation semantics we intend to run.
-    with ConvRotFC2(block.mlp, current_selected[:1]) as fc2:
-        old_part = fc2.selected(old_selected, logical)
-        new_part = fc2.selected(current_selected, logical)
+    old_part = shadow_fc2_runner(old_selected, logical)
+    new_part = shadow_fc2_runner(current_selected, logical)
     approx.sub_(old_part).add_(new_part)
 
     dense_sample = dense_out[start:stop]
@@ -423,13 +418,16 @@ def _shadow_delta(
     metrics = _shadow_metrics(approx, dense_sample, base_sample, gate)
     cache.activation = current_selected.detach().clone()
     cache.output = approx.detach()
-    return start, stop, config.shadow_fraction_for_layer(layer_index), metrics
+    requested = config.shadow_fraction_for_layer(layer_index)
+    actual = float(logical.numel() / current_full.shape[-1])
+    return start, stop, requested, actual, metrics
 
 
 def run_chipmunk_chunk(
     *, block, h, layer_index: int, chunk_index: int, chunk_start: int,
     chunk_stop: int, snapshot, session, config, dense_runner,
-    measure_activation_runner=None, residual_base=None, mlp_gate=None,
+    measure_activation_runner=None, shadow_fc2_runner=None,
+    residual_base=None, mlp_gate=None,
 ):
     """Return raw MLP output before H3's current-step residual gate."""
     session.ensure_request(snapshot)
@@ -437,10 +435,6 @@ def run_chipmunk_chunk(
     kind = _segment_kind(snapshot, chunk_start, chunk_stop)
     step = int(getattr(snapshot, "step_index", -1))
 
-    # Measurement is intentionally a lightweight observer. It always returns
-    # the exact dense MLP result, observes only a representative layer subset,
-    # keeps only token-mean feature summaries on GPU, and never computes or
-    # transfers per-token selected activations.
     if config.mode == "measure":
         out = dense_runner(h)
         if not (
@@ -489,8 +483,6 @@ def run_chipmunk_chunk(
                 raise
         return out, "chipmunk_measure"
 
-    # Shadow validation computes the exact dense result first and always returns
-    # it. Only sampled video rows/layers receive a parallel recurrent delta path.
     if config.mode == "shadow_validate":
         out = dense_runner(h)
         if not (
@@ -498,15 +490,18 @@ def run_chipmunk_chunk(
             and config.shadow_layer_enabled(layer_index)
         ):
             return out, "chipmunk_shadow_unobserved"
-        if measure_activation_runner is None or residual_base is None or mlp_gate is None:
+        if (
+            measure_activation_runner is None or shadow_fc2_runner is None
+            or residual_base is None or mlp_gate is None
+        ):
             raise ChipmunkExecutionError(
-                "shadow_validate requires held-fc1 runner, residual base, and current MLP gate"
+                "shadow_validate requires held fc1/fc2 runners, residual base, and current MLP gate"
             )
         cache = session.cache(branch, layer_index, chunk_index)
         cache.dense_calls += 1
         try:
             if _shadow_must_refresh(config, snapshot, cache):
-                start, stop, fraction, scores, had_previous = _shadow_refresh(
+                start, stop, requested, actual, scores, had_previous = _shadow_refresh(
                     h=h,
                     dense_out=out,
                     cache=cache,
@@ -523,15 +518,15 @@ def run_chipmunk_chunk(
                     kind=kind,
                     path="shadow_refresh",
                     cross_step=bool(had_previous),
-                    active_fraction=float(fraction),
+                    requested_fraction=float(requested),
+                    active_fraction=float(actual),
                     sample_start=int(start),
                     sample_rows=int(stop - start),
                     selector_mean=scores.mean(),
                     selector_rms=scores.square().mean().sqrt(),
                 )
             else:
-                start, stop, fraction, metrics = _shadow_delta(
-                    block=block,
+                start, stop, requested, actual, metrics = _shadow_delta(
                     h=h,
                     dense_out=out,
                     residual_base=residual_base,
@@ -540,6 +535,7 @@ def run_chipmunk_chunk(
                     config=config,
                     layer_index=layer_index,
                     measure_activation_runner=measure_activation_runner,
+                    shadow_fc2_runner=shadow_fc2_runner,
                 )
                 cache.sparse_calls += 1
                 cache.update_step = step
@@ -549,7 +545,8 @@ def run_chipmunk_chunk(
                     chunk=chunk_index,
                     kind=kind,
                     path="shadow_delta",
-                    active_fraction=float(fraction),
+                    requested_fraction=float(requested),
+                    active_fraction=float(actual),
                     refresh_age=int(step - cache.refresh_step),
                     sample_start=int(start),
                     sample_rows=int(stop - start),
