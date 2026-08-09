@@ -6,7 +6,7 @@ import torch
 import comfy.quant_ops
 
 from ..h3_activation_memory.linear import acquire_linear, _convrot_parts
-from .selector import logical_swiglu, select_top_groups
+from .selector import logical_swiglu, select_top_groups, energy_capture_by_fraction
 
 
 class ChipmunkExecutionError(RuntimeError):
@@ -22,6 +22,23 @@ def _segment_kind(snapshot, start: int, stop: int):
     return None
 
 
+def _kind_eligible(config, kind):
+    return (
+        (config.scope == "all_dynamic" and kind in ("audio", "video"))
+        or (config.scope == "target_video" and kind == "video")
+    )
+
+
+def _measure_layer_enabled(config, layer_index: int):
+    if not (int(config.layer_start) <= layer_index < int(config.layer_stop)):
+        return False
+    stride = int(config.measure_layer_stride)
+    return (
+        layer_index == int(config.layer_stop) - 1
+        or (layer_index - int(config.layer_start)) % stride == 0
+    )
+
+
 def _must_dense(config, snapshot, layer_index: int):
     step = int(getattr(snapshot, "step_index", -1))
     total = int(getattr(snapshot, "total_steps", 0))
@@ -35,7 +52,7 @@ def _must_dense(config, snapshot, layer_index: int):
 
 
 def _cache_on_cpu(config):
-    return config.mode == "measure" or config.cache_location == "cpu"
+    return config.cache_location == "cpu"
 
 
 def _store_tensor(value, config):
@@ -187,28 +204,50 @@ def _logical_indices(groups: torch.Tensor, count: int, feature_group: int):
     return (groups[:, None] * feature_group + offsets[None]).reshape(-1)
 
 
-def _selector(fc1, h, cache, config):
-    """Select ConvRot groups from block-mean SwiGLU activation deltas."""
-    tg = int(config.token_group_rows)
-    means = torch.stack([
-        h[a:min(h.shape[0], a + tg)].mean(dim=0)
-        for a in range(0, h.shape[0], tg)
-    ], dim=0)
-    act = logical_swiglu(fc1.full(means)).float()
+def _token_means(h, token_group_rows: int):
+    """Compute block means with one reduction for all complete token groups."""
+    rows = int(h.shape[0])
+    tg = int(token_group_rows)
+    full_rows = rows // tg * tg
+    pieces = []
+    if full_rows:
+        pieces.append(h[:full_rows].reshape(-1, tg, h.shape[-1]).mean(dim=1))
+    if full_rows < rows:
+        pieces.append(h[full_rows:].mean(dim=0, keepdim=True))
+    return pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=0)
+
+
+def _selector_from_activation(act, cache, config, *, store_selection=True):
+    act = act.float()
     fg = int(config.feature_group)
     if act.shape[-1] % fg:
         raise ChipmunkExecutionError("H3 FFN is not feature-group aligned")
     previous = _load_tensor(cache.selector_summary, act.device)
+    had_previous = previous is not None
     delta = act if previous is None else act - previous.float()
     scores = delta.reshape(delta.shape[0], delta.shape[1] // fg, fg).square().mean(dim=-1).sqrt()
     indices, counts = select_top_groups(scores, config.top_fraction, config.random_groups)
-    # This summary is touched only on refresh/measurement calls. Keep the full
-    # per-feature block-mean signal on CPU so signed values cannot cancel inside
-    # a 256-neuron group before the RMS delta is measured.
-    cache.selector_summary = act.to(torch.bfloat16).cpu()
-    cache.selected_groups = _store_tensor(indices, config)
-    cache.selected_counts = _store_tensor(counts, config)
-    return indices, counts, scores
+
+    if config.mode == "measure":
+        # Keep only the compact token-mean feature signal resident on GPU. This
+        # is intentionally not governed by cache_location: synchronously
+        # bouncing it through CPU every chunk caused multi-second idle periods.
+        cache.selector_summary = act.to(torch.bfloat16)
+        cache.selected_groups = None
+        cache.selected_counts = None
+    else:
+        cache.selector_summary = _store_tensor(act.to(torch.bfloat16), config)
+        if store_selection:
+            cache.selected_groups = _store_tensor(indices, config)
+            cache.selected_counts = _store_tensor(counts, config)
+    return indices, counts, scores, had_previous
+
+
+def _selector(fc1, h, cache, config, *, store_selection=True):
+    act = logical_swiglu(fc1.full(_token_means(h, config.token_group_rows)))
+    return _selector_from_activation(
+        act, cache, config, store_selection=store_selection
+    )
 
 
 def _selected_activation_all_groups(fc1, h, indices, counts, config):
@@ -216,10 +255,11 @@ def _selected_activation_all_groups(fc1, h, indices, counts, config):
     counts = _load_tensor(counts, h.device)
     tg = int(config.token_group_rows)
     fg = int(config.feature_group)
+    count = int(indices.shape[1])
     pieces = []
     for gi, a in enumerate(range(0, h.shape[0], tg)):
         b = min(h.shape[0], a + tg)
-        logical = _logical_indices(indices[gi], int(counts[gi].item()), fg)
+        logical = _logical_indices(indices[gi], count, fg)
         pieces.append(fc1.selected_activation(h[a:b], logical))
     return torch.cat(pieces, dim=0)
 
@@ -240,10 +280,11 @@ def _delta_update(block, h, cache, config):
 
     tg = int(config.token_group_rows)
     fg = int(config.feature_group)
+    count = int(indices.shape[1])
     with ConvRotFC2(block.mlp, current_activation[:1]) as fc2:
         for gi, a in enumerate(range(0, h.shape[0], tg)):
             b = min(h.shape[0], a + tg)
-            logical = _logical_indices(indices[gi], int(counts[gi].item()), fg)
+            logical = _logical_indices(indices[gi], count, fg)
             old_part = fc2.selected(old_activation[a:b], logical)
             new_part = fc2.selected(current_activation[a:b], logical)
             out[a:b].sub_(old_part).add_(new_part)
@@ -256,31 +297,82 @@ def _delta_update(block, h, cache, config):
 def _refresh_cache(block, h, out, cache, config, snapshot):
     with ConvRotFC1(block.mlp, h[:1]) as fc1:
         _check_gpu_budget(snapshot, config, fc1.hidden, fc1.ffn)
-        indices, counts, scores = _selector(fc1, h, cache, config)
+        indices, counts, scores, _had_previous = _selector(fc1, h, cache, config)
         selected = _selected_activation_all_groups(fc1, h, indices, counts, config)
         active = float(indices.shape[1] * config.feature_group / fc1.ffn)
     cache.activation = _store_tensor(selected, config)
-    cache.output = _store_tensor(out, config) if config.mode == "reference_delta" else None
+    cache.output = _store_tensor(out, config)
     return active, scores
 
 
 def run_chipmunk_chunk(
     *, block, h, layer_index: int, chunk_index: int, chunk_start: int,
     chunk_stop: int, snapshot, session, config, dense_runner,
+    measure_activation_runner=None,
 ):
     """Return raw MLP output before H3's current-step residual gate."""
     session.ensure_request(snapshot)
     branch = tuple(getattr(snapshot, "branch", (0,)))
-    cache = session.cache(branch, layer_index, chunk_index)
     kind = _segment_kind(snapshot, chunk_start, chunk_stop)
+    step = int(getattr(snapshot, "step_index", -1))
+
+    # Measurement is intentionally a lightweight observer. It always returns
+    # the exact dense MLP result, observes only a representative layer subset,
+    # keeps only token-mean feature summaries on GPU, and never computes or
+    # transfers per-token selected activations.
+    if config.mode == "measure":
+        out = dense_runner(h)
+        if not (
+            _kind_eligible(config, kind)
+            and _measure_layer_enabled(config, layer_index)
+        ):
+            return out, "chipmunk_measure_unobserved"
+        if measure_activation_runner is None:
+            raise ChipmunkExecutionError("measure mode requires held-fc1 activation runner")
+        cache = session.cache(branch, layer_index, chunk_index)
+        cache.dense_calls += 1
+        try:
+            means = _token_means(h, config.token_group_rows)
+            logical_activation = measure_activation_runner(means)
+            indices, _counts, scores, had_previous = _selector_from_activation(
+                logical_activation,
+                cache,
+                config,
+                store_selection=False,
+            )
+            ffn = int(logical_activation.shape[-1])
+            active = float(indices.shape[1] * config.feature_group / ffn)
+            captures = energy_capture_by_fraction(scores)
+            cache.activation = None
+            cache.output = None
+            session.record(
+                step=step,
+                layer=layer_index,
+                chunk=chunk_index,
+                kind=kind,
+                path="measure_selector",
+                cross_step=bool(had_previous),
+                active_fraction=active,
+                selector_mean=scores.mean(),
+                selector_rms=scores.square().mean().sqrt(),
+                energy_capture=captures,
+                effective_chunk_rows=int(config.effective_chunk_rows),
+            )
+        except Exception as exc:
+            cache.fallback_calls += 1
+            session.record(
+                step=step, layer=layer_index, chunk=chunk_index, kind=kind,
+                path="measure_fallback", reason=f"{type(exc).__name__}: {exc}",
+            )
+            if config.strict:
+                raise
+        return out, "chipmunk_measure"
+
+    cache = session.cache(branch, layer_index, chunk_index)
     eligible = (
         max(config.layer_start, config.first_dense_layers) <= layer_index < config.layer_stop
-        and (
-            (config.scope == "all_dynamic" and kind in ("audio", "video"))
-            or (config.scope == "target_video" and kind == "video")
-        )
+        and _kind_eligible(config, kind)
     )
-    step = int(getattr(snapshot, "step_index", -1))
 
     if not eligible or _must_dense(config, snapshot, layer_index):
         out = dense_runner(h)
@@ -293,7 +385,7 @@ def run_chipmunk_chunk(
                 session.record(
                     step=step, layer=layer_index, chunk=chunk_index, kind=kind,
                     path="dense_refresh", active_fraction=active,
-                    selector_mean=float(scores.mean().item()),
+                    selector_mean=scores.mean(),
                     cache_location=config.cache_location,
                 )
             except Exception as exc:
@@ -303,48 +395,9 @@ def run_chipmunk_chunk(
                     step=step, layer=layer_index, chunk=chunk_index, kind=kind,
                     path="dense_refresh_no_cache", reason=f"{type(exc).__name__}: {exc}",
                 )
-                if config.strict and config.mode == "reference_delta":
+                if config.strict:
                     raise
         return out, "chipmunk_dense"
-
-    if config.mode == "measure":
-        out = dense_runner(h)
-        cache.dense_calls += 1
-        try:
-            previous_indices = cache.selected_groups
-            previous_counts = cache.selected_counts
-            previous_activation = cache.activation
-            delta_rms = float("nan")
-            with ConvRotFC1(block.mlp, h[:1]) as fc1:
-                if previous_indices is not None and previous_activation is not None:
-                    current_previous = _selected_activation_all_groups(
-                        fc1, h, previous_indices, previous_counts, config
-                    )
-                    previous_gpu = _load_tensor(previous_activation, current_previous.device)
-                    if current_previous.shape == previous_gpu.shape:
-                        delta_rms = float(
-                            (current_previous.float() - previous_gpu.float())
-                            .square().mean().sqrt().item()
-                        )
-                indices, counts, scores = _selector(fc1, h, cache, config)
-                selected = _selected_activation_all_groups(fc1, h, indices, counts, config)
-                active = float(indices.shape[1] * config.feature_group / fc1.ffn)
-            cache.activation = _store_tensor(selected, config)
-            cache.output = None
-            session.record(
-                step=step, layer=layer_index, chunk=chunk_index, kind=kind,
-                path="measure", active_fraction=active,
-                selector_mean=float(scores.mean().item()), selected_delta_rms=delta_rms,
-            )
-        except Exception as exc:
-            cache.fallback_calls += 1
-            session.record(
-                step=step, layer=layer_index, chunk=chunk_index, kind=kind,
-                path="measure_fallback", reason=f"{type(exc).__name__}: {exc}",
-            )
-            if config.strict:
-                raise
-        return out, "chipmunk_measure"
 
     try:
         hidden = int(block.mlp.fc2.out_features)

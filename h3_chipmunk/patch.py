@@ -80,6 +80,9 @@ def install(model_patcher, config):
         "refresh_every": int(config.refresh_every),
         "feature_group": int(config.feature_group),
         "token_group_rows": int(config.token_group_rows),
+        "chunk_rows": int(config.chunk_rows),
+        "effective_chunk_rows": int(config.effective_chunk_rows),
+        "measure_layer_stride": int(config.measure_layer_stride),
         "scope": config.scope,
         "cache_location": config.cache_location,
         "cache_budget_gb": float(config.cache_budget_gb),
@@ -89,13 +92,17 @@ def install(model_patcher, config):
     options["minimax_h3_chipmunk_session"] = chip_session
     logging.info(
         "%s installed: mode=%s top=%.3f refresh=%d group=%d token_group=%d "
-        "scope=%s cache=%s budget=%.1fGiB",
+        "chunk=%d effective_chunk=%d measure_layer_stride=%d scope=%s "
+        "cache=%s budget=%.1fGiB",
         LOG_PREFIX,
         config.mode,
         config.top_fraction,
         config.refresh_every,
         config.feature_group,
         config.token_group_rows,
+        config.chunk_rows,
+        config.effective_chunk_rows,
+        config.measure_layer_stride,
         config.scope,
         config.cache_location,
         config.cache_budget_gb,

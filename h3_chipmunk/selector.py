@@ -3,6 +3,8 @@ from __future__ import annotations
 import math
 import torch
 
+MEASURE_FRACTIONS = (0.10, 0.20, 0.25, 0.30, 0.40, 0.50)
+
 
 def logical_swiglu(fc1_out: torch.Tensor) -> torch.Tensor:
     gate, up = fc1_out.chunk(2, dim=-1)
@@ -49,6 +51,30 @@ def select_top_groups(scores: torch.Tensor, top_fraction: float, random_fraction
     indices = torch.sort(indices, dim=-1).values.to(torch.int32).contiguous()
     counts = torch.full((indices.shape[0],), indices.shape[1], dtype=torch.int32, device=indices.device)
     return indices, counts
+
+
+def energy_capture_by_fraction(scores: torch.Tensor, fractions=MEASURE_FRACTIONS):
+    """Return scalar CUDA tensors describing how concentrated group deltas are.
+
+    The result deliberately stays on-device. Callers can defer the one host
+    transfer until request end instead of forcing a CUDA synchronization for
+    every MLP chunk.
+    """
+    if scores.ndim != 2:
+        raise ValueError("scores must be [token_groups, feature_groups]")
+    energy = scores.float().square()
+    total = energy.sum()
+    groups = int(scores.shape[-1])
+    captures = {}
+    for fraction in fractions:
+        keep = max(1, min(groups, int(math.ceil(groups * float(fraction)))))
+        kept = torch.topk(energy, keep, dim=-1, sorted=False).values.sum()
+        captures[f"{float(fraction):.2f}"] = torch.where(
+            total > 0,
+            kept / total,
+            torch.ones_like(total),
+        )
+    return captures
 
 
 def selected_mask(indices: torch.Tensor, counts: torch.Tensor, feature_groups: int) -> torch.Tensor:
