@@ -126,6 +126,9 @@ class RunDiagnostics:
     def policy_state(self):
         return {"true_nfe": self._true_nfe, "forecast_count": self._forecast_count}
 
+    def update_run_metadata(self, **metadata):
+        self._run_metadata.update(metadata)
+
     def observe_actual_anchor(self, step, sigma, x=None, actual_derivative=None,
                               counterfactual=None, previous_actual_sigma=None,
                               fallback_reason=None, **metadata):

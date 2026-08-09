@@ -7,9 +7,9 @@ from .config import (
     DEFAULT_MAX_EXTRAPOLATION_RATIO,
     CONDITIONING_MODES,
     DIAGNOSTICS,
+    EVALUATION_PROFILES,
     METHODS,
     POLICIES,
-    PROFILES,
     QUALITY_PRESETS,
     SamplerConfig,
 )
@@ -43,10 +43,10 @@ class MiniMaxH3VectorAccelSampler(io.ComfyNode):
                 ),
                 io.Combo.Input(
                     "evaluation_profile",
-                    options=list(PROFILES),
+                    options=list(EVALUATION_PROFILES),
                     default="full_20",
                     display_name="actual-evaluation schedule",
-                    tooltip="Select full_20 for every model evaluation or a reduced named schedule such as late_aggressive_13. With res_multistep, late_aggressive_13 is the 13-NFE multistep benchmark.",
+                    tooltip="Select full_20, a named reduced schedule, or adaptive_history_v1/v2. Adaptive history schedules are causal and require res_multistep.",
                 ),
                 io.Combo.Input(
                     "diagnostics",

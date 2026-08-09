@@ -11,6 +11,8 @@ PROFILES = (
     "late_aggressive_12", "late_max_11", "conservative_12",
     "early_aggressive_13", "uniform_13",
 )
+ADAPTIVE_PROFILES = frozenset(("adaptive_history_v1", "adaptive_history_v2"))
+EVALUATION_PROFILES = PROFILES + ("adaptive_history_v1", "adaptive_history_v2")
 DIAGNOSTICS = ("off", "summary", "full")
 POLICIES = ("fixed", "adaptive_repair")
 QUALITY_PRESETS = ("conservative", "balanced", "aggressive")
@@ -40,6 +42,8 @@ def profile_mask(profile: str, logical_steps: int = 20) -> tuple[bool, ...]:
     """Return the immutable actual-evaluation mask for a named profile."""
     if profile == "native_20":
         profile = "full_20"
+    if profile in ADAPTIVE_PROFILES:
+        raise ValueError(f"adaptive schedule {profile} does not have a fixed mask")
     if profile not in PROFILES:
         raise ValueError(f"unknown evaluation profile: {profile}")
     if logical_steps != 20:
@@ -91,7 +95,7 @@ class SamplerConfig:
         object.__setattr__(self, "evaluation_profile", evaluation_profile)
         if self.method not in METHODS:
             raise ValueError(f"unknown vector acceleration method: {self.method}")
-        if self.evaluation_profile not in PROFILES:
+        if self.evaluation_profile not in EVALUATION_PROFILES:
             raise ValueError(f"unknown evaluation profile: {self.evaluation_profile}")
         if self.diagnostics not in DIAGNOSTICS:
             raise ValueError(f"unknown diagnostics mode: {self.diagnostics}")
@@ -103,6 +107,8 @@ class SamplerConfig:
             raise ValueError(f"unknown conditioning mode: {self.conditioning_mode}")
         if self.method in CORE_SOLVER_METHODS and self.policy != "fixed":
             raise ValueError("core solver methods require the fixed policy")
+        if self.evaluation_profile in ADAPTIVE_PROFILES and self.method != "res_multistep":
+            raise ValueError("adaptive history schedule requires the res_multistep method")
         if self.policy == "adaptive_repair" and self.method not in PREDICTOR_METHODS:
             raise ValueError("adaptive repair policy requires a predictor method")
         if self.policy == "adaptive_repair" and not self.repairability_profile:
@@ -135,14 +141,19 @@ class SamplerConfig:
             raise ValueError("protected_prefix_steps must be a non-negative integer")
         if self.audio_emergency_multiplier <= 0:
             raise ValueError("audio_emergency_multiplier must be positive")
-        object.__setattr__(self, "_mask", profile_mask(self.evaluation_profile, 20))
+        mask = tuple() if self.evaluation_profile in ADAPTIVE_PROFILES else profile_mask(self.evaluation_profile, 20)
+        object.__setattr__(self, "_mask", mask)
 
     @property
     def mask(self) -> tuple[bool, ...]:
+        if self.evaluation_profile in ADAPTIVE_PROFILES:
+            raise ValueError(f"adaptive schedule {self.evaluation_profile} does not have a fixed mask")
         return self._mask
 
     @property
     def actual_indices(self) -> tuple[int, ...]:
+        if self.evaluation_profile in ADAPTIVE_PROFILES:
+            raise ValueError(f"adaptive schedule {self.evaluation_profile} does not have fixed actual indices")
         return tuple(i for i, value in enumerate(self._mask) if value)
 
     def validate_schedule_length(self, logical_steps: int) -> None:

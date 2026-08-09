@@ -5,7 +5,8 @@ import json
 
 import torch
 
-from .config import SamplerConfig
+from .config import ADAPTIVE_PROFILES, SamplerConfig
+from .adaptive_res import controller_identity
 
 
 def canonical_json(value) -> str:
@@ -45,7 +46,10 @@ def configuration_payload(config: SamplerConfig, sigmas=None, model_identity=Non
     payload = {
         "method": config.method,
         "evaluation_profile": config.evaluation_profile,
-        "actual_mask": list(config.actual_indices),
+        "actual_mask": (
+            None if config.evaluation_profile in ADAPTIVE_PROFILES
+            else list(config.actual_indices)
+        ),
         "mask_version": config.mask_version,
         "predictor_version": config.predictor_version,
         "guards": {
@@ -65,6 +69,8 @@ def configuration_payload(config: SamplerConfig, sigmas=None, model_identity=Non
         "audio_emergency_multiplier": config.audio_emergency_multiplier,
         "adaptive_profile_hash": config.adaptive_profile_hash,
     }
+    if config.evaluation_profile in ADAPTIVE_PROFILES:
+        payload["adaptive_controller"] = controller_identity(config.evaluation_profile)
     if sigmas is not None:
         payload["sigma_hash"] = sigma_hash(sigmas)
         if effective_sigmas is not None or actual_indices is not None:

@@ -18,6 +18,7 @@ comfy.options.enable_args_parsing()
 
 from comfy.k_diffusion.sampling import sample_euler, sample_res_multistep  # noqa: E402
 from h3_vector_accel.config import PROFILES, SamplerConfig  # noqa: E402
+from h3_vector_accel.adaptive_res import IncrementalRES  # noqa: E402
 from h3_vector_accel.diagnostics import RunDiagnostics, current_callback_metadata  # noqa: E402
 from h3_vector_accel.predictor import Prediction  # noqa: E402
 from h3_vector_accel.sampler import sample_vector_accel  # noqa: E402
@@ -186,6 +187,8 @@ class SamplerTests(unittest.TestCase):
         ])
         self.assertIn("full_20", inputs["evaluation_profile"].options)
         self.assertIn("late_aggressive_13", inputs["evaluation_profile"].options)
+        self.assertIn("adaptive_history_v1", inputs["evaluation_profile"].options)
+        self.assertIn("adaptive_history_v2", inputs["evaluation_profile"].options)
         self.assertEqual(inputs["method"].display_name, "solver / forecast mode")
         self.assertEqual(inputs["evaluation_profile"].display_name, "actual-evaluation schedule")
         output = MiniMaxH3VectorAccelSampler.execute(
@@ -195,6 +198,28 @@ class SamplerTests(unittest.TestCase):
         self.assertEqual(config.method, "res_multistep")
         self.assertEqual(config.evaluation_profile, "late_aggressive_13")
         self.assertEqual(len(config.actual_indices), 13)
+        output = MiniMaxH3VectorAccelSampler.execute(
+            "res_multistep", "adaptive_history_v1", "off"
+        )
+        self.assertEqual(
+            output.result[0].h3_vector_config.evaluation_profile,
+            "adaptive_history_v1",
+        )
+        self.assertIn(
+            "requires the res_multistep method",
+            MiniMaxH3VectorAccelSampler.validate_inputs("euler", "adaptive_history_v1"),
+        )
+        output = MiniMaxH3VectorAccelSampler.execute(
+            "res_multistep", "adaptive_history_v2", "off"
+        )
+        self.assertEqual(
+            output.result[0].h3_vector_config.evaluation_profile,
+            "adaptive_history_v2",
+        )
+        self.assertIn(
+            "requires the res_multistep method",
+            MiniMaxH3VectorAccelSampler.validate_inputs("euler", "adaptive_history_v2"),
+        )
 
     def test_node_hides_unavailable_adaptive_controls_without_removing_them(self):
         with mock.patch("h3_vector_accel.nodes._profile_names", return_value=[]):
@@ -334,6 +359,104 @@ class SamplerTests(unittest.TestCase):
         self.assertTrue(torch.equal(direct, configured))
         self.assertEqual(direct_model.calls, 20)
         self.assertEqual(configured_model.calls, 20)
+
+    def test_incremental_res_matches_stock_on_full_and_irregular_schedules(self):
+        schedules = (
+            self.sigmas,
+            torch.tensor([20.0, 17.0, 13.0, 8.0, 4.0, 1.0, 0.0]),
+        )
+        velocity = lambda x, sigma: 0.2 * x + 0.03 * sigma + 1.0
+        for sigmas in schedules:
+            direct = sample_res_multistep(
+                ResModel(velocity), self.x.clone(), sigmas, disable=True,
+            )
+            incremental_model = ResModel(velocity)
+            incremental = self.x.clone()
+            stepper = IncrementalRES()
+            for sigma, sigma_next in zip(sigmas[:-1], sigmas[1:]):
+                denoised = incremental_model(incremental, sigma.reshape(1))
+                incremental = stepper.step(incremental, sigma, denoised, sigma_next)
+            self.assertTrue(torch.equal(direct, incremental))
+
+    def test_adaptive_res_reports_causal_effective_schedule_and_honest_nfe(self):
+        sigmas = torch.tensor([
+            1.0, 0.9956331849, 0.9908256531, 0.9855073094, 0.9795918465,
+            0.9729729891, 0.9655172229, 0.9570552111, 0.9473683834,
+            0.9361702204, 0.9230769277, 0.9075629711, 0.8888888955,
+            0.8659793735, 0.8372092843, 0.8000000119, 0.75,
+            0.6792452931, 0.5714285970, 0.3870967925, 0.0,
+        ])
+        config = SamplerConfig(
+            method="res_multistep", evaluation_profile="adaptive_history_v1",
+        )
+        diagnostics = RunDiagnostics(config=config, latent_shapes=ResInner.latent_shapes)
+        callbacks, contexts = [], []
+        model = ResModel(lambda x, sigma: torch.full_like(
+            x, 1.0 + 100.0 * max(sigma - 0.98, 0.0)
+        ))
+        sample_vector_accel(
+            model, torch.zeros(1, 1, 6), sigmas, disable=True, config=config,
+            diagnostics=diagnostics,
+            callback=lambda row: (callbacks.append(row), contexts.append(current_callback_metadata())),
+        )
+        effective = diagnostics._run_metadata["effective_sigma_sequence"]
+        self.assertEqual(effective[:6], sigmas[:6].tolist())
+        self.assertEqual(effective[-4:], sigmas[17:20].tolist() + [0.0])
+        self.assertTrue(all(a > b for a, b in zip(effective, effective[1:])))
+        self.assertLess(model.calls, 20, diagnostics._run_metadata["adaptive_decisions"])
+        self.assertEqual(model.calls, len(callbacks))
+        self.assertEqual(model.calls, diagnostics.true_nfe)
+        self.assertEqual(
+            [row["h3_vector_actual_anchor_index"] for row in callbacks],
+            list(range(model.calls)),
+        )
+        self.assertNotEqual(callbacks[5]["h3_vector_policy_reason"], "protected_prefix")
+        self.assertEqual(callbacks[-1]["i"], 19)
+        self.assertTrue(all(not row["h3_vector_forecast"] for row in callbacks))
+        self.assertTrue(all(context["h3_vector_callback_context"] == "h3_vector_adaptive_actual_only"
+                            for context in contexts))
+        self.assertIn("effective_sigma_hash", diagnostics._run_metadata)
+        self.assertIn("adaptive_controller", diagnostics._run_metadata["configuration"])
+        with self.assertRaisesRegex(ValueError, "does not have fixed actual indices"):
+            _ = config.actual_indices
+
+    def test_adaptive_res_v2_has_bootstrap_two_anchor_tail_and_honest_nfe(self):
+        sigmas = torch.tensor([
+            1.0, 0.9956331849, 0.9908256531, 0.9855073094, 0.9795918465,
+            0.9729729891, 0.9655172229, 0.9570552111, 0.9473683834,
+            0.9361702204, 0.9230769277, 0.9075629711, 0.8888888955,
+            0.8659793735, 0.8372092843, 0.8000000119, 0.75,
+            0.6792452931, 0.5714285970, 0.3870967925, 0.0,
+        ])
+        config = SamplerConfig(
+            method="res_multistep", evaluation_profile="adaptive_history_v2",
+        )
+        diagnostics = RunDiagnostics(config=config, latent_shapes=ResInner.latent_shapes)
+        callbacks = []
+        model = ResModel(lambda x, sigma: torch.full_like(
+            x, 1.0 + 100.0 * max(sigma - 0.98, 0.0)
+        ))
+        sample_vector_accel(
+            model, torch.zeros(1, 1, 6), sigmas, disable=True, config=config,
+            diagnostics=diagnostics, callback=callbacks.append,
+        )
+        effective = diagnostics._run_metadata["effective_sigma_sequence"]
+        decisions = diagnostics._run_metadata["adaptive_decisions"]
+        self.assertEqual(effective[:4], sigmas[:4].tolist())
+        self.assertEqual(effective[-3:], sigmas[18:20].tolist() + [0.0])
+        self.assertEqual([row["reason"] for row in decisions[:3]], ["bootstrap"] * 3)
+        self.assertEqual([row["protected_region"] for row in decisions[:4]], ["bootstrap"] * 4)
+        self.assertTrue(all(row["reason"] != "protected_prefix" for row in decisions))
+        self.assertTrue(all(a > b for a, b in zip(effective, effective[1:])))
+        self.assertLessEqual(model.calls, 20)
+        self.assertEqual(model.calls, len(callbacks))
+        self.assertEqual(model.calls, diagnostics.true_nfe)
+        self.assertEqual(callbacks[-1]["i"], 19)
+        self.assertTrue(all(not row["h3_vector_forecast"] for row in callbacks))
+        self.assertEqual(
+            diagnostics._run_metadata["configuration"]["adaptive_controller"]["version"],
+            "adaptive_history_v2",
+        )
 
     def test_core_solvers_reject_adaptive_and_invalid_source_schedule(self):
         with self.assertRaisesRegex(ValueError, "core solver methods require the fixed policy"):

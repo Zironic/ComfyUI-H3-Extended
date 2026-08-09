@@ -19,6 +19,7 @@ from .fingerprint import (
 from .policy import make_policy
 from .predictor import make_predictor
 from .repairability import ProfileCompatibility, RepairabilityProfile
+from .adaptive_res import AdaptiveHistoryController, AdaptiveHistoryControllerV2, IncrementalRES
 
 
 @dataclass(frozen=True)
@@ -228,6 +229,142 @@ class _TimedModel:
         return getattr(self._model, name)
 
 
+def _sample_adaptive_res(model, x, source_sigmas, extra_args, callback, disable, config,
+                         diagnostics, context):
+    """Run causal adaptive RES with one genuine model call per accepted anchor."""
+    source = source_sigmas.detach().cpu().tolist()
+    source_hash = sigma_hash(source_sigmas)
+    controller_class = (AdaptiveHistoryControllerV2
+                        if config.evaluation_profile == "adaptive_history_v2"
+                        else AdaptiveHistoryController)
+    controller = controller_class(source, latent_shapes=context.latent_shapes)
+    stepper = IncrementalRES()
+    timed_model = _TimedModel(model)
+    diagnostics = diagnostics or RunDiagnostics(config=config, latent_shapes=context.latent_shapes,
+                                                model_fingerprint=context.model_fingerprint)
+    diagnostics.start_run(
+        sigmas=source, method=config.method, evaluation_profile=config.evaluation_profile,
+        configuration_fingerprint=configuration_fingerprint(config, source_sigmas, context.model_fingerprint),
+        configuration=configuration_payload(config, source_sigmas, context.model_fingerprint),
+        sigma_hash=source_hash, source_sigma_hash=source_hash,
+        source_sigma_sequence=source, controller_version=controller.version,
+        controller_constants=dict(controller.constants), effective_sigma_sequence=[],
+    )
+    s_in = x.new_ones([x.shape[0]])
+    sigma = source_sigmas[0]
+    prev_derivative = prev_denoised = prev_sigma = None
+    effective = []
+    decisions = []
+    started = time.perf_counter()
+    while True:
+        denoised = timed_model(x, sigma * s_in, **extra_args)
+        derivative = _to_d(x, sigma, denoised)
+        if not _finite(derivative):
+            raise RuntimeError("model returned a non-finite derivative")
+        effective.append(_scalar_sigma(sigma))
+        observation = controller.observe(
+            sigma, derivative, denoised,
+            prev_derivative, prev_denoised, prev_sigma,
+        )
+        sigma_next_value, decision = controller.propose(sigma, observation)
+        decisions.append(decision)
+        current_source = controller._source_index(_scalar_sigma(sigma))
+        tail_start = controller.constants["protected_tail"][0]
+        tail_count = len(controller.constants["protected_tail"])
+        if (len(effective) >= controller.max_nfe - tail_count and
+                (current_source is None or current_source < tail_start)):
+            sigma_next_value = source[tail_start]
+            decision = dict(
+                decision,
+                reason="reserve_protected_tail",
+                next_sigma=sigma_next_value,
+                proposed_interval_t=-math.log(sigma_next_value) + math.log(_scalar_sigma(sigma)),
+                protected_region="tail",
+            )
+            decisions[-1] = decision
+        if not math.isfinite(sigma_next_value) or not 0.0 <= sigma_next_value < _scalar_sigma(sigma):
+            raise RuntimeError("adaptive RES proposed an invalid sigma")
+        sigma_next = sigma.new_tensor(sigma_next_value)
+        source_index = controller._source_index(_scalar_sigma(sigma))
+        logical_step = controller._containing_index(_scalar_sigma(sigma)) if source_index is None else min(source_index, 19)
+        anchor_index = len(effective) - 1
+        metadata = {
+            "x": x, "i": logical_step, "sigma": sigma, "sigma_hat": sigma,
+            "denoised": denoised, "h3_vector_forecast": False,
+            "h3_vector_true_nfe": len(effective),
+            "h3_vector_actual_anchor_index": anchor_index,
+            "h3_vector_logical_step": logical_step,
+            "h3_vector_method": config.method, "h3_vector_profile": config.evaluation_profile,
+            "h3_vector_policy": config.policy, "h3_vector_policy_reason": decision["reason"],
+            "h3_vector_step_scale": decision["step_scale"],
+            "h3_vector_local_base_interval": decision.get("local_base_interval"),
+            "h3_vector_proposed_interval_t": decision.get("proposed_interval_t"),
+            "h3_vector_next_sigma": sigma_next_value,
+            "h3_vector_protected_region": decision.get("protected_region"),
+            "h3_vector_video_change": observation.video_change,
+            "h3_vector_audio_change": observation.audio_change,
+            "h3_vector_video_direction_cosine": observation.video_cosine,
+            "h3_vector_audio_direction_cosine": observation.audio_cosine,
+            "h3_vector_video_rate": observation.video_rate,
+            "h3_vector_audio_rate": observation.audio_rate,
+            "h3_vector_video_x0_change": observation.video_x0_change,
+            "h3_vector_audio_x0_change": observation.audio_x0_change,
+            "h3_vector_source_sigma_hash": source_hash,
+            "h3_vector_callback_context": "h3_vector_adaptive_actual_only",
+            "h3_vector_controller_version": controller.version,
+        }
+        if callback is not None:
+            with callback_metadata_scope({k: v for k, v in metadata.items() if k.startswith("h3_vector_")}):
+                callback(metadata)
+        diagnostics.observe_actual_anchor(
+            logical_step, _scalar_sigma(sigma), x=x, actual_derivative=derivative,
+            policy_reason=decision["reason"], step_scale=decision["step_scale"],
+            source_index=source_index, next_sigma=sigma_next_value,
+            local_base_interval=decision.get("local_base_interval"),
+            proposed_interval_t=decision.get("proposed_interval_t"),
+            protected_region=decision.get("protected_region"), trajectory_metrics={
+                "video_change": observation.video_change, "audio_change": observation.audio_change,
+                "video_x0_change": observation.video_x0_change,
+                "audio_x0_change": observation.audio_x0_change,
+                "video_direction_cosine": observation.video_cosine,
+                "audio_direction_cosine": observation.audio_cosine,
+                "video_rate": observation.video_rate, "audio_rate": observation.audio_rate,
+                "video_score": observation.video_score, "audio_score": observation.audio_score,
+            },
+        )
+        diagnostics.observe_step(logical_step, _scalar_sigma(sigma), False, len(effective),
+                                 actual_anchor_index=anchor_index, method=config.method,
+                                 profile=config.evaluation_profile, policy=config.policy,
+                                 policy_reason=decision["reason"], step_scale=decision["step_scale"],
+                                 next_sigma=sigma_next_value,
+                                 proposed_interval_t=decision.get("proposed_interval_t"),
+                                 protected_region=decision.get("protected_region"))
+        if sigma_next_value <= 0.0 or len(effective) >= controller.max_nfe:
+            if sigma_next_value > 0.0:
+                sigma_next = sigma.new_zeros(())
+            x = stepper.step(x, sigma, denoised, sigma_next)
+            break
+        x = stepper.step(x, sigma, denoised, sigma_next)
+        prev_derivative, prev_denoised, prev_sigma = derivative, denoised, sigma
+        sigma = sigma_next
+    effective.append(0.0)
+    effective_tensor = source_sigmas.new_tensor(effective)
+    run_fingerprint = configuration_fingerprint(config, source_sigmas, context.model_fingerprint,
+                                                effective_sigmas=effective_tensor)
+    diagnostics.update_run_metadata(
+        effective_sigma_hash=sigma_hash(effective_tensor),
+        effective_sigma_sequence=effective,
+        configuration_fingerprint=run_fingerprint,
+        effective_schedule_fingerprint=run_fingerprint,
+        adaptive_decisions=decisions,
+    )
+    wall_seconds = time.perf_counter() - started
+    diagnostics.finish_run(model_call_seconds=timed_model.elapsed,
+                           sampler_overhead_seconds=max(0.0, wall_seconds - timed_model.elapsed),
+                           wall_seconds=wall_seconds)
+    return x
+
+
 def _sample_core_solver(model, x, source_sigmas, extra_args, callback, disable, config,
                         diagnostics, context):
     logical_steps = int(source_sigmas.numel() - 1)
@@ -243,6 +380,9 @@ def _sample_core_solver(model, x, source_sigmas, extra_args, callback, disable, 
     if not context.is_h3_flow_av:
         raise RuntimeError("core solver methods require ModelSamplingAV combined with CONST flow sampling")
 
+    if config.evaluation_profile in ("adaptive_history_v1", "adaptive_history_v2"):
+        return _sample_adaptive_res(model, x, source_sigmas, extra_args, callback, disable,
+                                    config, diagnostics, context)
     actual_indices = config.actual_indices
     index_tensor = torch.as_tensor(actual_indices, device=source_sigmas.device)
     effective_sigmas = torch.cat((source_sigmas.index_select(0, index_tensor), source_sigmas[-1:]))

@@ -2,8 +2,16 @@
 import os, sys, unittest
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(_HERE))
-from h3_vector_accel.config import SamplerConfig, actual_mask
-from h3_vector_accel.policy import AdaptiveRepairPolicy, make_policy
+sys.path.insert(0, os.path.abspath(os.path.join(_HERE, "..", "..", "..")))
+
+_ORIGINAL_ARGV = list(sys.argv)
+sys.argv = [sys.argv[0], "--cpu"]
+import comfy.options  # noqa: E402
+comfy.options.enable_args_parsing()
+
+from h3_vector_accel.config import SamplerConfig, actual_mask  # noqa: E402
+from h3_vector_accel.policy import AdaptiveRepairPolicy, make_policy  # noqa: E402
+sys.argv = _ORIGINAL_ARGV
 
 
 class Profile:

@@ -1,0 +1,120 @@
+# H3 History-Controlled Adaptive RES Plan
+
+## Outcome
+
+Add a reproducible `res_multistep + adaptive_history_v1` experiment that uses
+only genuine H3 evaluations. It must protect the known-sensitive prefix and
+tail, choose intermediate sigma coordinates causally from trajectory changes
+observed at paid anchors, preserve RES multistep state across those choices,
+and report the resulting schedule and true NFE.
+
+This tests whether H3 can select its own evaluation density. It does not use
+velocity forecasts, synthetic denoised values, hidden error probes, rejected
+steps, or rollback.
+
+## Evidence behind the change
+
+- `res_multistep + late_aggressive_13` is perceptually equivalent to the tested
+  20-NFE outputs, while an equal-NFE early-aggressive placement corrupted video.
+- The current fixed sparse RES path already proves that stock RES accepts a
+  supplied nonuniform schedule.
+- Stock `sample_res_multistep` owns its complete schedule and keeps multistep
+  history in local variables. Calling it once per adaptive interval would reset
+  that history and is therefore not an adaptive RES implementation.
+
+The result is evidence for evaluation placement on the tested generation, not
+yet a general H3 quality claim.
+
+## Version-one contract
+
+### User-visible selection
+
+- Keep the existing solver choices and widget order.
+- Add `adaptive_history_v1` to the actual-evaluation schedule choices.
+- Permit it only with `res_multistep`; incompatible combinations fail prompt
+  validation with a clear error.
+- Expose no uncalibrated controller knobs. The controller constants and version
+  are fingerprinted so later tuning produces a new named version.
+
+### RES integration
+
+Extract the deterministic eta-zero RES update into a run-scoped incremental
+stepper. Its state is the previous denoised prediction, previous sigma-down,
+and previous evaluated sigma. The first interval and the terminal-zero interval
+use the same Euler branches as stock RES; all other intervals use the same
+log-sigma, `c2`, `phi1`, `phi2`, `b1`, and `b2` equations.
+
+For any predetermined descending schedule, the incremental stepper must match
+stock `sample_res_multistep` before it is used by the adaptive controller.
+
+### Controller
+
+- Use RES time `t = -log(sigma)` for interval arithmetic.
+- Evaluate source indices 0 through 5 exactly.
+- Protect source indices 17, 18, and 19 and the terminal-zero transition.
+- Between those regions, propose continuous off-grid `t` coordinates using the
+  local spacing of the original 20-step scheduler as the baseline.
+- Maintain a dimensionless step scale in `[1, 3]`, initially 1. Each low-change
+  observation grows it by 1.5, each high-change or audio-emergency observation
+  shrinks it by 0.7, and a moderate observation keeps it unchanged.
+- Establish the reference trajectory-change rate from the last three
+  protected-prefix intervals. Low and high bands compare later per-unit-t
+  rates against that fixed, versioned reference so widening source intervals
+  are not mistaken for increasing trajectory curvature.
+- Calculate per-modality relative velocity change, relative x0 change,
+  velocity-direction cosine, and their per-unit-t rates. Video drives normal
+  decisions; audio is an emergency shrink signal.
+- Clamp every proposal to strict descent, the protected-tail boundary, and a
+  maximum of 20 genuine evaluations. Every proposed anchor is accepted and
+  counted; there are no unreported probes.
+
+### Observability
+
+Every callback and full diagnostic anchor records the actual sigma, true NFE,
+step scale, local base interval, proposed interval, video/audio trajectory
+metrics, decision reason, and whether the anchor belongs to the protected
+prefix or tail. Run metadata records the source schedule, selected effective
+schedule, controller version/constants, and hashes of both schedules.
+
+The configuration fingerprint includes the adaptive controller identity and
+constants. The final effective-schedule hash is a run result because it is not
+known when the sampler object is constructed.
+
+## Version-two contract
+
+`adaptive_history_v2` removes the hand-authored protected head while preserving
+the same RES integration and controller limits. It uses source anchors 0-3 only
+as the minimum bootstrap needed to measure three trajectory-change intervals.
+After that, no head coordinate is forced. Two consecutive low-video-change
+observations are required before widening; moderate or high change clears the
+streak, and high change or an audio emergency shrinks immediately. Only tail
+anchors 18/19 and terminal zero remain protected.
+
+The v2 identity fingerprints the four-anchor bootstrap, zero protected-prefix
+length, two-observation growth gate, and shortened tail separately from v1.
+
+## Acceptance evidence
+
+CPU tests must establish:
+
+1. Incremental RES is equal to stock RES on full and irregular predetermined
+   schedules, with one model call and callback per nonterminal anchor.
+2. Adaptive schedules are finite, strictly descending, terminate at zero,
+   contain the version's exact bootstrap/protected anchors, and never exceed
+   20 NFE.
+3. Controller decisions use only current and earlier genuine anchors; no
+   synthetic anchor is added and no extra model call is made for error control.
+4. Low change grows spacing, high video change shrinks it, and an audio
+   emergency can shrink it without making audio the normal controller.
+5. Diagnostics and callback metadata expose the selected schedule, decisions,
+   trajectory metrics, and honest NFE.
+6. Fixed Euler, fixed RES, and forecast modes retain their existing parity,
+   masks, node input ordering, and legacy-name normalization.
+
+No CPU test establishes H3 output quality. After restart, the next authorized
+live experiment is `res_multistep + adaptive_history_v2` with full diagnostics.
+Compare its selected coordinates, NFE, media quality, sampler/model time, and
+fingerprint against `res_multistep + late_aggressive_13` and the established
+20-NFE RES reference. The research success criterion is comparable quality at
+variable NFE across held-out prompts and seeds, not exact reproduction of the
+hand-authored 13-point coordinates.

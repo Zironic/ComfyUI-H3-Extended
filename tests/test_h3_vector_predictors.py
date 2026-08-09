@@ -4,7 +4,14 @@ import torch
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(_HERE))
 sys.path.insert(0, os.path.abspath(os.path.join(_HERE, "..", "..", "..")))
-from h3_vector_accel.predictor import HoldPredictor, LinearVelocityPredictor, VDEPredictor
+
+_ORIGINAL_ARGV = list(sys.argv)
+sys.argv = [sys.argv[0], "--cpu"]
+import comfy.options  # noqa: E402
+comfy.options.enable_args_parsing()
+
+from h3_vector_accel.predictor import HoldPredictor, LinearVelocityPredictor, VDEPredictor  # noqa: E402
+sys.argv = _ORIGINAL_ARGV
 
 class PredictorTests(unittest.TestCase):
     def test_hold_uses_actual_only(self):

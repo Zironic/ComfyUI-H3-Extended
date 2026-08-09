@@ -8,8 +8,14 @@ import torch
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(_HERE))
+sys.path.insert(0, os.path.abspath(os.path.join(_HERE, "..", "..", "..")))
 
-from h3_vector_accel.fingerprint import sigma_hash
+_ORIGINAL_ARGV = list(sys.argv)
+sys.argv = [sys.argv[0], "--cpu"]
+import comfy.options  # noqa: E402
+comfy.options.enable_args_parsing()
+
+from h3_vector_accel.fingerprint import sigma_hash  # noqa: E402
 from h3_vector_accel.repairability import (
     ProfileCompatibility,
     RepairabilityProfile,
@@ -17,7 +23,8 @@ from h3_vector_accel.repairability import (
     capture_native_trajectory,
     run_natural_omission,
     run_normalized_perturbation,
-)
+)  # noqa: E402
+sys.argv = _ORIGINAL_ARGV
 
 
 class FakeModel:

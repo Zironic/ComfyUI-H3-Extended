@@ -6,13 +6,22 @@ import unittest
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(_HERE))
+sys.path.insert(0, os.path.abspath(os.path.join(_HERE, "..", "..", "..")))
+
+_ORIGINAL_ARGV = list(sys.argv)
+sys.argv = [sys.argv[0], "--cpu"]
+import comfy.options  # noqa: E402
+comfy.options.enable_args_parsing()
 
 from h3_vector_accel.study import (
     adaptive_comparison_arms,
+    adaptive_history_arm,
+    adaptive_history_v2_arm,
     fixed_policy_arms,
     four_arm_study_arms,
     run_fixed_policy_study,
 )
+sys.argv = _ORIGINAL_ARGV
 
 
 class StudyTests(unittest.TestCase):
@@ -75,6 +84,16 @@ class StudyTests(unittest.TestCase):
             ],
         )
         self.assertEqual({arm.phase for arm in arms}, {"solver_comparison"})
+
+    def test_adaptive_history_arm_has_variable_nfe_and_no_fixed_indices(self):
+        for arm, profile in (
+            (adaptive_history_arm(), "adaptive_history_v1"),
+            (adaptive_history_v2_arm(), "adaptive_history_v2"),
+        ):
+            self.assertEqual(arm.method, "res_multistep")
+            self.assertEqual(arm.evaluation_profile, profile)
+            self.assertIsNone(arm.expected_true_nfe)
+            self.assertIsNone(arm.as_dict()["actual_indices"])
 
 
 if __name__ == "__main__":

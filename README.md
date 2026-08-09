@@ -46,10 +46,33 @@ points, while a reduced profile passes only its named anchors plus the terminal
 sigma to the core solver. The 13-NFE multistep benchmark is therefore
 `res_multistep + late_aggressive_13`.
 
+`res_multistep + adaptive_history_v1` is the causal experiment: it evaluates
+the protected 0-5 prefix and 17-19 tail exactly, proposes intermediate
+log-sigma coordinates from observed video trajectory changes, and shrinks only
+for an audio emergency. Every accepted anchor is a genuine H3 call (at most
+20 NFE); no forecast, probe, or rollback is used.
+
+`adaptive_history_v2` bootstraps with source anchors 0-3, then adapts without a
+protected quality head while retaining tail anchors 18/19 and terminal zero.
+It requires two consecutive low-change observations before widening.
+
 `late_aggressive_13` is the current accelerated reference profile. The first
 controlled placement comparison found that the equal-NFE early profile severely
-corrupted video, so adaptive policies protect logical steps 0-5 and use video
-risk for normal decisions while retaining audio as an emergency veto.
+corrupted video. Version one and the forecast-repair policy therefore protect
+logical steps 0-5; version two deliberately tests whether the trajectory signal
+can discover that boundary without the fixed protection.
+
+Diagnostics can be inspected without importing ComfyUI or loading a model:
+
+```powershell
+python benchmarks/analyze_vector_runs.py --run latest --decisions
+python benchmarks/analyze_vector_runs.py --run RUN_ID --compare OTHER_RUN_ID --format json
+```
+
+The analyzer checks schedule/NFE/fallback invariants and labels explicit
+comparisons `raw/not automatically comparable`. `--server http://127.0.0.1:PORT`
+only performs verified, read-only queue/system-stats/history requests; a failed
+installation or execution-window check remains diagnostics-only.
 
 Adaptive repair-aware skipping is exposed only when a matching measured profile
 is installed. VDE remains experimental and should be characterized under fixed
