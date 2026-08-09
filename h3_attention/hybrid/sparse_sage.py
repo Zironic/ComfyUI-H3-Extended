@@ -148,6 +148,76 @@ def _cuda_version():
     return int(parts[0]), int(parts[1])
 
 
+@torch.library.custom_op(
+    "minimax_h3::prepare_sparse_sage_v",
+    mutates_args=(),
+    device_types="cuda",
+)
+def prepare_sparse_sage_v_op(
+    v: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    api = load_sparse_sage_api()
+    return prepare_v_fp8(v, api.v_fused)
+
+
+@prepare_sparse_sage_v_op.register_fake
+def _prepare_sparse_sage_v_fake(v):
+    padded = (v.shape[-2] + 127) // 128 * 128
+    return (
+        v.new_empty((*v.shape[:-2], v.shape[-1], padded), dtype=torch.float8_e4m3fn),
+        v.new_empty((*v.shape[:-2], v.shape[-1]), dtype=torch.float32),
+    )
+
+
+def prepare_sparse_sage_v(v, _fused=None):
+    return prepare_sparse_sage_v_op(v)
+
+
+@torch.library.custom_op(
+    "minimax_h3::sparse_sage_attention",
+    mutates_args=(),
+    device_types="cuda",
+)
+def sparse_sage_attention_op(
+    q_int8: torch.Tensor,
+    k_int8: torch.Tensor,
+    v_fp8: torch.Tensor,
+    lut: torch.Tensor,
+    valid_block_num: torch.Tensor,
+    pv_threshold: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    api = load_sparse_sage_api()
+    kernel = api.low_level_f16 if _cuda_version() >= (12, 8) else api.low_level_f32
+    output = torch.empty(q_int8.shape, dtype=output_dtype, device=q_int8.device)
+    kernel(
+        q_int8, k_int8, v_fp8, output,
+        lut, valid_block_num, pv_threshold,
+        q_scale, k_scale, v_scale,
+        1, 0, 1, 128 ** -0.5, 0,
+    )
+    return output
+
+
+@sparse_sage_attention_op.register_fake
+def _sparse_sage_attention_fake(
+    q_int8,
+    k_int8,
+    v_fp8,
+    lut,
+    valid_block_num,
+    pv_threshold,
+    q_scale,
+    k_scale,
+    v_scale,
+    output_dtype,
+):
+    return q_int8.new_empty(q_int8.shape, dtype=output_dtype)
+
+
 class SparseSageExecutor:
     def __init__(self, api, *, allow_cpu_for_tests=False, qk_quantizer=None,
                  v_preparer=None, low_level_selector=None):
@@ -156,8 +226,13 @@ class SparseSageExecutor:
         self.api = api
         self.allow_cpu_for_tests = bool(allow_cpu_for_tests)
         self.qk_quantizer = qk_quantizer or quantize_qk
-        self.v_preparer = v_preparer or prepare_v_fp8
+        self.v_preparer = v_preparer or (
+            prepare_v_fp8 if self.allow_cpu_for_tests else prepare_sparse_sage_v
+        )
         self.low_level_selector = low_level_selector or self._select_low_level
+        self._use_sparse_sage_op = (
+            low_level_selector is None and not self.allow_cpu_for_tests
+        )
 
     def _validate(self, q, k, v, lut, valid):
         if q.shape != k.shape or q.shape != v.shape:
@@ -345,17 +420,31 @@ class SparseSageExecutor:
         )
 
     def execute(self, prepared):
-        output = torch.empty(prepared.output_shape, dtype=prepared.output_dtype,
-                             device=prepared.q_int8.device)
         kernel_timing = prepared.timing.begin("sparse_sage_low_level_kernel") if prepared.timing is not None else None
         try:
-            kernel = self.low_level_selector(prepared.q_int8)
-            kernel(
-                prepared.q_int8, prepared.k_int8, prepared.v_fp8, output,
-                prepared.lut, prepared.valid_block_num, prepared.pv_threshold,
-                prepared.q_scale, prepared.k_scale, prepared.v_scale,
-                1, 0, 1, 128 ** -0.5, 0,
-            )
+            if self._use_sparse_sage_op:
+                output = sparse_sage_attention_op(
+                    prepared.q_int8,
+                    prepared.k_int8,
+                    prepared.v_fp8,
+                    prepared.lut,
+                    prepared.valid_block_num,
+                    prepared.pv_threshold,
+                    prepared.q_scale,
+                    prepared.k_scale,
+                    prepared.v_scale,
+                    prepared.output_dtype,
+                )
+            else:
+                output = torch.empty(prepared.output_shape, dtype=prepared.output_dtype,
+                                     device=prepared.q_int8.device)
+                kernel = self.low_level_selector(prepared.q_int8)
+                kernel(
+                    prepared.q_int8, prepared.k_int8, prepared.v_fp8, output,
+                    prepared.lut, prepared.valid_block_num, prepared.pv_threshold,
+                    prepared.q_scale, prepared.k_scale, prepared.v_scale,
+                    1, 0, 1, 128 ** -0.5, 0,
+                )
         except Exception as exc:
             raise SparseSageError(
                 "Sparse Sage kernel failed: layer=%d sequence=%d heads=%d "

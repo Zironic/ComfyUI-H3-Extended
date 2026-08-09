@@ -21,6 +21,7 @@ try:
     )
     from ..h3_memory_optimizer.config import ACTIVATION_MODES, MemoryOptimizerConfig
     from ..h3_memory_optimizer.patch import apply
+    from ..h3_runtime.compile_compat import request_shared_block_compile
 except ImportError:
     from h3_activation_memory.config import DEFAULT_CHUNK_ROWS, DEFAULT_MODE
     from h3_attention.hybrid import (
@@ -37,6 +38,7 @@ except ImportError:
     )
     from h3_memory_optimizer.config import ACTIVATION_MODES, MemoryOptimizerConfig
     from h3_memory_optimizer.patch import apply
+    from h3_runtime.compile_compat import request_shared_block_compile
 
 ATTENTION_HYBRID = "hybrid_sparse"
 
@@ -76,6 +78,13 @@ class MiniMaxH3HybridSparseAttention(io.ComfyNode):
                 ),
                 io.String.Input("run_tag", default="hybrid50"),
                 io.Boolean.Input("timing", default=True),
+                io.Combo.Input(
+                    "compile_backend", options=["off", "inductor"], default="off",
+                    tooltip=(
+                        "Compile one shared tensor program for all 50 main H3 blocks. "
+                        "Do not combine this with TorchCompileModel."
+                    ),
+                ),
             ],
             outputs=[io.Model.Output()],
         )
@@ -83,7 +92,8 @@ class MiniMaxH3HybridSparseAttention(io.ComfyNode):
     @classmethod
     def execute(cls, model, enabled=True, mode="sage128", video_budget=0.5,
                 strict=True, activation=DEFAULT_MODE,
-                chunk_rows=DEFAULT_CHUNK_ROWS, run_tag="hybrid50", timing=True) -> io.NodeOutput:
+                chunk_rows=DEFAULT_CHUNK_ROWS, run_tag="hybrid50", timing=True,
+                compile_backend="off") -> io.NodeOutput:
         if not enabled:
             return io.NodeOutput(model)
 
@@ -121,6 +131,8 @@ class MiniMaxH3HybridSparseAttention(io.ComfyNode):
             activation_strict=bool(strict),
         )
         patched = model.clone()
+        if compile_backend == "inductor":
+            request_shared_block_compile(patched)
         apply(patched, config=optimizer_config, decision=decision)
         return io.NodeOutput(patched)
 

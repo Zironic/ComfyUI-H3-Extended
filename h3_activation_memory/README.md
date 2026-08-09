@@ -11,11 +11,21 @@ before the sampler.
 - `mlp_chunked_bf16`: bounded BF16 SwiGLU slabs.
 - `mlp_chunked_native`: default; uses Comfy's fused TensorWise-INT8 SwiGLU path
   when the active `fc2` layout supports it.
+- `mlp_chunked_convrot_2slice`: strict BF16-only H3 ConvRot mode. It pre-packs
+  exactly two equal feature slices (7,168 each for the 14,336-wide H3 FFN),
+  runs ConvRot INT8 fc1 and fused SwiGLU/fc2 per slice, and accumulates the
+  partial hidden outputs without materializing the full fc1 expansion. Both
+  weights must be non-transposed TensorWise-INT8 ConvRot-256 tensors with
+  per-output-channel scales and no bias; unsupported layouts fail explicitly.
 - `chunk_rows`: default 2048, selected from the real-weight MLP sweep.
 - `prefer_held_weights`: enabled by default; acquires `fc1` and `fc2` once per
   block when distinct async cast buffers make that safe. A same-buffer case
   uses ordinary per-slab module calls instead of risking weight corruption.
-- `strict`: raises on core drift, unsupported acquisition, or `torch.compile`.
+- `strict`: raises on core drift or unsupported weight acquisition.
+
+The ConvRot kernels expose fake-tensor contracts for `torch.compile`; weight
+tile preparation and both fused linears remain explicit operations in the
+compiled graph.
 
 The patch owns `diffusion_model.blocks.N.forward`; the attention work owns
 `diffusion_model.blocks.N.attn.forward`, so both patches compose.

@@ -289,6 +289,22 @@ def test_node_mode_schema():
     check(mode.default == "sage128",
           "established mode remains the backward-compatible default")
 
+    from h3_memory_optimizer.config import ACTIVATION_MODES
+    activation = next(item for item in schema.inputs if item.id == "activation")
+    check(
+        "mlp_chunked_convrot_2slice" in activation.options
+        and "mlp_chunked_convrot_2slice" in ACTIVATION_MODES,
+        "Hybrid Sparse activation exposes the two-slice ConvRot mode",
+    )
+    compile_backend = next(
+        item for item in schema.inputs if item.id == "compile_backend"
+    )
+    check(
+        compile_backend.options == ["off", "inductor"]
+        and compile_backend.default == "off",
+        "shared block compilation is explicit and backward compatible",
+    )
+
 
 def test_report_files():
     print("request report")

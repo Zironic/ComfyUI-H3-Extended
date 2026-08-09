@@ -1,7 +1,7 @@
 """Direct Sparse-Sage tile routing for MiniMax H3 hybrid attention."""
 
-from dataclasses import dataclass
 import math
+from dataclasses import dataclass
 
 import torch
 
@@ -11,6 +11,26 @@ KV_TILE = 64
 
 class SparseRouterError(RuntimeError):
     pass
+
+
+@torch.library.custom_op(
+    "minimax_h3::sort_selected_indices",
+    mutates_args=(),
+    device_types="cuda",
+)
+def sort_selected_indices_op(indices: torch.Tensor) -> torch.Tensor:
+    return indices.sort(dim=-1).values
+
+
+@sort_selected_indices_op.register_fake
+def _sort_selected_indices_fake(indices):
+    return torch.empty_like(indices)
+
+
+def sort_selected_indices(indices):
+    if torch.compiler.is_compiling() or indices.is_cuda:
+        return sort_selected_indices_op(indices)
+    return indices.sort(dim=-1).values
 
 
 @dataclass(frozen=True)
@@ -239,7 +259,9 @@ class SparseTileRouter:
                 q_means[..., geometry.pure_video_q_start:, :],
                 k_means[..., geometry.pure_video_kv_start:, :].transpose(-1, -2),
             )
-            selected = torch.topk(scores, retained, dim=-1).indices.sort(dim=-1).values
+            selected = sort_selected_indices(
+                torch.topk(scores, retained, dim=-1).indices
+            )
             selected = selected.to(torch.int32) + geometry.pure_video_kv_start
 
         if retained < pure_kv:

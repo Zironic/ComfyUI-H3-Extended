@@ -45,7 +45,9 @@ class MiniMaxH3ActivationMemory(io.ComfyNode):
                     tooltip=(
                         "mlp_chunked_bf16 materializes a bounded BF16 SwiGLU "
                         "slab before fc2. mlp_chunked_native uses Comfy's fused "
-                        "TensorWise-INT8 SwiGLU path when available."
+                        "TensorWise-INT8 SwiGLU path when available. "
+                        "mlp_chunked_convrot_2slice requires BF16 H3 ConvRot "
+                        "weights and computes two equal feature tiles."
                     ),
                 ),
                 io.Int.Input(
@@ -73,9 +75,9 @@ class MiniMaxH3ActivationMemory(io.ComfyNode):
                     "strict",
                     default=True,
                     tooltip=(
-                        "Raise on unsupported weight acquisition, core drift, "
-                        "or torch.compile instead of silently running a "
-                        "different path. Safe same-graph module fallback for an "
+                        "Raise on unsupported weight acquisition or core drift "
+                        "instead of silently running a different path. Safe "
+                        "same-graph module fallback for an "
                         "async cast-buffer conflict remains allowed."
                     ),
                 ),

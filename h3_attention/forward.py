@@ -90,6 +90,9 @@ def make_forward(module, layer_index, backend=None, attention=None, projector=No
         raise ValueError("pass either backend or attention, not both")
     if projector is not None and backend is None:
         raise ValueError("a fused QKV projector requires a consuming backend")
+    bind_projector = getattr(projector, "bind", None)
+    if bind_projector is not None:
+        bind_projector(module)
 
     def forward(x, rope_freqs=None, transformer_options=None):
         transformer_options = transformer_options if transformer_options is not None else {}

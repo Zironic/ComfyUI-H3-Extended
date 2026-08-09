@@ -1,6 +1,8 @@
 """H3 TensorWise-INT8 QKV projection with Sparse Sage-native Q/K output."""
 
 from dataclasses import dataclass
+import itertools
+import weakref
 
 import torch
 
@@ -17,6 +19,8 @@ from .router import KV_TILE, Q_TILE
 
 HEAD_DIM = 128
 ROT_DIM = 96
+_FUSED_QKV_MODULES = weakref.WeakValueDictionary()
+_FUSED_QKV_IDS = itertools.count(1)
 
 
 class FusedQKVError(RuntimeError):
@@ -327,6 +331,22 @@ def _plain_qkv_weight(module, x):
         raise
 
 
+def _register_fused_qkv_module(module):
+    module_id = getattr(module, "_h3_fused_qkv_id", None)
+    if module_id is None:
+        module_id = next(_FUSED_QKV_IDS)
+        module._h3_fused_qkv_id = module_id
+    _FUSED_QKV_MODULES[module_id] = module
+    return module_id
+
+
+def _fused_qkv_module(module_id):
+    module = _FUSED_QKV_MODULES.get(module_id)
+    if module is None:
+        raise FusedQKVError("fused H3 QKV module is no longer active")
+    return module
+
+
 def _quantize_projection_input(x):
     try:
         from comfy_kitchen.backends.cuda import quantize_int8_rowwise_convrot64
@@ -416,6 +436,184 @@ def _fused_qkv_tensor_core(
 fused_qkv_tensor_core = _fused_qkv_tensor_core
 
 
+@torch.library.custom_op(
+    "minimax_h3::fused_qkv",
+    mutates_args=(),
+    device_types="cuda",
+)
+def fused_qkv_op(
+    x: torch.Tensor,
+    qdata: torch.Tensor,
+    weight_scale: torch.Tensor,
+    q_norm: torch.Tensor,
+    k_norm: torch.Tensor,
+    rope: torch.Tensor,
+    heads: int,
+    epsilon: float,
+    has_rope: bool,
+    rope_strides: list[int],
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    x_int8, x_scale = _quantize_projection_input(x)
+    return _fused_qkv_tensor_core(
+        x_int8,
+        qdata,
+        x_scale,
+        weight_scale,
+        q_norm,
+        k_norm,
+        rope,
+        heads=heads,
+        sequence=x.shape[0],
+        hidden=x.shape[1],
+        epsilon=epsilon,
+        has_rope=has_rope,
+        rope_strides=rope_strides,
+        output_dtype=x.dtype,
+    )
+
+
+@fused_qkv_op.register_fake
+def _fused_qkv_fake(
+    x,
+    qdata,
+    weight_scale,
+    q_norm,
+    k_norm,
+    rope,
+    heads,
+    epsilon,
+    has_rope,
+    rope_strides,
+):
+    sequence = x.shape[0]
+    q_blocks = (sequence + Q_TILE - 1) // Q_TILE
+    k_blocks = (sequence + KV_TILE - 1) // KV_TILE
+    shape = (1, heads, sequence, HEAD_DIM)
+    return (
+        x.new_empty(shape, dtype=torch.int8),
+        x.new_empty((1, heads, q_blocks), dtype=torch.float32),
+        x.new_empty(shape, dtype=torch.int8),
+        x.new_empty((1, heads, k_blocks), dtype=torch.float32),
+        x.new_empty(shape),
+        x.new_empty((1, heads, q_blocks, HEAD_DIM)),
+        x.new_empty((1, heads, k_blocks, HEAD_DIM)),
+    )
+
+
+@torch.library.custom_op(
+    "minimax_h3::fused_qkv_module",
+    mutates_args=(),
+    device_types="cuda",
+)
+def fused_qkv_module_op(
+    x: torch.Tensor,
+    rope: torch.Tensor,
+    module_id: int,
+    heads: int,
+    epsilon: float,
+    has_rope: bool,
+    rope_strides: list[int],
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    import comfy.model_management
+    import comfy.ops
+
+    module = _fused_qkv_module(module_id)
+    qdata, weight_scale, handle, held_weight, bias = _plain_qkv_weight(module, x)
+    release_guard = None
+    try:
+        inner = heads * HEAD_DIM
+        expected_weight = (inner * 3, x.shape[1])
+        if (tuple(qdata.shape) != expected_weight
+                or qdata.dtype != torch.int8
+                or qdata.device != x.device):
+            raise FusedQKVError(
+                "fused H3 QKV weight shape is %s; expected %s"
+                % (tuple(qdata.shape), expected_weight)
+            )
+        if not qdata.is_contiguous():
+            qdata = qdata.contiguous()
+        weight_scale = weight_scale.reshape(-1).contiguous()
+        if (weight_scale.numel() != inner * 3
+                or weight_scale.dtype != torch.float32
+                or weight_scale.device != x.device):
+            raise FusedQKVError("fused H3 QKV weight scale shape is invalid")
+
+        q_norm = comfy.model_management.cast_to(
+            module.q_norm.weight, device=x.device, dtype=x.dtype
+        ).contiguous()
+        k_norm = comfy.model_management.cast_to(
+            module.k_norm.weight, device=x.device, dtype=x.dtype
+        ).contiguous()
+        if (q_norm.numel() != HEAD_DIM or k_norm.numel() != HEAD_DIM
+                or q_norm.dtype != x.dtype or k_norm.dtype != x.dtype):
+            raise FusedQKVError("fused H3 QKV RMSNorm weights are invalid")
+
+        x_int8, x_scale = _quantize_projection_input(x)
+        carriers = _fused_qkv_tensor_core(
+            x_int8,
+            qdata,
+            x_scale,
+            weight_scale,
+            q_norm,
+            k_norm,
+            rope,
+            heads=heads,
+            sequence=x.shape[0],
+            hidden=x.shape[1],
+            epsilon=epsilon,
+            has_rope=has_rope,
+            rope_strides=rope_strides,
+            output_dtype=x.dtype,
+        )
+        release_guard = carriers[0]
+        return carriers
+    finally:
+        comfy.ops.uncast_bias_weight(
+            module.qkv_proj, held_weight, bias, handle, guard=release_guard
+        )
+
+
+@fused_qkv_module_op.register_fake
+def _fused_qkv_module_fake(
+    x,
+    rope,
+    module_id,
+    heads,
+    epsilon,
+    has_rope,
+    rope_strides,
+):
+    sequence = x.shape[0]
+    q_blocks = (sequence + Q_TILE - 1) // Q_TILE
+    k_blocks = (sequence + KV_TILE - 1) // KV_TILE
+    shape = (1, heads, sequence, HEAD_DIM)
+    return (
+        x.new_empty(shape, dtype=torch.int8),
+        x.new_empty((1, heads, q_blocks), dtype=torch.float32),
+        x.new_empty(shape, dtype=torch.int8),
+        x.new_empty((1, heads, k_blocks), dtype=torch.float32),
+        x.new_empty(shape),
+        x.new_empty((1, heads, q_blocks, HEAD_DIM)),
+        x.new_empty((1, heads, k_blocks, HEAD_DIM)),
+    )
+
+
 def run_fused_qkv(module, x, rope_freqs, *, layer_index, tensor_core=None):
     import comfy.model_management
     import comfy.ops
@@ -447,47 +645,11 @@ def run_fused_qkv(module, x, rope_freqs, *, layer_index, tensor_core=None):
     heads = int(module.heads)
     inner = heads * HEAD_DIM
     expected_weight = (inner * 3, hidden)
-    qdata, weight_scale, handle, held_weight, bias = _plain_qkv_weight(module, x)
+    held_weight = None
+    bias = None
+    handle = None
+    release_guard = None
     try:
-        if (tuple(qdata.shape) != expected_weight
-                or qdata.dtype != torch.int8
-                or qdata.device != x.device):
-            raise FusedQKVError(
-                "fused H3 QKV weight shape is %s; expected %s"
-                % (tuple(qdata.shape), expected_weight)
-            )
-        if not qdata.is_contiguous():
-            qdata = qdata.contiguous()
-        weight_scale = weight_scale.reshape(-1).contiguous()
-        if (weight_scale.numel() != inner * 3
-                or weight_scale.dtype != torch.float32
-                or weight_scale.device != x.device):
-            raise FusedQKVError("fused H3 QKV weight scale shape is invalid")
-
-        x_int8, x_scale = _quantize_projection_input(x)
-        if (
-            tuple(x_int8.shape) != tuple(x.shape)
-            or x_int8.dtype != torch.int8
-            or x_int8.device != x.device
-            or not x_int8.is_contiguous()
-            or x_scale.numel() != sequence
-            or x_scale.dtype != torch.float32
-            or x_scale.device != x.device
-        ):
-            raise FusedQKVError(
-                "Comfy Kitchen returned an invalid ConvRot activation carrier"
-            )
-        x_scale = x_scale.reshape(-1).contiguous()
-        q_norm = comfy.model_management.cast_to(
-            module.q_norm.weight, device=x.device, dtype=x.dtype
-        ).contiguous()
-        k_norm = comfy.model_management.cast_to(
-            module.k_norm.weight, device=x.device, dtype=x.dtype
-        ).contiguous()
-        if (q_norm.numel() != HEAD_DIM or k_norm.numel() != HEAD_DIM
-                or q_norm.dtype != x.dtype or k_norm.dtype != x.dtype):
-            raise FusedQKVError("fused H3 QKV RMSNorm weights are invalid")
-
         if rope_freqs is None:
             rope = x.new_empty((1, 1, 1, 16, 2, 2))
             rope_strides = (0, 0, 0, 0)
@@ -501,23 +663,74 @@ def run_fused_qkv(module, x, rope_freqs, *, layer_index, tensor_core=None):
             )
 
         if tensor_core is None:
-            tensor_core = _fused_qkv_tensor_core
-        carriers = tensor_core(
-            x_int8,
-            qdata,
-            x_scale,
-            weight_scale,
-            q_norm,
-            k_norm,
-            rope,
-            heads=heads,
-            sequence=sequence,
-            hidden=hidden,
-            epsilon=float(module.q_norm.eps),
-            has_rope=rope_freqs is not None,
-            rope_strides=rope_strides,
-            output_dtype=x.dtype,
-        )
+            module_id = getattr(module, "_h3_fused_qkv_id", None)
+            if module_id is None:
+                raise FusedQKVError("fused H3 QKV module was not registered")
+            carriers = fused_qkv_module_op(
+                x,
+                rope,
+                module_id,
+                heads,
+                float(module.q_norm.eps),
+                rope_freqs is not None,
+                list(rope_strides),
+            )
+        else:
+            qdata, weight_scale, handle, held_weight, bias = _plain_qkv_weight(module, x)
+            if (tuple(qdata.shape) != expected_weight
+                    or qdata.dtype != torch.int8
+                    or qdata.device != x.device):
+                raise FusedQKVError(
+                    "fused H3 QKV weight shape is %s; expected %s"
+                    % (tuple(qdata.shape), expected_weight)
+                )
+            if not qdata.is_contiguous():
+                qdata = qdata.contiguous()
+            weight_scale = weight_scale.reshape(-1).contiguous()
+            if (weight_scale.numel() != inner * 3
+                    or weight_scale.dtype != torch.float32
+                    or weight_scale.device != x.device):
+                raise FusedQKVError("fused H3 QKV weight scale shape is invalid")
+
+            q_norm = comfy.model_management.cast_to(
+                module.q_norm.weight, device=x.device, dtype=x.dtype
+            ).contiguous()
+            k_norm = comfy.model_management.cast_to(
+                module.k_norm.weight, device=x.device, dtype=x.dtype
+            ).contiguous()
+            if (q_norm.numel() != HEAD_DIM or k_norm.numel() != HEAD_DIM
+                    or q_norm.dtype != x.dtype or k_norm.dtype != x.dtype):
+                raise FusedQKVError("fused H3 QKV RMSNorm weights are invalid")
+
+            x_int8, x_scale = _quantize_projection_input(x)
+            if (
+                tuple(x_int8.shape) != tuple(x.shape)
+                or x_int8.dtype != torch.int8
+                or x_int8.device != x.device
+                or not x_int8.is_contiguous()
+                or x_scale.numel() != sequence
+                or x_scale.dtype != torch.float32
+                or x_scale.device != x.device
+            ):
+                raise FusedQKVError(
+                    "Comfy Kitchen returned an invalid ConvRot activation carrier"
+                )
+            carriers = tensor_core(
+                x_int8,
+                qdata,
+                x_scale.reshape(-1).contiguous(),
+                weight_scale,
+                q_norm,
+                k_norm,
+                rope,
+                heads=heads,
+                sequence=sequence,
+                hidden=hidden,
+                epsilon=float(module.q_norm.eps),
+                has_rope=rope_freqs is not None,
+                rope_strides=rope_strides,
+                output_dtype=x.dtype,
+            )
         (
             q_int8,
             q_scale,
@@ -527,6 +740,7 @@ def run_fused_qkv(module, x, rope_freqs, *, layer_index, tensor_core=None):
             q_summary,
             k_summary,
         ) = carriers
+        release_guard = q_int8
         return validate_prepared_fused_qkv(
             PreparedFusedQKV(
                 q_int8=q_int8,
@@ -545,18 +759,22 @@ def run_fused_qkv(module, x, rope_freqs, *, layer_index, tensor_core=None):
             )
         )
     finally:
-        comfy.ops.uncast_bias_weight(
-            module.qkv_proj, held_weight, bias, handle
-        )
+        if held_weight is not None:
+            comfy.ops.uncast_bias_weight(
+                module.qkv_proj, held_weight, bias, handle, guard=release_guard
+            )
 
 
 class FusedQKVProjector:
     name = "h3_fused_qkv"
 
     def __init__(self, tensor_core=None):
-        self.tensor_core = (
-            _fused_qkv_tensor_core if tensor_core is None else tensor_core
-        )
+        self.tensor_core = tensor_core
+
+    def bind(self, module):
+        if self.tensor_core is None:
+            return _register_fused_qkv_module(module)
+        return None
 
     def project(self, module, x, rope_freqs, *, layer_index, transformer_options):
         return run_fused_qkv(

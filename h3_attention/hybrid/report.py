@@ -51,6 +51,9 @@ def summarize(records, seconds=None, timing=None):
             "attention_cuda_to_request_wall_ratio": None,
             "total_measured_dit_block_cuda_seconds": 0.0,
             "dit_block_cuda_to_request_wall_ratio": None,
+            "model_forward_call_count": 0,
+            "total_model_forward_cuda_seconds": 0.0,
+            "model_forward_cuda_to_request_wall_ratio": None,
             "ratio_caveat": (
                 "CUDA event timing was disabled; no attention CUDA time was measured."
             ),
@@ -88,7 +91,9 @@ def render(payload):
         "Timing stages cover the DiT block, activation/MLP stages, attention "
         "projection stages (including fused QKV when selected), direct LUT "
         "construction, V FP8 preparation, Q/K "
-        "int8 quantization, and the low-level Sparse Sage kernel.",
+        "int8 quantization, and the low-level Sparse Sage kernel. Compiled "
+        "runs replace those internal events with one model-call event so "
+        "timing does not split the compiled tensor graph.",
     ])
     timing = summary.get("timing") or {}
     if timing.get("enabled") and timing.get("stages"):
@@ -114,6 +119,12 @@ def render(payload):
             "DiT-block-CUDA/request-wall ratio: %s" % (
                 "unknown" if timing.get("dit_block_cuda_to_request_wall_ratio") is None
                 else "%.3f" % timing["dit_block_cuda_to_request_wall_ratio"]),
+            "model forward CUDA seconds: %.6f (%d calls)" % (
+                timing.get("total_model_forward_cuda_seconds", 0.0),
+                timing.get("model_forward_call_count", 0)),
+            "model-forward-CUDA/request-wall ratio: %s" % (
+                "unknown" if timing.get("model_forward_cuda_to_request_wall_ratio") is None
+                else "%.3f" % timing["model_forward_cuda_to_request_wall_ratio"]),
             timing.get("ratio_caveat", ""),
             "Stage times are nested/overlapping; do not sum stage totals.",
         ])

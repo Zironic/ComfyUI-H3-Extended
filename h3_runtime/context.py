@@ -16,6 +16,9 @@ import time
 from typing import Any, Iterable
 
 import torch
+import comfy.utils
+
+from .timing import get_timing
 
 RUNTIME_KEY = "minimax_h3_runtime"
 RUNTIME_SESSION_KEY = "minimax_h3_runtime_session"
@@ -316,6 +319,50 @@ def make_diffusion_wrapper(session):
     return wrapper
 
 
+def make_apply_model_wrapper(session):
+    """Observe one model call before entering a compiled diffusion module."""
+    def wrapper(executor, *args, **kwargs):
+        transformer_options = args[5] if len(args) > 5 else kwargs.get("transformer_options", {})
+        if transformer_options is None:
+            transformer_options = {}
+            if len(args) > 5:
+                mutable = list(args)
+                mutable[5] = transformer_options
+                args = tuple(mutable)
+            else:
+                kwargs["transformer_options"] = transformer_options
+        x = args[0] if args else kwargs.get("x")
+        latent_shapes = kwargs.get("latent_shapes")
+        layout_x = (
+            comfy.utils.unpack_latents(x, latent_shapes)
+            if latent_shapes is not None and not isinstance(x, (list, tuple))
+            else x
+        )
+        timestep = args[1] if len(args) > 1 else kwargs.get("t")
+        context = args[3] if len(args) > 3 else kwargs.get("c_crossattn")
+        payload = kwargs.get("minimax_payload") or {}
+        observed_timestep = timestep
+        if transformer_options.get("sigmas") is None and timestep is not None:
+            observed_timestep = timestep * 1000.0
+        snapshot = session.observe(
+            layout_x,
+            observed_timestep,
+            context,
+            transformer_options,
+            payload,
+        )
+        timing = get_timing(transformer_options)
+        token = timing.begin("model_forward") if timing is not None else None
+        try:
+            result = executor(*args, **kwargs)
+        finally:
+            if timing is not None:
+                timing.end(token)
+        session.after_forward(snapshot, result, transformer_options)
+        return result
+    return wrapper
+
+
 def install_runtime_wrapper(model_patcher, session=None):
     """Install explicit sampler and diffusion wrappers on one ModelPatcher."""
     import comfy.patcher_extension
@@ -328,13 +375,23 @@ def install_runtime_wrapper(model_patcher, session=None):
         model_patcher.model_options,
         is_model_options=True,
     )
-    comfy.patcher_extension.add_wrapper_with_key(
-        comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL,
-        WRAPPER_KEY,
-        make_diffusion_wrapper(session),
-        model_patcher.model_options,
-        is_model_options=True,
-    )
+    compile_kwargs = model_patcher.model_options.get("torch_compile_kwargs")
+    if compile_kwargs is not None:
+        comfy.patcher_extension.add_wrapper_with_key(
+            comfy.patcher_extension.WrappersMP.APPLY_MODEL,
+            WRAPPER_KEY,
+            make_apply_model_wrapper(session),
+            model_patcher.model_options,
+            is_model_options=True,
+        )
+    else:
+        comfy.patcher_extension.add_wrapper_with_key(
+            comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL,
+            WRAPPER_KEY,
+            make_diffusion_wrapper(session),
+            model_patcher.model_options,
+            is_model_options=True,
+        )
     options = model_patcher.model_options["transformer_options"] = (
         model_patcher.model_options.get("transformer_options", {}).copy()
     )

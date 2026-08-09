@@ -18,9 +18,15 @@ import comfy.ops  # noqa: E402
 from comfy.ldm.minimax.model import DiTBlock  # noqa: E402
 
 from h3_activation_memory import chunks  # noqa: E402
-from h3_activation_memory.config import MODE_NATIVE, ActivationMemoryConfig  # noqa: E402
+from h3_activation_memory.config import (  # noqa: E402
+    MODE_CONVROT_2SLICE,
+    MODE_NATIVE,
+    ActivationMemoryConfig,
+)
 from h3_activation_memory.forward import make_forward  # noqa: E402
 from h3_activation_memory.linear import HeldMLP  # noqa: E402
+import h3_activation_memory.forward as forward_module  # noqa: E402
+import h3_activation_memory.linear as linear_module  # noqa: E402
 from h3_activation_memory.observer import observing  # noqa: E402
 from h3_activation_memory import patch  # noqa: E402
 from h3_attention.hybrid.stats import DeferredCudaTiming  # noqa: E402
@@ -39,6 +45,144 @@ def test_defaults():
     check(config.mode == MODE_NATIVE, "native SwiGLU is the default")
     check(config.chunk_rows == 2048, "2048 rows is the default slab size")
     check(config.prefer_held_weights, "held weights are enabled by default")
+    check(
+        ActivationMemoryConfig(mode=MODE_CONVROT_2SLICE).convrot_2slice,
+        "two-slice ConvRot mode is selectable",
+    )
+
+
+def test_convrot_two_slice_cpu_fake():
+    print("two-slice ConvRot fake")
+
+    class FakeQuantized:
+        def __init__(self, qdata, scale, **params):
+            self.qdata = qdata
+            self.scale = scale
+            self._layout_cls = "TensorWiseINT8Layout"
+            self._params = type("Params", (), params)()
+
+    class FakeLayout:
+        @staticmethod
+        def get_plain_tensors(weight):
+            return weight.qdata, weight.scale
+
+    class FakeLinear:
+        def __init__(self, weight):
+            self.weight = weight
+
+    hidden, ffn = 256, 512
+    torch.manual_seed(27)
+    fc1_q = torch.randint(-1, 2, (ffn * 2, hidden), dtype=torch.int8)
+    fc2_q = torch.randint(-1, 2, (hidden, ffn), dtype=torch.int8)
+    fc1 = FakeLinear(
+        FakeQuantized(
+            fc1_q,
+            torch.ones(ffn * 2),
+            transposed=False,
+            convrot=True,
+            convrot_groupsize=256,
+        )
+    )
+    fc2 = FakeLinear(
+        FakeQuantized(
+            fc2_q,
+            torch.ones(hidden),
+            transposed=False,
+            convrot=True,
+            convrot_groupsize=256,
+        )
+    )
+    mlp = type("MLP", (), {"fc1": fc1, "fc2": fc2})()
+    original_cast = comfy.ops.cast_bias_weight
+    original_quantized = linear_module.QuantizedTensor
+    original_layout = linear_module.TensorWiseINT8Layout
+    linear_module.QuantizedTensor = FakeQuantized
+    linear_module.TensorWiseINT8Layout = FakeLayout
+    comfy.ops.cast_bias_weight = lambda module, sample, **kwargs: (
+        module.weight,
+        None,
+        None,
+    )
+    def fake_convrot(x, qdata, scale, input_act=None):
+        weight = qdata.to(x.dtype)
+        if input_act == "swiglu":
+            gate, up = x.chunk(2, dim=-1)
+            x = torch.nn.functional.silu(gate) * up
+        return x @ weight.t()
+    try:
+        x = torch.randn(3, hidden, dtype=torch.bfloat16) * 0.01
+        with linear_module.ConvRotTwoSliceMLP(mlp, x[:1], fake_convrot) as session:
+            got, path = session.fc1_fc2(x)
+            gate, up = (x @ fc1_q[:ffn].to(torch.bfloat16).t()), (
+                x @ fc1_q[ffn:].to(torch.bfloat16).t()
+            )
+            expected = (torch.nn.functional.silu(gate) * up) @ fc2_q.to(torch.bfloat16).t()
+            check(got.shape == (3, hidden), "two-slice output shape is preserved")
+            check(torch.allclose(got, expected, atol=0.25, rtol=0.0), "two-slice accumulation matches fake ConvRot")
+            check(path == "held_convrot_2slice", "two-slice path is reported")
+        check(session.tiles is None, "prepared tiles release at session exit")
+    finally:
+        comfy.ops.cast_bias_weight = original_cast
+        linear_module.QuantizedTensor = original_quantized
+        linear_module.TensorWiseINT8Layout = original_layout
+
+
+def test_convrot_scale_tiles():
+    print("two-slice ConvRot scale layouts")
+    fc1_q = torch.empty((1024, 256), dtype=torch.int8)
+    fc2_q = torch.empty((256, 512), dtype=torch.int8)
+    scalar = torch.tensor(0.25)
+    scalar_fc1 = linear_module._convrot_fc1_tiles(fc1_q, scalar)
+    scalar_fc2 = linear_module._convrot_fc2_tiles(fc2_q, scalar)
+    check(scalar_fc1[1].shape == scalar.shape and scalar_fc1[3].shape == scalar.shape,
+          "both fc1 tiles preserve a scalar scale")
+    check(scalar_fc2[2].shape == scalar.shape,
+          "fc2 tiles preserve a scalar scale")
+    column_fc1 = linear_module._convrot_fc1_tiles(
+        fc1_q, torch.empty((1024, 1))
+    )
+    column_fc2 = linear_module._convrot_fc2_tiles(
+        fc2_q, torch.empty((256, 1))
+    )
+    check(column_fc1[1].shape == (512, 1) and column_fc1[3].shape == (512, 1),
+          "both fc1 tiles preserve per-output scale columns")
+    check(column_fc2[2].shape == (256, 1),
+          "fc2 tiles preserve per-output scale columns")
+
+
+def test_convrot_two_slice_rejects_contract():
+    print("two-slice ConvRot contract")
+    class FakeLinear:
+        def __init__(self, weight):
+            self.weight = weight
+
+    class BadWeight:
+        _layout_cls = "OtherLayout"
+        _params = type("Params", (), {"transposed": False, "convrot": True, "convrot_groupsize": 256})()
+
+    original_cast = comfy.ops.cast_bias_weight
+    original_quantized = linear_module.QuantizedTensor
+    comfy.ops.cast_bias_weight = lambda module, sample, **kwargs: (module.weight, None, None)
+    linear_module.QuantizedTensor = BadWeight
+    try:
+        mlp = type("MLP", (), {"fc1": FakeLinear(BadWeight()), "fc2": FakeLinear(BadWeight())})()
+        try:
+            with linear_module.ConvRotTwoSliceMLP(mlp, torch.zeros(1, 256, dtype=torch.float32)):
+                pass
+        except TypeError as exc:
+            check("requires BF16" in str(exc), "non-BF16 input is rejected clearly")
+        else:
+            raise AssertionError("non-BF16 input must be rejected")
+        try:
+            with linear_module.ConvRotTwoSliceMLP(mlp, torch.zeros(1, 256, dtype=torch.bfloat16)):
+                pass
+        except TypeError as exc:
+            check("TensorWiseINT8Layout" in str(exc), "unsupported layout is rejected clearly")
+        else:
+            raise AssertionError("unsupported layout must be rejected")
+    finally:
+        comfy.ops.cast_bias_weight = original_cast
+        linear_module.QuantizedTensor = original_quantized
 
 
 def build_block(seed=0):
@@ -68,6 +212,50 @@ def build_inputs(seed=1):
     t_emb = torch.randn(1, 24) * 0.1
     segments = [(0, 5, 0), (5, 13, 1), (13, 19, 2)]
     return x, t_emb, segments
+
+
+def test_convrot_two_slice_forward_dispatch():
+    print("two-slice ConvRot forward dispatch")
+    calls = []
+
+    class FakeSession:
+        def __init__(self, mlp, sample):
+            calls.append(("init", tuple(sample.shape)))
+
+        def __enter__(self):
+            calls.append(("enter", None))
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            calls.append(("exit", None))
+
+        def fc1_fc2(self, h, stage_factory=None):
+            calls.append(("chunk", tuple(h.shape)))
+            return torch.zeros_like(h), "held_convrot_2slice"
+
+    original = forward_module.ConvRotTwoSliceMLP
+    forward_module.ConvRotTwoSliceMLP = FakeSession
+    try:
+        block = build_block(seed=28)
+        x, t_emb, segments = build_inputs(seed=29)
+        config = ActivationMemoryConfig(
+            mode=MODE_CONVROT_2SLICE,
+            chunk_rows=256,
+            alignment=256,
+        )
+        with torch.no_grad():
+            got = make_forward(block, 0, config)(
+                x, t_emb, segments, rope_freqs=None, transformer_options={}
+            )
+    finally:
+        forward_module.ConvRotTwoSliceMLP = original
+
+    check(got.shape == x.shape, "two-slice forward preserves the block shape")
+    check(
+        len([item for item in calls if item[0] == "chunk"]) == 3,
+        "two-slice session handles every modulation chunk",
+    )
+    check(calls[-1][0] == "exit", "two-slice session releases after the block")
 
 
 def test_chunks():
@@ -279,6 +467,10 @@ def test_patch_install():
 
 def main():
     test_defaults()
+    test_convrot_two_slice_cpu_fake()
+    test_convrot_scale_tiles()
+    test_convrot_two_slice_rejects_contract()
+    test_convrot_two_slice_forward_dispatch()
     test_chunks()
     test_block_parity("mlp_chunked_bf16")
     test_block_parity("mlp_chunked_native")

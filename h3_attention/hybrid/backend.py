@@ -2,6 +2,8 @@
 
 from dataclasses import dataclass
 
+import torch
+
 from .config import HybridSparseConfig, MODE_SAGE128_FUSED_QKV
 from .fused_qkv import FusedQKVProjector
 from .router import SparseRouterError, SparseTileRouter
@@ -196,7 +198,7 @@ class HybridSparseBackend:
     def execute(self, prepared):
         try:
             output = self.executor.execute(prepared.sparse)
-            if self.collector is not None:
+            if self.collector is not None and not torch.compiler.is_compiling():
                 self.collector.record(prepared.sparse.metadata)
             return output
         finally:

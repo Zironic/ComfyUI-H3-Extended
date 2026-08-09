@@ -67,6 +67,132 @@ def compile_fused_qkv_core(torch_module, core):
     return torch_module.compile(core, fullgraph=True, dynamic=False)
 
 
+def compile_sparse_sage_kernel_core(torch_module, adapter):
+    """Compile the fixed-shape tensor-only Sparse Sage kernel adapter."""
+    return torch_module.compile(adapter, fullgraph=True, dynamic=False)
+
+
+def make_sparse_sage_kernel_adapter(kernel, output_shape, output_dtype):
+    """Bind one selected low-level op to the executor's tensor-only ABI."""
+    output_shape = tuple(int(value) for value in output_shape)
+
+    def adapter(q_int8, k_int8, v_fp8, lut, valid_block_num,
+                pv_threshold, q_scale, k_scale, v_scale):
+        output = torch.empty(
+            output_shape, dtype=output_dtype, device=q_int8.device,
+        )
+        # The SM89 op mutates output and its return value is intentionally not
+        # part of SparseSageExecutor.execute's contract.
+        kernel(
+            q_int8, k_int8, v_fp8, output,
+            lut, valid_block_num, pv_threshold,
+            q_scale, k_scale, v_scale,
+            1, 0, 1, 128 ** -0.5, 0,
+        )
+        return output
+
+    return adapter
+
+
+def sparse_sage_carrier_tensors(prepared):
+    """Return a prepared carrier in the exact order consumed by the kernel."""
+    return (
+        prepared.q_int8,
+        prepared.k_int8,
+        prepared.v_fp8,
+        prepared.lut,
+        prepared.valid_block_num,
+        prepared.pv_threshold,
+        prepared.q_scale,
+        prepared.k_scale,
+        prepared.v_scale,
+    )
+
+
+def sparse_sage_op_identity(kernel):
+    module = getattr(kernel, "__module__", None)
+    name = getattr(kernel, "__qualname__", None) or getattr(kernel, "__name__", None)
+    if module and name:
+        return "%s.%s" % (module, name)
+    return type(kernel).__name__
+
+
+def validate_compile_sage_request(enabled, layout):
+    """Reject kernel-only compilation unless geometry supplied a carrier."""
+    if enabled and layout is None:
+        raise ValueError("--compile-sage requires --frames geometry mode")
+
+
+def _prepare_sparse_sage_carrier(backend, module, x, rope, runtime, layer_index):
+    """Prepare one real production fused-QKV Sparse Sage carrier."""
+    _ensure_forward_imports()
+    options = {RUNTIME_KEY: runtime}
+    publish_timing(options, backend.timing)
+    projected = backend.projector.project(
+        module, x, rope, layer_index=layer_index,
+        transformer_options=options,
+    )
+    prepared = backend.prepare_projected(
+        projected, layer_index=layer_index, transformer_options=options,
+    )
+    del projected
+    return prepared.sparse
+
+
+def benchmark_sparse_sage_compile(prepared, executor, warmup, iterations, device):
+    """A/B one prepared Sparse Sage carrier, excluding all preparation stages."""
+    kernel = executor.low_level_selector(prepared.q_int8)
+    adapter = make_sparse_sage_kernel_adapter(
+        kernel, prepared.output_shape, prepared.output_dtype,
+    )
+    carrier = sparse_sage_carrier_tensors(prepared)
+    eager_fn = lambda: adapter(*carrier)
+    eager = benchmark_case(eager_fn, warmup, iterations)
+    compiled = compile_sparse_sage_kernel_core(torch, adapter)
+    compiled_fn = lambda: compiled(*carrier)
+    compiled_result = benchmark_compiled_case(
+        compiled_fn, warmup, iterations, device,
+    )
+
+    eager_output = eager_fn()
+    torch.cuda.synchronize(device)
+    eager_output = eager_output.detach().cpu()
+    compiled_output = compiled_fn()
+    torch.cuda.synchronize(device)
+    compiled_output = compiled_output.detach().cpu()
+    exact = bool(torch.equal(eager_output, compiled_output))
+    parity = {
+        "exact": exact,
+        "exact_equal": exact,
+        "max_abs": max_abs(eager_output, compiled_output),
+        "relative_rmse": relative_rmse(eager_output, compiled_output),
+    }
+    del eager_output, compiled_output
+    return {
+        "boundary": {
+            "input": "PreparedSparseSage carrier tensors",
+            "included_stages": ["sparse_sage_low_level_kernel"],
+            "excluded_stages": [
+                "fused_qkv_projection",
+                "direct_lut_construction",
+                "q_k_int8_quantization",
+                "v_fp8_preparation",
+            ],
+        },
+        "excluded_stages": [
+            "fused_qkv_projection",
+            "direct_lut_construction",
+            "q_k_int8_quantization",
+            "v_fp8_preparation",
+        ],
+        "op_identity": sparse_sage_op_identity(kernel),
+        "eager": eager,
+        "compiled": compiled_result,
+        "speedup": eager["median_ms"] / compiled_result["median_ms"],
+        "parity": parity,
+    }
+
+
 def _compile_warmup(fn, device):
     """Run the first compiled call outside measured samples."""
     torch.cuda.synchronize(device)
@@ -163,13 +289,13 @@ def build_attention(checkpoint, block_index, epsilon):
     qkv_proj.load_state_dict(qkv_state, strict=True)
     q_norm = SimpleNamespace(weight=state["q_norm.weight"], eps=float(epsilon))
     k_norm = SimpleNamespace(weight=state["k_norm.weight"], eps=float(epsilon))
-    return SimpleNamespace(
-        qkv_proj=qkv_proj,
-        q_norm=q_norm,
-        k_norm=k_norm,
-        heads=heads,
-        head_dim=HEAD_DIM,
-    ), hidden, prefix
+    module = torch.nn.Module()
+    module.qkv_proj = qkv_proj
+    module.q_norm = q_norm
+    module.k_norm = k_norm
+    module.heads = heads
+    module.head_dim = HEAD_DIM
+    return module, hidden, prefix
 
 
 def make_rope(sequence, device):
@@ -478,6 +604,29 @@ def run_routed_geometry(args, checkpoint, module, hidden, prefix, sequence, layo
         fused, module, x, rope, runtime, args.block, True,
         args.warmup, args.iterations,
     )
+    sparse_sage_compile = None
+    if getattr(args, "compile_sage", False):
+        carrier_backend = HybridSparseBackend(
+            HybridSparseConfig(
+                mode=MODE_SAGE128_FUSED_QKV,
+                video_budget=args.video_budget,
+                timing=False,
+                run_tag="bench_fused_qkv_sparse_sage_compile",
+            ),
+            api=api,
+            router=router,
+        )
+        carrier = _prepare_sparse_sage_carrier(
+            carrier_backend, module, x, rope, runtime, args.block,
+        )
+        sparse_sage_compile = benchmark_sparse_sage_compile(
+            carrier,
+            carrier_backend.executor,
+            args.warmup,
+            args.iterations,
+            device,
+        )
+        del carrier
     compiled = compiled_core = compiled_result = None
     if getattr(args, "compile_fused", False):
         compiled_core = compile_fused_qkv_core(torch, fused_qkv_tensor_core)
@@ -606,6 +755,8 @@ def run_routed_geometry(args, checkpoint, module, hidden, prefix, sequence, layo
             fused_result["median_peak_allocated_bytes"]
             - compiled_result["median_peak_allocated_bytes"]
         )
+    if sparse_sage_compile is not None:
+        result["sparse_sage_compile"] = sparse_sage_compile
     return result
 
 
@@ -638,6 +789,10 @@ def main():
         "--compile-fused", action="store_true",
         help="also benchmark a fixed-shape torch.compile fused projection (CUDA)",
     )
+    parser.add_argument(
+        "--compile-sage", action="store_true",
+        help="also benchmark eager vs fixed-shape torch.compile Sparse Sage kernel (geometry only)",
+    )
     parser.add_argument("--i-understand-this-uses-gpu", action="store_true")
     args = parser.parse_args()
     if args.warmup < 0 or args.iterations <= 0:
@@ -650,6 +805,10 @@ def main():
         raise SystemExit(str(exc))
     if sequence <= 0:
         raise SystemExit("sequence/iteration arguments are invalid")
+    try:
+        validate_compile_sage_request(args.compile_sage, layout)
+    except ValueError as exc:
+        raise SystemExit(str(exc))
     if not 0.0 < float(args.video_budget) <= 1.0:
         raise SystemExit("video-budget must be in (0, 1]")
     if args.frames is not None and args.verify_attention:
@@ -663,6 +822,9 @@ def main():
 
     checkpoint = resolve_checkpoint(args.checkpoint)
     module, hidden, prefix = build_attention(checkpoint, args.block, args.epsilon)
+    # Production patching binds every fused-QKV module before its first call.
+    # The standalone benchmark owns its synthetic module and must do the same.
+    FusedQKVProjector().bind(module)
     _ensure_forward_imports()
     device = torch.device("cuda")
     generator = torch.Generator(device=device).manual_seed(args.seed)
@@ -697,6 +859,20 @@ def main():
                 ))
                 print(json.dumps(
                     result["compiled_comparisons"], indent=2, sort_keys=True,
+                ))
+            if "sparse_sage_compile" in result:
+                sage = result["sparse_sage_compile"]
+                print("sparse sage eager: %.3f ms, peak %.3f GiB" % (
+                    sage["eager"]["median_ms"],
+                    sage["eager"]["peak_bytes"] / 2**30,
+                ))
+                print("sparse sage compiled: %.3f ms, peak %.3f GiB, compile warmup %.3f ms" % (
+                    sage["compiled"]["median_ms"],
+                    sage["compiled"]["peak_bytes"] / 2**30,
+                    sage["compiled"]["compile_warmup_ms"],
+                ))
+                print("sparse sage eager/compiled speedup: %.3fx; exact parity: %s" % (
+                    sage["speedup"], sage["parity"]["exact"],
                 ))
             print(json.dumps(result["comparisons"], indent=2, sort_keys=True))
         return

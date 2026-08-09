@@ -34,6 +34,7 @@ TIMING_STAGES = (
     "mlp_fc1",
     "mlp_swiglu_fc2",
     "final_mlp_gate",
+    "model_forward",
 )
 
 
@@ -91,6 +92,8 @@ class DeferredCudaTiming:
     def begin(self, stage):
         if stage not in TIMING_STAGES:
             raise ValueError("unknown hybrid timing stage: %s" % stage)
+        if torch.compiler.is_compiling():
+            return None
         if not self.active:
             return None
         start = self._new_event()
@@ -101,6 +104,8 @@ class DeferredCudaTiming:
         return token
 
     def end(self, token):
+        if torch.compiler.is_compiling():
+            return
         if token is None or token not in self._active:
             return
         stage, _start, end = token
@@ -131,6 +136,7 @@ class DeferredCudaTiming:
         stages = {}
         total_ms = 0.0
         total_block_ms = 0.0
+        model_forward_ms = 0.0
         for stage in TIMING_STAGES:
             values = [self._elapsed_ms(start, end) for _, start, end in self._samples[stage]]
             stage_sum = sum(values)
@@ -143,13 +149,16 @@ class DeferredCudaTiming:
                 total_ms = stage_sum
             elif stage == "total_dit_block":
                 total_block_ms = stage_sum
+            elif stage == "model_forward":
+                model_forward_ms = stage_sum
         self._resolved = self.summary(request_wall_seconds, stages=stages,
                                       measured_ms=total_ms,
-                                      measured_block_ms=total_block_ms)
+                                      measured_block_ms=total_block_ms,
+                                      model_forward_ms=model_forward_ms)
         return self._resolved
 
     def summary(self, request_wall_seconds=None, *, stages=None, measured_ms=0.0,
-                measured_block_ms=0.0):
+                measured_block_ms=0.0, model_forward_ms=0.0):
         stages = stages or {
             stage: {"count": 0, "sum_ms": 0.0, "mean_ms": 0.0}
             for stage in TIMING_STAGES
@@ -159,6 +168,8 @@ class DeferredCudaTiming:
         ratio = None if wall is None or wall <= 0.0 else cuda_seconds / wall
         block_seconds = float(measured_block_ms) / 1000.0
         block_ratio = None if wall is None or wall <= 0.0 else block_seconds / wall
+        model_forward_seconds = float(model_forward_ms) / 1000.0
+        model_forward_ratio = None if wall is None or wall <= 0.0 else model_forward_seconds / wall
         return {
             "enabled": bool(self.enabled),
             "call_count": int(stages["total_hybrid_attention"]["count"]),
@@ -168,6 +179,9 @@ class DeferredCudaTiming:
             "attention_cuda_to_request_wall_ratio": ratio,
             "total_measured_dit_block_cuda_seconds": block_seconds,
             "dit_block_cuda_to_request_wall_ratio": block_ratio,
+            "model_forward_call_count": int(stages["model_forward"]["count"]),
+            "total_model_forward_cuda_seconds": model_forward_seconds,
+            "model_forward_cuda_to_request_wall_ratio": model_forward_ratio,
             "ratio_caveat": (
                 "CUDA event time is asynchronous and overlaps request wall time; "
                 "the ratio is indicative, not an exact decomposition."

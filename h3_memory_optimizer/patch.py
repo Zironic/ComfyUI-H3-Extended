@@ -9,12 +9,14 @@ try:
     from ..h3_attention.config import configure_backend
     from ..h3_block_cache.patch import install as install_block_cache
     from ..h3_runtime.context import H3RuntimeSession, install_runtime_wrapper
+    from ..h3_runtime.compile_compat import configure_shared_block_inductor
 except ImportError:
     from h3_activation_memory.patch import install as install_activation
     from h3_adaln.patch import install as install_adaln
     from h3_attention.config import configure_backend
     from h3_block_cache.patch import install as install_block_cache
     from h3_runtime.context import H3RuntimeSession, install_runtime_wrapper
+    from h3_runtime.compile_compat import configure_shared_block_inductor
 
 from .attention import ATTENTION_EXISTING, ATTENTION_SOL, resolve_attention
 from .config import MemoryOptimizerConfig
@@ -175,6 +177,14 @@ def apply(
     listeners.extend(
         item for item in getattr(decision.backend, "runtime_listeners", ())
         if item is not None and item not in listeners
+    )
+
+    configure_shared_block_inductor(
+        model_patcher,
+        backend=decision.backend,
+        activation_config=activation_config,
+        adaln_provider=adaln_provider,
+        block_cache=cache_coordinator,
     )
     runtime_needed = bool(
         listeners or _backend_flag(decision.backend, "requires_runtime_context")

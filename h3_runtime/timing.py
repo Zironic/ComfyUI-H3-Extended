@@ -8,6 +8,8 @@ without importing each other's product concepts.
 
 from contextlib import contextmanager
 
+import torch
+
 
 TIMING_KEY = "minimax_h3_deferred_cuda_timing"
 
@@ -29,6 +31,9 @@ def get_timing(transformer_options):
 @contextmanager
 def timed_stage(transformer_options, stage):
     """Measure one stage without synchronizing or allocating when inactive."""
+    if torch.compiler.is_compiling():
+        yield
+        return
     timing = get_timing(transformer_options)
     token = timing.begin(stage) if timing is not None else None
     try:

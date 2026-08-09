@@ -4,7 +4,8 @@ from dataclasses import dataclass
 
 MODE_BF16 = "mlp_chunked_bf16"
 MODE_NATIVE = "mlp_chunked_native"
-MODES = (MODE_BF16, MODE_NATIVE)
+MODE_CONVROT_2SLICE = "mlp_chunked_convrot_2slice"
+MODES = (MODE_BF16, MODE_NATIVE, MODE_CONVROT_2SLICE)
 IMPLEMENTED_MODES = frozenset(MODES)
 DEFAULT_MODE = MODE_NATIVE
 
@@ -22,6 +23,8 @@ class ActivationMemoryConfig:
     down-projection. ``mlp_chunked_native`` asks Comfy's TensorWise-INT8 path to
     fuse SwiGLU into activation quantization when that exact fast path is
     available, and otherwise follows Comfy's eager fallback.
+    ``mlp_chunked_convrot_2slice`` requires H3's BF16 ConvRot-256 weights and
+    evaluates the FFN as two prepacked feature slices.
     """
 
     mode: str = DEFAULT_MODE
@@ -54,6 +57,10 @@ class ActivationMemoryConfig:
     @property
     def native_swiglu(self):
         return self.mode == MODE_NATIVE
+
+    @property
+    def convrot_2slice(self):
+        return self.mode == MODE_CONVROT_2SLICE
 
     @property
     def signature(self):

@@ -7,7 +7,14 @@ import torch
 import comfy.model_management
 
 from .chunks import iter_mod_chunks, validate_mod_segments
-from .linear import HeldMLP, UnsafeHeldWeights, module_fc1, module_swiglu_fc2
+from .linear import (
+    ConvRotTwoSliceMLP,
+    HeldMLP,
+    UnsafeHeldWeights,
+    bind_convrot_mlp,
+    module_fc1,
+    module_swiglu_fc2,
+)
 from .observer import notify_activation
 from .stats import get_stats
 
@@ -27,11 +34,6 @@ def _gate_add(x, other, gate):
     return x.addcmul_(other, gate.to(x.dtype))
 
 
-def _compiler_active():
-    compiler = getattr(torch, "compiler", None)
-    return bool(compiler is not None and compiler.is_compiling())
-
-
 def make_forward(block, layer_index, config, original_forward=None):
     """Build an unbound replacement for one ``DiTBlock.forward``.
 
@@ -39,6 +41,8 @@ def make_forward(block, layer_index, config, original_forward=None):
     the block is closed over rather than received as ``self``.
     """
     original_forward = original_forward or block.forward
+    if config.convrot_2slice and isinstance(block.mlp, torch.nn.Module):
+        bind_convrot_mlp(block.mlp)
 
     def _forward(x, t_emb, mod_segments, rope_freqs, transformer_options={}):
         if comfy.model_management.in_training:
@@ -46,19 +50,6 @@ def make_forward(block, layer_index, config, original_forward=None):
                 "h3_activation_memory is inference-only; training requires "
                 "core's original block forward"
             )
-        if _compiler_active():
-            if config.strict:
-                raise RuntimeError(
-                    "h3_activation_memory does not support torch.compile yet"
-                )
-            return original_forward(
-                x,
-                t_emb,
-                mod_segments,
-                rope_freqs,
-                transformer_options=transformer_options,
-            )
-
         with timed_stage(transformer_options, "adaln_proj"):
             shifts = block.adaln_proj(t_emb)
         (
@@ -72,8 +63,11 @@ def make_forward(block, layer_index, config, original_forward=None):
         segments = validate_mod_segments(
             mod_segments, x.shape[0], mod_rows=shift_msa.shape[0]
         )
-        stats = get_stats(transformer_options, config)
-        stats.blocks += 1
+        stats = None if torch.compiler.is_compiling() else get_stats(
+            transformer_options, config
+        )
+        if stats is not None:
+            stats.blocks += 1
 
         notify_activation(
             "block_enter",
@@ -124,11 +118,17 @@ def make_forward(block, layer_index, config, original_forward=None):
 
         held = None
         held_error = None
-        if config.prefer_held_weights:
+        if config.convrot_2slice:
+            held = ConvRotTwoSliceMLP(block.mlp, x[:1])
+            held.__enter__()
+            if stats is not None:
+                stats.held_sessions += 1
+        elif config.prefer_held_weights:
             try:
                 held = HeldMLP(block.mlp, x[:1])
                 held.__enter__()
-                stats.held_sessions += 1
+                if stats is not None:
+                    stats.held_sessions += 1
             except UnsafeHeldWeights as exc:
                 held_error = str(exc)
                 held = None
@@ -139,7 +139,8 @@ def make_forward(block, layer_index, config, original_forward=None):
                 held_error = "%s: %s" % (type(exc).__name__, exc)
 
         if held_error is not None:
-            stats.record_fallback(held_error)
+            if stats is not None:
+                stats.record_fallback(held_error)
             logging.warning(
                 "%s block %d using ordinary module calls: %s",
                 LOG_PREFIX,
@@ -149,7 +150,8 @@ def make_forward(block, layer_index, config, original_forward=None):
 
         try:
             for chunk_index, chunk in enumerate(chunks):
-                stats.record_chunk(chunk.rows)
+                if stats is not None:
+                    stats.record_chunk(chunk.rows)
                 notify_activation(
                     "mlp_chunk_enter",
                     layer_index,
@@ -165,7 +167,15 @@ def make_forward(block, layer_index, config, original_forward=None):
                         h, shift_mlp[chunk.mod_row], scale_mlp[chunk.mod_row]
                     )
 
-                if held is not None:
+                expanded = None
+                if config.convrot_2slice:
+                    out, path = held.fc1_fc2(
+                        h,
+                        stage_factory=lambda name: timed_stage(
+                            transformer_options, name
+                        ),
+                    )
+                elif held is not None:
                     with timed_stage(transformer_options, "mlp_fc1"):
                         expanded = held.fc1(h)
                     with timed_stage(transformer_options, "mlp_swiglu_fc2"):
@@ -180,7 +190,8 @@ def make_forward(block, layer_index, config, original_forward=None):
                             block.mlp, expanded, native=config.native_swiglu
                         )
 
-                stats.record_path(path)
+                if stats is not None:
+                    stats.record_path(path)
                 notify_activation(
                     "mlp_fc2_ready",
                     layer_index,
@@ -215,11 +226,6 @@ def make_forward(block, layer_index, config, original_forward=None):
         return x
 
     def forward(x, t_emb, mod_segments, rope_freqs, transformer_options={}):
-        if comfy.model_management.in_training or _compiler_active():
-            return _forward(
-                x, t_emb, mod_segments, rope_freqs,
-                transformer_options=transformer_options,
-            )
         with timed_stage(transformer_options, "total_dit_block"):
             return _forward(
                 x, t_emb, mod_segments, rope_freqs,

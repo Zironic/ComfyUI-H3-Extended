@@ -58,7 +58,14 @@ quantization, the low-level Sparse Sage kernel, and total hybrid attention;
 events are synchronized once at request end. CUDA event time overlaps request
 wall time; the reported ratios are indicative rather than an exact
 decomposition. CPU tests remain un-timed unless a fake event factory is
-injected.
+injected. Set the Hybrid Sparse node's `compile_backend` to `inductor` to
+compile one full, static tensor program shared by all 50 main H3 blocks. Do not
+also add `TorchCompileModel`: the H3 node keeps the outer layer loop, AIMDO
+weight acquisition, runtime metadata, timing, and statistics eager, while QKV,
+routing, Sparse Sage, residuals, and the two-slice ConvRot MLP stay in the shared
+graph. Per-stage CUDA events are omitted inside that graph; `total_dit_block`
+is measured around each invocation. CUDA graph capture is disabled for this
+path so every AIMDO lifecycle and custom-kernel call executes normally.
 
 Phase A is SM89-only and requires the compiled `spas_sage_attn` package. The
 default `sage128` mode retains the established BF16 QKV projection. The opt-in

@@ -62,6 +62,62 @@ def test_compile_factory_uses_static_full_graph():
           "fused compile factory requests a static full graph")
 
 
+def test_sparse_compile_factory_uses_static_full_graph():
+    calls = []
+    compiled = object()
+
+    class FakeTorch:
+        @staticmethod
+        def compile(core, **kwargs):
+            calls.append((core, kwargs))
+            return compiled
+
+    core = object()
+    check(benchmark.compile_sparse_sage_kernel_core(FakeTorch, core) is compiled,
+          "Sparse Sage compile factory selects the injected adapter")
+    check(calls == [(core, {"fullgraph": True, "dynamic": False})],
+          "Sparse Sage compile factory requests a static full graph")
+
+
+def test_sparse_adapter_owns_output_and_preserves_exact_abi():
+    calls = []
+
+    def fake_kernel(*args):
+        calls.append(args)
+        output = args[3]
+        output.fill_(7)
+        return "ignored return value"
+
+    tensors = tuple(
+        benchmark.torch.empty((1,), dtype=benchmark.torch.float32)
+        for _ in range(9)
+    )
+    adapter = benchmark.make_sparse_sage_kernel_adapter(
+        fake_kernel, (1, 2, 3, 4), benchmark.torch.float32,
+    )
+    output = adapter(*tensors)
+    check(output.shape == (1, 2, 3, 4), "adapter allocates the executor output shape")
+    check(output.dtype == benchmark.torch.float32 and float(output.min()) == 7,
+          "adapter returns the kernel-mutated output")
+    expected_carrier = tensors[:3] + (calls[0][3],) + tensors[3:]
+    check(len(calls) == 1 and all(actual is expected for actual, expected in zip(calls[0][:10], expected_carrier)),
+          "adapter forwards the nine prepared carrier tensors in order")
+    check(calls[0][10:] == (1, 0, 1, 128 ** -0.5, 0),
+          "adapter forwards the exact Sparse Sage ABI flags")
+
+
+def test_compile_sage_requires_geometry():
+    try:
+        benchmark.validate_compile_sage_request(True, None)
+    except ValueError as exc:
+        check("--frames" in str(exc),
+              "Sparse Sage compilation outside geometry fails clearly")
+    else:
+        raise AssertionError("expected --compile-sage without geometry to fail")
+    benchmark.validate_compile_sage_request(False, None)
+    check(True, "disabled Sparse Sage compilation preserves sequence-only mode")
+
+
 def test_compilation_warmup_is_not_measured():
     calls = []
     original_compile_warmup = benchmark._compile_warmup
@@ -172,6 +228,9 @@ def main():
     test_geometry_resolution_and_layout_contract()
     test_conflicting_sequence_rejected()
     test_compile_factory_uses_static_full_graph()
+    test_sparse_compile_factory_uses_static_full_graph()
+    test_sparse_adapter_owns_output_and_preserves_exact_abi()
+    test_compile_sage_requires_geometry()
     test_compilation_warmup_is_not_measured()
     test_invalid_geometry_rejected()
     test_routed_dispatch_uses_production_backend_contracts()
