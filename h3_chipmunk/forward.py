@@ -8,6 +8,7 @@ from ..h3_activation_memory.linear import ConvRotTwoSliceMLP
 from ..h3_runtime.context import get_runtime_snapshot
 from ..h3_runtime.timing import timed_stage
 from .executor import run_chipmunk_chunk
+from .selector import logical_swiglu
 
 
 def _scale_shift(h, shift, scale):
@@ -45,14 +46,34 @@ def make_forward(block, layer_index, config, session, original_forward=None):
                 _gate_add(x[start:stop], attn_out[start:stop], gate_msa[row])
         del h, attn_out
 
+        chunk_rows = int(config.effective_chunk_rows)
         chunks = tuple(iter_mod_chunks(
-            segments, x.shape[0], config.chunk_rows,
-            alignment=min(256, config.chunk_rows), mod_rows=shift_mlp.shape[0],
+            segments, x.shape[0], chunk_rows,
+            alignment=min(256, chunk_rows), mod_rows=shift_mlp.shape[0],
         ))
 
         held = ConvRotTwoSliceMLP(block.mlp, x[:1])
         held.__enter__()
         try:
+            def measure_activation_runner(value):
+                """Compute logical SwiGLU activations from already-held fc1 tiles.
+
+                This is intentionally fc1-only. Reusing the held tiles avoids a
+                second Comfy weight lease / staging cycle for every measured
+                chunk, which was a major source of idle GPU periods on low-VRAM
+                systems.
+                """
+                pieces = []
+                for tile in held.tiles:
+                    expanded = held.convrot_linear(
+                        value,
+                        tile["fc1_weight"],
+                        tile["fc1_scale"],
+                        input_act=None,
+                    )
+                    pieces.append(logical_swiglu(expanded))
+                return torch.cat(pieces, dim=-1)
+
             for chunk_index, chunk in enumerate(chunks):
                 with timed_stage(transformer_options, "norm2_modulation"):
                     h = block.norm2(x[chunk.start:chunk.stop])
@@ -83,6 +104,7 @@ def make_forward(block, layer_index, config, session, original_forward=None):
                     session=session,
                     config=config,
                     dense_runner=dense_runner,
+                    measure_activation_runner=measure_activation_runner,
                 )
                 with timed_stage(transformer_options, "final_mlp_gate"):
                     _gate_add(x[chunk.start:chunk.stop], out, gate_mlp[chunk.mod_row])

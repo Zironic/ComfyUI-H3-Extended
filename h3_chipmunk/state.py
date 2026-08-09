@@ -57,7 +57,61 @@ class H3ChipmunkSession:
         return value
 
     def record(self, **values):
+        # Measurement scalars may remain as CUDA tensors here. Converting them
+        # with .item() in the block loop would synchronize the whole device for
+        # every chunk. materialize_records() batches those transfers at request
+        # end instead.
         self.records.append(dict(values))
+
+    def materialize_records(self):
+        """Return JSON-safe records with one batched scalar copy per device."""
+        scalar_tensors = []
+
+        def encode(value):
+            if torch.is_tensor(value):
+                tensor = value.detach()
+                if tensor.numel() == 1:
+                    slot = len(scalar_tensors)
+                    scalar_tensors.append(tensor.reshape(()))
+                    return ("__h3_chipmunk_scalar__", slot)
+                return tensor.to("cpu").tolist()
+            if isinstance(value, dict):
+                return {key: encode(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [encode(item) for item in value]
+            if isinstance(value, tuple):
+                return tuple(encode(item) for item in value)
+            return value
+
+        encoded = [encode(row) for row in self.records]
+        resolved = [None] * len(scalar_tensors)
+        by_device = {}
+        for index, tensor in enumerate(scalar_tensors):
+            by_device.setdefault(str(tensor.device), []).append((index, tensor))
+        for items in by_device.values():
+            # One stack/copy per device replaces thousands of per-chunk .item()
+            # synchronizations. Values are diagnostic only, so float32 is enough.
+            packed = torch.stack([tensor.float() for _, tensor in items]).to("cpu")
+            values = packed.tolist()
+            for (index, _tensor), value in zip(items, values):
+                resolved[index] = float(value)
+
+        def decode(value):
+            if (
+                isinstance(value, tuple)
+                and len(value) == 2
+                and value[0] == "__h3_chipmunk_scalar__"
+            ):
+                return resolved[int(value[1])]
+            if isinstance(value, dict):
+                return {key: decode(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [decode(item) for item in value]
+            if isinstance(value, tuple):
+                return tuple(decode(item) for item in value)
+            return value
+
+        return [decode(row) for row in encoded]
 
     def invalidate_branch(self, branch):
         branch = tuple(int(x) for x in branch)

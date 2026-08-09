@@ -4,6 +4,13 @@ MODES = ("measure", "reference_delta")
 SCOPES = ("target_video", "all_dynamic")
 CACHE_LOCATIONS = ("cpu", "gpu")
 
+# Measurement is diagnostic, so keep the exact dense MLP on the already-measured
+# efficient slab size even when an old saved workflow still contains the original
+# 128-row prototype default. token_group_rows remains independently configurable.
+MEASURE_MIN_CHUNK_ROWS = 2_048
+DEFAULT_CHUNK_ROWS = 2_048
+DEFAULT_MEASURE_LAYER_STRIDE = 5
+
 
 @dataclass(frozen=True)
 class H3ChipmunkConfig:
@@ -16,13 +23,14 @@ class H3ChipmunkConfig:
     first_dense_layers: int = 2
     layer_start: int = 0
     layer_stop: int = 50
-    chunk_rows: int = 128
+    chunk_rows: int = DEFAULT_CHUNK_ROWS
     token_group_rows: int = 128
     feature_group: int = 256
     scope: str = "target_video"
     cache_location: str = "cpu"
     cache_budget_gb: float = 24.0
     random_groups: float = 0.0
+    measure_layer_stride: int = DEFAULT_MEASURE_LAYER_STRIDE
     strict: bool = True
     save_report: bool = True
     run_tag: str = "chipmunk"
@@ -48,6 +56,14 @@ class H3ChipmunkConfig:
             raise ValueError("cache_budget_gb must be positive")
         if not (0.0 <= float(self.random_groups) < 1.0):
             raise ValueError("random_groups must be in [0, 1)")
+        if int(self.measure_layer_stride) < 1:
+            raise ValueError("measure_layer_stride must be >= 1")
+
+    @property
+    def effective_chunk_rows(self):
+        if self.mode == "measure":
+            return max(int(self.chunk_rows), MEASURE_MIN_CHUNK_ROWS)
+        return int(self.chunk_rows)
 
     @property
     def signature(self):
@@ -57,6 +73,6 @@ class H3ChipmunkConfig:
             int(self.first_dense_layers), int(self.layer_start), int(self.layer_stop),
             int(self.chunk_rows), int(self.token_group_rows), int(self.feature_group),
             self.scope, self.cache_location, float(self.cache_budget_gb),
-            float(self.random_groups), bool(self.strict), bool(self.save_report),
-            self.run_tag,
+            float(self.random_groups), int(self.measure_layer_stride),
+            bool(self.strict), bool(self.save_report), self.run_tag,
         )

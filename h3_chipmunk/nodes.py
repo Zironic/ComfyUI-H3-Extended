@@ -1,6 +1,13 @@
 from comfy_api.latest import ComfyExtension, io
 
-from .config import H3ChipmunkConfig, MODES, SCOPES, CACHE_LOCATIONS
+from .config import (
+    H3ChipmunkConfig,
+    MODES,
+    SCOPES,
+    CACHE_LOCATIONS,
+    DEFAULT_CHUNK_ROWS,
+    DEFAULT_MEASURE_LAYER_STRIDE,
+)
 from .patch import install
 
 
@@ -13,7 +20,7 @@ class MiniMaxH3ChipmunkMLP(io.ComfyNode):
             category="model/patch/minimax",
             description=(
                 "Experimental training-free H3 SwiGLU MLP delta acceleration. "
-                "measure is output-exact and records 256-feature ConvRot group dynamics; "
+                "measure is output-exact and records lightweight ConvRot group dynamics; "
                 "reference_delta enables approximate cached sparse-delta execution. "
                 "Use after the H3 attention patch and instead of Activation Memory/shared block compile."
             ),
@@ -28,7 +35,7 @@ class MiniMaxH3ChipmunkMLP(io.ComfyNode):
                 io.Int.Input("first_dense_layers", default=2, min=0, max=50, step=1),
                 io.Int.Input("layer_start", default=0, min=0, max=49, step=1),
                 io.Int.Input("layer_stop", default=50, min=1, max=50, step=1),
-                io.Int.Input("chunk_rows", default=128, min=128, max=4096, step=128),
+                io.Int.Input("chunk_rows", default=DEFAULT_CHUNK_ROWS, min=128, max=4096, step=128),
                 io.Int.Input("token_group_rows", default=128, min=32, max=1024, step=32),
                 io.Combo.Input("scope", options=list(SCOPES), default="target_video"),
                 io.Combo.Input("cache_location", options=list(CACHE_LOCATIONS), default="cpu"),
@@ -37,6 +44,19 @@ class MiniMaxH3ChipmunkMLP(io.ComfyNode):
                 io.Boolean.Input("strict", default=True),
                 io.Boolean.Input("save_report", default=True),
                 io.String.Input("run_tag", default="chipmunk"),
+                # Append new widgets after all original fields so saved Comfy
+                # workflows retain their positional widget values.
+                io.Int.Input(
+                    "measure_layer_stride",
+                    default=DEFAULT_MEASURE_LAYER_STRIDE,
+                    min=1,
+                    max=50,
+                    step=1,
+                    tooltip=(
+                        "measure mode observes every Nth main block plus the last block. "
+                        "5 is the low-overhead default; 1 measures all 50 blocks."
+                    ),
+                ),
             ],
             outputs=[io.Model.Output()],
         )
@@ -46,9 +66,10 @@ class MiniMaxH3ChipmunkMLP(io.ComfyNode):
         cls, model, enabled=True, mode="measure", top_fraction=0.25,
         refresh_every=6, first_dense_steps=2, last_dense_steps=2,
         first_dense_layers=2, layer_start=0, layer_stop=50,
-        chunk_rows=128, token_group_rows=128, scope="target_video",
+        chunk_rows=DEFAULT_CHUNK_ROWS, token_group_rows=128, scope="target_video",
         cache_location="cpu", cache_budget_gb=24.0, random_groups=0.0,
         strict=True, save_report=True, run_tag="chipmunk",
+        measure_layer_stride=DEFAULT_MEASURE_LAYER_STRIDE,
     ):
         if not enabled:
             return io.NodeOutput(model)
@@ -68,6 +89,7 @@ class MiniMaxH3ChipmunkMLP(io.ComfyNode):
             cache_location=cache_location,
             cache_budget_gb=float(cache_budget_gb),
             random_groups=float(random_groups),
+            measure_layer_stride=int(measure_layer_stride),
             strict=bool(strict),
             save_report=bool(save_report),
             run_tag=str(run_tag),
