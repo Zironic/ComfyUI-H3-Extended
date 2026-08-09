@@ -54,11 +54,24 @@ def install(model_patcher, config):
         if getattr(current, "_h3_chipmunk", False):
             if getattr(current, "_h3_chipmunk_config", None) == config.signature:
                 continue
-            raise H3ChipmunkPatchError("Chipmunk is already installed with another configuration")
-        original = getattr(current, "_h3_activation_original", None) if current is not None else None
+            raise H3ChipmunkPatchError(
+                "Chipmunk is already installed with another configuration"
+            )
+        original = (
+            getattr(current, "_h3_activation_original", None)
+            if current is not None
+            else None
+        )
         original = original or block.forward
         model_patcher.add_object_patch(
-            key, make_forward(block, index, config, chip_session, original_forward=original)
+            key,
+            make_forward(
+                block,
+                index,
+                config,
+                chip_session,
+                original_forward=original,
+            ),
         )
 
     options[STATUS_KEY] = {
@@ -68,13 +81,23 @@ def install(model_patcher, config):
         "feature_group": int(config.feature_group),
         "token_group_rows": int(config.token_group_rows),
         "scope": config.scope,
+        "cache_location": config.cache_location,
+        "cache_budget_gb": float(config.cache_budget_gb),
         "layer_range": [int(config.layer_start), int(config.layer_stop)],
         "approximate": config.mode == "reference_delta",
     }
     options["minimax_h3_chipmunk_session"] = chip_session
     logging.info(
-        "%s installed: mode=%s top=%.3f refresh=%d group=%d token_group=%d scope=%s",
-        LOG_PREFIX, config.mode, config.top_fraction, config.refresh_every,
-        config.feature_group, config.token_group_rows, config.scope,
+        "%s installed: mode=%s top=%.3f refresh=%d group=%d token_group=%d "
+        "scope=%s cache=%s budget=%.1fGiB",
+        LOG_PREFIX,
+        config.mode,
+        config.top_fraction,
+        config.refresh_every,
+        config.feature_group,
+        config.token_group_rows,
+        config.scope,
+        config.cache_location,
+        config.cache_budget_gb,
     )
     return chip_session
