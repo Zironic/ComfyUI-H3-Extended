@@ -188,20 +188,24 @@ def _logical_indices(groups: torch.Tensor, count: int, feature_group: int):
 
 
 def _selector(fc1, h, cache, config):
+    """Select ConvRot groups from block-mean SwiGLU activation deltas."""
     tg = int(config.token_group_rows)
     means = torch.stack([
         h[a:min(h.shape[0], a + tg)].mean(dim=0)
         for a in range(0, h.shape[0], tg)
     ], dim=0)
-    act = logical_swiglu(fc1.full(means))
+    act = logical_swiglu(fc1.full(means)).float()
     fg = int(config.feature_group)
     if act.shape[-1] % fg:
         raise ChipmunkExecutionError("H3 FFN is not feature-group aligned")
-    grouped = act.float().reshape(act.shape[0], act.shape[1] // fg, fg).mean(dim=-1)
-    old_summary = _load_tensor(cache.selector_summary, grouped.device)
-    scores = grouped.abs() if old_summary is None else (grouped - old_summary.float()).abs()
+    previous = _load_tensor(cache.selector_summary, act.device)
+    delta = act if previous is None else act - previous.float()
+    scores = delta.reshape(delta.shape[0], delta.shape[1] // fg, fg).square().mean(dim=-1).sqrt()
     indices, counts = select_top_groups(scores, config.top_fraction, config.random_groups)
-    cache.selector_summary = _store_tensor(grouped.to(torch.bfloat16), config)
+    # This summary is touched only on refresh/measurement calls. Keep the full
+    # per-feature block-mean signal on CPU so signed values cannot cancel inside
+    # a 256-neuron group before the RMS delta is measured.
+    cache.selector_summary = act.to(torch.bfloat16).cpu()
     cache.selected_groups = _store_tensor(indices, config)
     cache.selected_counts = _store_tensor(counts, config)
     return indices, counts, scores
@@ -232,9 +236,7 @@ def _delta_update(block, h, cache, config):
     out = _load_tensor(cache.output, h.device)
 
     with ConvRotFC1(block.mlp, h[:1]) as fc1:
-        current_activation = _selected_activation_all_groups(
-            fc1, h, indices, counts, config
-        )
+        current_activation = _selected_activation_all_groups(fc1, h, indices, counts, config)
 
     tg = int(config.token_group_rows)
     fg = int(config.feature_group)
@@ -349,9 +351,7 @@ def run_chipmunk_chunk(
         ffn = int(block.mlp.fc2.in_features)
         _check_gpu_budget(snapshot, config, hidden, ffn)
         out = _delta_update(block, h, cache, config)
-        active = float(
-            cache.selected_groups.shape[1] * config.feature_group / ffn
-        )
+        active = float(cache.selected_groups.shape[1] * config.feature_group / ffn)
         cache.sparse_calls += 1
         cache.update_step = step
         session.record(
