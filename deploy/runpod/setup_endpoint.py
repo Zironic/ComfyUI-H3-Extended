@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import shlex
 import shutil
 import subprocess
@@ -169,8 +168,7 @@ def _create_endpoint(args: argparse.Namespace, template_id: str) -> str:
         str(args.workers_max),
         "--idle-timeout",
         str(args.idle_timeout),
-        "--flash-boot",
-        "true",
+        "--flash-boot=true",
         "--execution-timeout",
         str(args.execution_timeout),
         "--min-cuda-version",
