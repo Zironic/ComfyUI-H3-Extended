@@ -42,12 +42,10 @@ class AcquiredLinear:
     def linear(self, x):
         return F.linear(x, self.weight, self.bias)
 
-    def release(self, guard=None):
+    def release(self):
         if self.released:
             return
-        comfy.ops.uncast_bias_weight(
-            self.module, self.weight, self.bias, self.handle, guard=guard
-        )
+        comfy.ops.uncast_bias_weight(self.module, self.weight, self.bias, self.handle)
         self.released = True
 
 
@@ -257,7 +255,6 @@ def _convrot_fc1_module_op(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     mlp = _convrot_mlp(module_id)
     acquired = acquire_linear(mlp.fc1, sample)
-    guard = None
     try:
         if acquired.bias is not None:
             raise ValueError("fc1 ConvRot weight must not have a bias")
@@ -268,10 +265,9 @@ def _convrot_fc1_module_op(
         if half_width % 256 or int(qdata.shape[1]) % 256:
             raise ValueError("fc1 ConvRot dimensions must be group-size aligned")
         outputs = _convrot_fc1_tiles(qdata, scale)
-        guard = outputs[-1]
         return outputs
     finally:
-        acquired.release(guard=guard)
+        acquired.release()
 
 
 @_convrot_fc1_module_op.register_fake
@@ -303,7 +299,6 @@ def _convrot_fc2_module_op(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     mlp = _convrot_mlp(module_id)
     acquired = acquire_linear(mlp.fc2, sample)
-    guard = None
     try:
         if acquired.bias is not None:
             raise ValueError("fc2 ConvRot weight must not have a bias")
@@ -311,10 +306,9 @@ def _convrot_fc2_module_op(
         if qdata.shape[1] % 2 or (qdata.shape[1] // 2) % 256:
             raise ValueError("H3 FFN width must split into two group-aligned tiles")
         outputs = _convrot_fc2_tiles(qdata, scale)
-        guard = outputs[-1]
         return outputs
     finally:
-        acquired.release(guard=guard)
+        acquired.release()
 
 
 @_convrot_fc2_module_op.register_fake
@@ -412,7 +406,7 @@ class ConvRotTwoSliceMLP:
                 (fc1_weight_0, fc1_scale_0),
                 (fc1_weight_1, fc1_scale_1),
             )
-            fc1.release(guard=fc1_scale_1)
+            fc1.release()
             fc1 = None
             fc1_qdata = None
             fc1_scale = None
@@ -440,7 +434,7 @@ class ConvRotTwoSliceMLP:
                 }
                 for fc1_tile, fc2_tile in zip(fc1_tiles, fc2_tiles)
             )
-            fc2.release(guard=fc2_scale)
+            fc2.release()
             fc2 = None
             return self
         except Exception:

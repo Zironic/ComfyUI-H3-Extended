@@ -535,7 +535,6 @@ def fused_qkv_module_op(
 
     module = _fused_qkv_module(module_id)
     qdata, weight_scale, handle, held_weight, bias = _plain_qkv_weight(module, x)
-    release_guard = None
     try:
         inner = heads * HEAD_DIM
         expected_weight = (inner * 3, x.shape[1])
@@ -581,12 +580,9 @@ def fused_qkv_module_op(
             rope_strides=rope_strides,
             output_dtype=x.dtype,
         )
-        release_guard = carriers[0]
         return carriers
     finally:
-        comfy.ops.uncast_bias_weight(
-            module.qkv_proj, held_weight, bias, handle, guard=release_guard
-        )
+        comfy.ops.uncast_bias_weight(module.qkv_proj, held_weight, bias, handle)
 
 
 @fused_qkv_module_op.register_fake
@@ -648,7 +644,6 @@ def run_fused_qkv(module, x, rope_freqs, *, layer_index, tensor_core=None):
     held_weight = None
     bias = None
     handle = None
-    release_guard = None
     try:
         if rope_freqs is None:
             rope = x.new_empty((1, 1, 1, 16, 2, 2))
@@ -740,7 +735,6 @@ def run_fused_qkv(module, x, rope_freqs, *, layer_index, tensor_core=None):
             q_summary,
             k_summary,
         ) = carriers
-        release_guard = q_int8
         return validate_prepared_fused_qkv(
             PreparedFusedQKV(
                 q_int8=q_int8,
@@ -760,9 +754,7 @@ def run_fused_qkv(module, x, rope_freqs, *, layer_index, tensor_core=None):
         )
     finally:
         if held_weight is not None:
-            comfy.ops.uncast_bias_weight(
-                module.qkv_proj, held_weight, bias, handle, guard=release_guard
-            )
+            comfy.ops.uncast_bias_weight(module.qkv_proj, held_weight, bias, handle)
 
 
 class FusedQKVProjector:

@@ -51,6 +51,25 @@ def test_defaults():
     )
 
 
+def test_weight_release_uses_current_comfy_contract():
+    print("weight release contract")
+    calls = []
+    original = comfy.ops.uncast_bias_weight
+
+    def uncast(module, weight, bias, handle):
+        calls.append((module, weight, bias, handle))
+
+    acquired = linear_module.AcquiredLinear("module", "weight", "bias", "handle")
+    try:
+        comfy.ops.uncast_bias_weight = uncast
+        acquired.release()
+        acquired.release()
+    finally:
+        comfy.ops.uncast_bias_weight = original
+    check(calls == [("module", "weight", "bias", "handle")],
+          "held weights use Comfy's four-argument release API exactly once")
+
+
 def test_convrot_two_slice_cpu_fake():
     print("two-slice ConvRot fake")
 
@@ -467,6 +486,7 @@ def test_patch_install():
 
 def main():
     test_defaults()
+    test_weight_release_uses_current_comfy_contract()
     test_convrot_two_slice_cpu_fake()
     test_convrot_scale_tiles()
     test_convrot_two_slice_rejects_contract()
