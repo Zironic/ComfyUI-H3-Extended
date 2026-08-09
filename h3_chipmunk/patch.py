@@ -83,17 +83,22 @@ def install(model_patcher, config):
         "chunk_rows": int(config.chunk_rows),
         "effective_chunk_rows": int(config.effective_chunk_rows),
         "measure_layer_stride": int(config.measure_layer_stride),
+        "shadow_layer_stride": int(config.shadow_layer_stride),
+        "shadow_sample_rows": int(config.shadow_sample_rows),
+        "shadow_profile": [list(item) for item in config.shadow_profile],
         "scope": config.scope,
         "cache_location": config.cache_location,
         "cache_budget_gb": float(config.cache_budget_gb),
         "layer_range": [int(config.layer_start), int(config.layer_stop)],
+        # shadow_validate is output-exact: it computes approximation error beside
+        # the dense result but never feeds the shadow result into the model.
         "approximate": config.mode == "reference_delta",
     }
     options["minimax_h3_chipmunk_session"] = chip_session
     logging.info(
         "%s installed: mode=%s top=%.3f refresh=%d group=%d token_group=%d "
-        "chunk=%d effective_chunk=%d measure_layer_stride=%d scope=%s "
-        "cache=%s budget=%.1fGiB",
+        "chunk=%d effective_chunk=%d measure_stride=%d shadow_stride=%d "
+        "shadow_rows=%d scope=%s cache=%s budget=%.1fGiB",
         LOG_PREFIX,
         config.mode,
         config.top_fraction,
@@ -103,6 +108,8 @@ def install(model_patcher, config):
         config.chunk_rows,
         config.effective_chunk_rows,
         config.measure_layer_stride,
+        config.shadow_layer_stride,
+        config.shadow_sample_rows,
         config.scope,
         config.cache_location,
         config.cache_budget_gb,
