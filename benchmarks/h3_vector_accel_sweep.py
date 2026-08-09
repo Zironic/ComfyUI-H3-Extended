@@ -19,6 +19,7 @@ sys.path.insert(0, str(PACK_ROOT))
 
 from h3_vector_accel.study import (  # noqa: E402
     adaptive_comparison_arms,
+    four_arm_study_arms,
     fixed_policy_arms,
     run_study_arms,
     write_study_result,
@@ -44,6 +45,8 @@ def main():
     parser.add_argument("--runner", required=True)
     parser.add_argument("--out", required=True)
     parser.add_argument("--include-vde", action="store_true")
+    parser.add_argument("--four-arm", action="store_true",
+                        help="run the fixed solver and forecast four-arm comparison")
     parser.add_argument("--adaptive-profile")
     parser.add_argument("--adaptive-method", choices=("hold", "linear_velocity", "vde"), default="linear_velocity")
     parser.add_argument("--conditioning-mode", default="default")
@@ -55,7 +58,9 @@ def main():
         raise SystemExit("--authorize-gpu is required because the injected runner may load H3 and allocate VRAM")
     _gpu_preflight()
     runner = _load_runner(args.runner)
-    arms = list(fixed_policy_arms(include_vde=args.include_vde))
+    if args.four_arm and args.adaptive_profile:
+        raise SystemExit("--four-arm cannot be combined with --adaptive-profile")
+    arms = list(four_arm_study_arms() if args.four_arm else fixed_policy_arms(include_vde=args.include_vde))
     if args.adaptive_profile:
         arms.extend(adaptive_comparison_arms(
             args.best_fixed_method, args.best_fixed_profile,

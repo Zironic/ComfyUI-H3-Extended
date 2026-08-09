@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass
 import json
 from pathlib import Path
 
-from .config import SamplerConfig, actual_mask
+from .config import PREDICTOR_METHODS, SamplerConfig, actual_mask
 
 
 @dataclass(frozen=True)
@@ -41,7 +41,7 @@ class StudyArm:
 def fixed_policy_arms(include_vde=False):
     """Return ordered predictor and equal-NFE placement study arms."""
     arms = [
-        StudyArm("native_20", "predictor", "native", "native_20", 20),
+        StudyArm("euler_full_20", "predictor", "euler", "full_20", 20),
         StudyArm("hold_conservative_12", "predictor", "hold", "conservative_12", 12),
         StudyArm("linear_conservative_12", "predictor", "linear_velocity", "conservative_12", 12),
         StudyArm("linear_early_aggressive_13", "placement", "linear_velocity", "early_aggressive_13", 13),
@@ -56,10 +56,26 @@ def fixed_policy_arms(include_vde=False):
     return tuple(arms)
 
 
+def four_arm_study_arms():
+    """Return the fixed four-arm solver and forecast comparison."""
+    return (
+        StudyArm("res_multistep_full_20", "solver_comparison",
+                 "res_multistep", "full_20", 20),
+        StudyArm("res_multistep_late_aggressive_13", "solver_comparison",
+                 "res_multistep", "late_aggressive_13", 13),
+        StudyArm("linear_velocity_late_aggressive_13", "solver_comparison",
+                 "linear_velocity", "late_aggressive_13", 13),
+        StudyArm("euler_late_aggressive_13", "solver_comparison",
+                 "euler", "late_aggressive_13", 13),
+    )
+
+
 def adaptive_comparison_arms(best_fixed_method, best_fixed_profile,
                              repairability_profile, predictor_method,
                              conditioning_mode, quality_presets=("conservative", "balanced", "aggressive")):
     """Compare a selected fixed arm with profile-gated adaptive presets."""
+    if predictor_method not in PREDICTOR_METHODS:
+        raise ValueError("adaptive comparison requires a predictor method")
     arms = [StudyArm(
         f"best_fixed_{best_fixed_method}_{best_fixed_profile}",
         "adaptive_compare", best_fixed_method, best_fixed_profile,
@@ -67,7 +83,7 @@ def adaptive_comparison_arms(best_fixed_method, best_fixed_profile,
     )]
     arms.extend(StudyArm(
         f"adaptive_{predictor_method}_{preset}",
-        "adaptive_compare", predictor_method, "native_20", None,
+        "adaptive_compare", predictor_method, "full_20", None,
         policy="adaptive_repair", quality_preset=preset,
         repairability_profile=repairability_profile,
         conditioning_mode=conditioning_mode,
@@ -119,6 +135,10 @@ def run_fixed_policy_study(runner, include_vde=False, metadata=None):
     return run_study_arms(
         runner, fixed_policy_arms(include_vde=include_vde), metadata=metadata
     )
+
+
+def run_four_arm_study(runner, metadata=None):
+    return run_study_arms(runner, four_arm_study_arms(), metadata=metadata)
 
 
 def write_study_result(result, path):

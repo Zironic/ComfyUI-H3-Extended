@@ -2,7 +2,7 @@
 
 ## 1. Objective
 
-Implement a custom ComfyUI sampler that reduces MiniMax H3 transformer evaluations by forecasting selected rectified-flow derivatives while retaining the existing dense sigma schedule as the logical integration grid.
+Implement a custom ComfyUI sampler that reduces MiniMax H3 transformer evaluations while separating three concerns: which coordinates receive genuine H3 evaluations, which numerical integrator advances between those anchors, and whether synthetic velocity forecasts are used at all.
 
 The experiment should test this specific hypothesis:
 
@@ -17,6 +17,8 @@ The sampler therefore must distinguish three different properties:
 The eventual adaptive policy should forecast based on estimated **final surviving error**, not merely on velocity smoothness.
 
 The first controlled placement comparison falsified that hypothesis at the tested skip magnitude. With the same 13 true NFEs, `early_aggressive_13` produced severe video corruption while `late_aggressive_13` was visually acceptable and much closer to native. The working model is now an early trajectory-establishment phase followed by a more forecastable refinement phase. `late_aggressive_13` is the reference accelerated fixed profile; the exact protected-prefix boundary remains experimental.
+
+A second interpretation must now be isolated: the current vector sampler changes both H3 evaluation placement and the numerical integrator. Its actual steps use Euler, while production H3 commonly uses ComfyUI's second-order `res_multistep`. Core RES already accepts unequal sigma intervals, so the next required control is to pass only the named actual-anchor sigmas to the existing RES implementation. Do not build an adaptive off-grid velocity integrator until reduced-schedule RES, reduced-schedule Euler, and the current vector method have been compared at the same anchors and true NFE.
 
 ---
 
@@ -59,7 +61,7 @@ The current H3 harness already accepts arbitrary `sampler` and `sigmas` objects 
 The first implementation must preserve these invariants:
 
 1. **Native parity first.**
-   `method=native` must reproduce stock deterministic Euler for identical inputs.
+   `method=euler` with `evaluation_profile=full_20` must reproduce stock deterministic Euler for identical inputs.
 
 2. **Deterministic flow integration only.**
    No churn, ancestral noise, stochastic corrections, or Heun stages in V1.
@@ -76,7 +78,8 @@ The first implementation must preserve these invariants:
 6. **Every unsafe forecast becomes an actual evaluation.**
    Missing history, duplicate sigmas, non-finite values, extrapolation bounds, or policy uncertainty must trigger a real H3 call.
 
-7. **The dense sigma sequence is a candidate-decision grid, not a guarantee of numerical fidelity.**
+7. **The dense sigma sequence is a source schedule, not a universal integration grid.**
+   Vector forecast methods retain it as a candidate-decision grid. Sparse-anchor methods select genuine H3 coordinates from it, append the original terminal sigma, and give that reduced nonuniform schedule directly to the chosen core integrator.
 
 8. **Only one approximation system at a time during characterization.**
    Existing DiT caching, prediction caches, spectral forecasting, or other step-skipping systems must be disabled while evaluating Vector Accel.
@@ -91,7 +94,7 @@ The first implementation must preserve these invariants:
 
 The original benchmark separated:
 
-* sparse Euler over actual-anchor sigmas; and
+* reduced-schedule Euler over actual-anchor sigmas; and
 * dense-grid Euler holding the last actual derivative across forecast points.
 
 Those are the same integration method.
@@ -112,11 +115,11 @@ Then:
 x_2=x_0+d_a(\sigma_2-\sigma_0).
 ]
 
-That is exactly the sparse Euler update from (\sigma_0) directly to (\sigma_2), aside from floating-point accumulation order and intermediate callbacks.
+That is exactly the reduced-schedule Euler update from (\sigma_0) directly to (\sigma_2), aside from floating-point accumulation order and intermediate callbacks.
 
 Therefore:
 
-> `dense hold` and `sparse Euler using the same anchors` are an equivalence test, not two meaningful quality arms.
+> `dense hold` and `reduced-schedule Euler using the same anchors` are an equivalence test, not two meaningful quality arms.
 
 The dense schedule remains useful because it provides:
 
@@ -200,12 +203,13 @@ Initial visible inputs:
 
 ```text
 method:
-    native
+    euler
+    res_multistep
     hold
     linear_velocity
 
 evaluation_profile:
-    native_20
+    full_20
     late_aggressive_13  # reference accelerated profile
     conservative_12
     early_aggressive_13
@@ -225,6 +229,8 @@ max_extrapolation_ratio: conservative default  # hard veto, not a forecast scale
 ```
 
 Do not initially expose arbitrary thresholds, custom masks, error-controller gains, separate video/audio tolerances, or consecutive-forecast limits. Fixed named profiles make the first comparisons reproducible.
+
+`euler` and `res_multistep` do not forecast synthetic derivatives. The evaluation profile independently selects their actual sigma schedule. `euler + full_20` is the Euler parity baseline; `res_multistep + full_20` is the full 20-NFE RES control; `res_multistep + late_aggressive_13` is the reduced 13-NFE RES arm.
 
 Later versions can add:
 
@@ -281,8 +287,8 @@ model fingerprint, when available
 Failure behavior:
 
 ```text
-method=native:
-    may optionally permit generic CONST flow models for unit testing
+euler / res_multistep:
+    require H3 ModelSamplingAV with CONST flow sampling
 
 hold / linear_velocity / adaptive:
     reject unsupported model sampling with a clear error
@@ -292,7 +298,7 @@ Do not hard-code one fragile chain of `.inner_model.inner_model...` attributes. 
 
 ---
 
-## 8. Native Euler parity
+## 8. Full-schedule Euler parity
 
 Start by structurally matching deterministic Comfy Euler:
 
@@ -305,7 +311,7 @@ x_next = x + h * d
 
 The current stock Euler sampler follows this structure.
 
-`method=native` must:
+`method=euler` with `evaluation_profile=full_20` must:
 
 * perform one H3 call for every nonterminal sigma;
 * produce the same callback order;
@@ -374,7 +380,7 @@ Anchor derivative and slope arithmetic should initially use FP32 even when the m
 
 ## 10. Prediction methods
 
-### 10.1 `native`
+### 10.1 `euler`
 
 Every step executes H3.
 
@@ -398,7 +404,7 @@ h_i=\sigma_{i+1}-\sigma_i.
 
 This is the zero-order baseline.
 
-It is also the exact numerical equivalent of removing forecast sigma points and taking sparse Euler steps between the same actual anchors.
+It is also the exact numerical equivalent of removing forecast sigma points and taking Euler steps between the same actual anchors.
 
 ### 10.3 `linear_velocity`
 
@@ -779,7 +785,7 @@ Prediction error alone does not test the central hypothesis. Add a separate offl
 
 ### 16.1 Native reference trajectory
 
-Run deterministic native 20-step Euler and retain selected:
+Run deterministic full-schedule Euler and retain selected:
 
 ```text
 x_i
@@ -938,7 +944,7 @@ Run these experiments in order.
 ### Phase A — numerical controls
 
 1. Native custom sampler versus stock Euler.
-2. Dense hold versus sparse Euler with identical actual anchors.
+2. Dense hold versus reduced-schedule Euler with identical actual anchors.
 3. Constant-velocity fake model.
 4. Linear-in-sigma fake velocity model.
 5. True model-call counts.
@@ -948,7 +954,7 @@ Run these experiments in order.
 For one fixed 12- or 13-NFE anchor mask:
 
 ```text
-native 20
+Euler full-20
 hold
 linear_velocity
 ```
@@ -966,6 +972,19 @@ late_aggressive_13
 ```
 
 This test found that early forecasts can displace the video trajectory beyond later correction. `late_aggressive_13` is therefore the reference accelerated arm and `early_aggressive_13` is retained only as a failed characterization control.
+
+### Phase C2 — integration-method control
+
+Use the same `late_aggressive_13` actual coordinates for all 13-NFE accelerated arms:
+
+```text
+native production      20 NFE  res_multistep over the full schedule
+RES late-13            13 NFE  res_multistep over actual anchors only
+current vector late-13 13 NFE  Euler plus linear-velocity forecasts
+Euler late-13          13 NFE  Euler over actual anchors only
+```
+
+This control precedes adaptive off-grid work. If reduced-schedule RES matches or beats the vector predictor, keep H3-specific logic focused on anchor placement and let core RES own integration. Do not feed synthetic denoised predictions into RES before actual-only reduced-schedule RES is characterized.
 
 ### Phase D — one-step repairability sweep
 
@@ -1127,7 +1146,7 @@ Do not silently apply a 20-step simple-schedule profile to a different scheduler
 
 Add VDE only after hold and linear velocity have established:
 
-* native parity;
+* full-schedule Euler parity;
 * useful NFE reduction;
 * known audio behavior;
 * measured repairability.
@@ -1242,12 +1261,18 @@ being treated as equivalent merely because they share the same Python sampler cl
 
 ## 22. Unit tests
 
+These are direct sampler-boundary CPU contract tests using fake models and
+explicit sigma tensors. They are not assertions made through a serialized
+ComfyUI workflow. Workflow runs exercise the configured arm and emit
+diagnostics; they cannot by themselves prove internal solver parity or
+callback-coordinate mapping.
+
 ### Native parity
 
 Same fake flow model, initial state, sigmas, and callback:
 
 ```text
-stock Euler == custom native mode
+stock Euler == custom `euler + full_20`
 ```
 
 Check final tensor and every callback value.
@@ -1266,17 +1291,17 @@ all of these should agree:
 native
 hold with arbitrary skipped points
 linear_velocity
-sparse Euler using the same actual anchors
+reduced-schedule Euler using the same actual anchors
 ```
 
-### Hold/sparse equivalence
+### Hold/reduced-schedule equivalence
 
 For an arbitrary deterministic model and predetermined actual anchors:
 
 ```text
 dense logical grid + held derivative
 ==
-sparse Euler across actual-anchor sigmas
+Euler across actual-anchor sigmas
 ```
 
 Test multiple consecutive forecast lengths and irregular sigmas.
@@ -1300,6 +1325,12 @@ Verify that forecast derivatives never become anchors.
 ### Model-call count
 
 Every profile must produce the exact expected number of `model()` calls unless a guard fallback occurs.
+
+For actual-only core solvers, also verify that the full-20 RES control matches core
+`sample_res_multistep`, reduced schedules report their original logical anchor
+coordinates and exact true NFE, reduced-schedule fingerprints include both source and
+effective schedules, and the four-arm study builder emits the intended method,
+profile, and NFE matrix.
 
 ### Guard fallback
 
@@ -1386,7 +1417,7 @@ The first production-oriented success criterion is:
 
 ### Gate 1 — parity
 
-Proceed only when native mode matches stock Euler.
+Proceed only when `euler + full_20` matches stock Euler.
 
 ### Gate 2 — predictor value
 
@@ -1418,7 +1449,7 @@ Adaptive mode is useful only when it reduces median true NFE relative to the bes
 * Implement model compatibility resolution.
 * Clone deterministic Euler behavior.
 * Register extension.
-* Add native parity tests.
+* Add full-schedule Euler parity tests.
 * Add sampler fingerprint.
 
 ### Milestone 2 — fixed predictors
@@ -1434,7 +1465,7 @@ Adaptive mode is useful only when it reduces median true NFE relative to the bes
 
 * Add separate video/audio metrics.
 * Update latent-dynamics callback handling.
-* Add hold/sparse equivalence test.
+* Add hold/reduced-schedule equivalence test.
 * Add constant and linear fake-flow tests.
 * Add run-scoped JSON output.
 
@@ -1445,6 +1476,7 @@ Adaptive mode is useful only when it reduces median true NFE relative to the bes
 * Characterize audio failures separately.
 * Select candidate NFE/profile combinations.
 * Treat `late_aggressive_13` as the reference accelerated profile after the first controlled placement comparison.
+* Compare full 20-step RES, reduced late-13 RES, vector late-13, and reduced late-13 Euler before attributing quality to velocity forecasting.
 
 ### Milestone 5 — repairability study
 

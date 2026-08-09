@@ -40,7 +40,8 @@ def model_fingerprint(model) -> str:
     return hashlib.sha256("|".join(bits).encode("utf-8")).hexdigest()[:24]
 
 
-def configuration_payload(config: SamplerConfig, sigmas=None, model_identity=None) -> dict:
+def configuration_payload(config: SamplerConfig, sigmas=None, model_identity=None,
+                          effective_sigmas=None, actual_indices=None) -> dict:
     payload = {
         "method": config.method,
         "evaluation_profile": config.evaluation_profile,
@@ -66,13 +67,23 @@ def configuration_payload(config: SamplerConfig, sigmas=None, model_identity=Non
     }
     if sigmas is not None:
         payload["sigma_hash"] = sigma_hash(sigmas)
+        if effective_sigmas is not None or actual_indices is not None:
+            payload["source_sigma_sequence"] = torch.as_tensor(sigmas).detach().cpu().tolist()
+    if effective_sigmas is not None:
+        payload["effective_sigma_hash"] = sigma_hash(effective_sigmas)
+        payload["effective_sigma_sequence"] = torch.as_tensor(effective_sigmas).detach().cpu().tolist()
+    if actual_indices is not None:
+        payload["actual_indices"] = [int(index) for index in actual_indices]
     if model_identity is not None:
         payload["model_fingerprint"] = str(model_identity)
     return payload
 
 
-def configuration_fingerprint(config: SamplerConfig, sigmas=None, model_identity=None) -> str:
-    encoded = canonical_json(configuration_payload(config, sigmas, model_identity)).encode("utf-8")
+def configuration_fingerprint(config: SamplerConfig, sigmas=None, model_identity=None,
+                              effective_sigmas=None, actual_indices=None) -> str:
+    encoded = canonical_json(configuration_payload(
+        config, sigmas, model_identity, effective_sigmas, actual_indices
+    )).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
 

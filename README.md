@@ -36,9 +36,15 @@ this copy.
 `MiniMaxH3VectorAccelSamplerZi` is an experimental deterministic-flow sampler
 for H3's packed video/audio latent. It keeps the scheduler's full sigma grid but
 can replace selected H3 forwards with held or linearly extrapolated derivatives.
-The named forecast profiles are exact 20-step masks; native mode remains the
-parity baseline and evaluates every step. Forecast guards fail closed to genuine
+The named forecast profiles are exact 20-step masks. `euler + full_20` is the
+Euler parity baseline and evaluates every step. Forecast guards fail closed to genuine
 H3 evaluations, and diagnostics report logical steps separately from true NFE.
+
+`euler` and `res_multistep` are actual-only core solvers. The separately selected
+evaluation profile determines their sigma schedule: `full_20` uses all source
+points, while a reduced profile passes only its named anchors plus the terminal
+sigma to the core solver. The 13-NFE multistep benchmark is therefore
+`res_multistep + late_aggressive_13`.
 
 `late_aggressive_13` is the current accelerated reference profile. The first
 controlled placement comparison found that the equal-NFE early profile severely

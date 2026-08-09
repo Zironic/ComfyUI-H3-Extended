@@ -28,4 +28,21 @@ class FingerprintTests(unittest.TestCase):
         self.assertEqual(configuration_fingerprint(config, sigmas),
                          configuration_fingerprint(config, sigmas.clone()))
 
+    def test_core_solver_fingerprint_includes_effective_schedule(self):
+        sigmas = torch.linspace(20., 0., 21)
+        config = SamplerConfig(
+            method="res_multistep",
+            evaluation_profile="late_aggressive_13",
+        )
+        indices = config.actual_indices
+        effective = torch.cat((sigmas[list(indices)], sigmas[-1:]))
+        base = configuration_fingerprint(
+            config, sigmas, effective_sigmas=effective, actual_indices=indices,
+        )
+        changed = effective.clone()
+        changed[6] -= 0.125
+        self.assertNotEqual(base, configuration_fingerprint(
+            config, sigmas, effective_sigmas=changed, actual_indices=indices,
+        ))
+
 if __name__ == "__main__": unittest.main()

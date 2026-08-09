@@ -14,20 +14,6 @@ class Decision:
     audio_risk: float | None = None
 
 
-class NativePolicy:
-    def reset(self):
-        pass
-
-    def decide(self, step, **kwargs) -> Decision:
-        return Decision(False, "native")
-
-    def observe_actual(self, *args, **kwargs):
-        pass
-
-    def observe_step(self, forecast):
-        pass
-
-
 class FixedMaskPolicy:
     def __init__(self, mask):
         self.mask = tuple(bool(value) for value in mask)
@@ -145,8 +131,6 @@ class AdaptiveRepairPolicy:
 
 
 def make_policy(config: SamplerConfig, profile=None, logical_steps=20):
-    if config.method == "native":
-        return NativePolicy()
     if config.policy == "adaptive_repair":
         if profile is None:
             raise ValueError("adaptive repair policy requires a loaded profile")

@@ -3,9 +3,11 @@
 from dataclasses import dataclass, field
 import math
 
-METHODS = ("native", "hold", "linear_velocity", "vde")
+PREDICTOR_METHODS = frozenset(("hold", "linear_velocity", "vde"))
+CORE_SOLVER_METHODS = frozenset(("euler", "res_multistep"))
+METHODS = ("euler", "res_multistep", "hold", "linear_velocity", "vde")
 PROFILES = (
-    "native_20", "late_aggressive_13", "late_cautious_14",
+    "full_20", "late_aggressive_13", "late_cautious_14",
     "late_aggressive_12", "late_max_11", "conservative_12",
     "early_aggressive_13", "uniform_13",
 )
@@ -23,7 +25,7 @@ DEFAULT_PROTECTED_PREFIX_STEPS = 6
 DEFAULT_AUDIO_EMERGENCY_MULTIPLIER = 4.0
 
 _MASKS = {
-    "native_20": (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19),
+    "full_20": (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19),
     "conservative_12": (0, 1, 3, 5, 7, 9, 11, 13, 15, 17, 18, 19),
     "early_aggressive_13": (0, 1, 4, 7, 8, 10, 12, 14, 15, 16, 17, 18, 19),
     "uniform_13": (0, 1, 3, 5, 7, 9, 11, 13, 15, 16, 17, 18, 19),
@@ -36,6 +38,8 @@ _MASKS = {
 
 def profile_mask(profile: str, logical_steps: int = 20) -> tuple[bool, ...]:
     """Return the immutable actual-evaluation mask for a named profile."""
+    if profile == "native_20":
+        profile = "full_20"
     if profile not in PROFILES:
         raise ValueError(f"unknown evaluation profile: {profile}")
     if logical_steps != 20:
@@ -52,8 +56,8 @@ def actual_mask(profile: str, logical_steps: int = 20) -> tuple[int, ...]:
 
 @dataclass(frozen=True)
 class SamplerConfig:
-    method: str = "native"
-    evaluation_profile: str = "native_20"
+    method: str = "euler"
+    evaluation_profile: str = "full_20"
     diagnostics: str = "off"
     fallback_on_guard: bool = True
     max_extrapolation_ratio: float = DEFAULT_MAX_EXTRAPOLATION_RATIO
@@ -74,6 +78,17 @@ class SamplerConfig:
     _mask: tuple[bool, ...] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self):
+        legacy_native = self.method == "native"
+        method = {
+            "native": "euler",
+            "sparse_euler": "euler",
+            "sparse_res_multistep": "res_multistep",
+        }.get(self.method, self.method)
+        evaluation_profile = self.evaluation_profile
+        if legacy_native or evaluation_profile == "native_20":
+            evaluation_profile = "full_20"
+        object.__setattr__(self, "method", method)
+        object.__setattr__(self, "evaluation_profile", evaluation_profile)
         if self.method not in METHODS:
             raise ValueError(f"unknown vector acceleration method: {self.method}")
         if self.evaluation_profile not in PROFILES:
@@ -86,12 +101,14 @@ class SamplerConfig:
             raise ValueError(f"unknown quality preset: {self.quality_preset}")
         if self.conditioning_mode not in CONDITIONING_MODES:
             raise ValueError(f"unknown conditioning mode: {self.conditioning_mode}")
-        if self.policy == "adaptive_repair" and self.method == "native":
-            raise ValueError("adaptive repair policy requires a forecast predictor")
+        if self.method in CORE_SOLVER_METHODS and self.policy != "fixed":
+            raise ValueError("core solver methods require the fixed policy")
+        if self.policy == "adaptive_repair" and self.method not in PREDICTOR_METHODS:
+            raise ValueError("adaptive repair policy requires a predictor method")
         if self.policy == "adaptive_repair" and not self.repairability_profile:
             raise ValueError("adaptive repair policy requires a repairability profile")
-        if self.policy == "adaptive_repair" and self.evaluation_profile != "native_20":
-            raise ValueError("adaptive repair policy uses the native_20 candidate grid")
+        if self.policy == "adaptive_repair" and self.evaluation_profile != "full_20":
+            raise ValueError("adaptive repair policy uses the full_20 candidate grid")
         if self.repairability_profile is not None:
             if not isinstance(self.repairability_profile, str) or not self.repairability_profile.strip():
                 raise ValueError("repairability_profile must be a non-empty profile filename")
@@ -131,5 +148,5 @@ class SamplerConfig:
     def validate_schedule_length(self, logical_steps: int) -> None:
         if logical_steps < 1:
             raise ValueError("sigma schedule must contain at least one derivative interval")
-        if (self.method != "native" or self.policy == "adaptive_repair") and logical_steps != 20:
+        if logical_steps != 20:
             raise ValueError(f"{self.evaluation_profile} requires exactly 20 logical steps")

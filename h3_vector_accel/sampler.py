@@ -6,8 +6,9 @@ import time
 
 import torch
 from comfy.utils import model_trange as trange
+from comfy.k_diffusion.sampling import sample_euler, sample_res_multistep
 
-from .config import SamplerConfig
+from .config import CORE_SOLVER_METHODS, PREDICTOR_METHODS, SamplerConfig
 from .diagnostics import RunDiagnostics, callback_metadata_scope
 from .fingerprint import (
     configuration_fingerprint,
@@ -207,9 +208,135 @@ def _guard_reason(config, x, sigma, sigma_next, prediction, predictor, metrics=N
     return None
 
 
+class _TimedModel:
+    """Proxy that preserves the model interface while measuring model calls."""
+
+    def __init__(self, model):
+        self._model = model
+        self.calls = 0
+        self.elapsed = 0.0
+
+    def __call__(self, *args, **kwargs):
+        started = time.perf_counter()
+        try:
+            return self._model(*args, **kwargs)
+        finally:
+            self.calls += 1
+            self.elapsed += time.perf_counter() - started
+
+    def __getattr__(self, name):
+        return getattr(self._model, name)
+
+
+def _sample_core_solver(model, x, source_sigmas, extra_args, callback, disable, config,
+                        diagnostics, context):
+    logical_steps = int(source_sigmas.numel() - 1)
+    if logical_steps != 20:
+        raise ValueError("core solver methods require the existing 20-interval sigma schedule")
+    if not _finite(source_sigmas):
+        raise ValueError("core solver methods require finite sigma values")
+    differences = source_sigmas[1:] - source_sigmas[:-1]
+    if bool((differences >= 0).any().item()):
+        raise ValueError("core solver methods require a strictly descending sigma schedule")
+    if config.policy != "fixed":
+        raise ValueError("core solver methods do not support adaptive policy")
+    if not context.is_h3_flow_av:
+        raise RuntimeError("core solver methods require ModelSamplingAV combined with CONST flow sampling")
+
+    actual_indices = config.actual_indices
+    index_tensor = torch.as_tensor(actual_indices, device=source_sigmas.device)
+    effective_sigmas = torch.cat((source_sigmas.index_select(0, index_tensor), source_sigmas[-1:]))
+    source_hash = sigma_hash(source_sigmas)
+    effective_hash = sigma_hash(effective_sigmas)
+    fingerprint = configuration_fingerprint(
+        config, source_sigmas, context.model_fingerprint,
+        effective_sigmas=effective_sigmas, actual_indices=actual_indices,
+    )
+    diagnostics.start_run(
+        sigmas=source_sigmas.tolist(),
+        method=config.method,
+        evaluation_profile=config.evaluation_profile,
+        configuration_fingerprint=fingerprint,
+        configuration=configuration_payload(
+            config, source_sigmas, context.model_fingerprint,
+            effective_sigmas=effective_sigmas, actual_indices=actual_indices,
+        ),
+        sigma_hash=source_hash,
+        source_sigma_hash=source_hash,
+        source_sigma_sequence=source_sigmas.tolist(),
+        effective_sigma_hash=effective_hash,
+        effective_sigma_sequence=effective_sigmas.tolist(),
+        actual_indices=list(actual_indices),
+    )
+
+    timed_model = _TimedModel(model)
+    core_sampler = sample_euler if config.method == "euler" else sample_res_multistep
+    callback_count = 0
+
+    def core_callback(data):
+        nonlocal callback_count
+        callback_count += 1
+        reduced_index = int(data["i"])
+        logical_index = int(actual_indices[reduced_index])
+        true_nfe = timed_model.calls
+        payload = dict(data)
+        payload["i"] = logical_index
+        payload["sigma"] = source_sigmas[logical_index]
+        payload["sigma_hat"] = source_sigmas[logical_index]
+        payload.update({
+            "h3_vector_forecast": False,
+            "h3_vector_true_nfe": true_nfe,
+            "h3_vector_actual_anchor_index": true_nfe - 1,
+            "h3_vector_logical_step": logical_index,
+            "h3_vector_method": config.method,
+            "h3_vector_profile": config.evaluation_profile,
+            "h3_vector_policy": config.policy,
+            "h3_vector_actual_only": True,
+            "h3_vector_core_solver": config.method,
+            "h3_vector_source_sigma_hash": source_hash,
+            "h3_vector_effective_sigma_hash": effective_hash,
+            "h3_vector_actual_indices": list(actual_indices),
+            "h3_vector_callback_context": "h3_vector_actual_only",
+        })
+        derivative = _to_d(payload["x"], payload["sigma"], payload["denoised"])
+        diagnostics.observe_actual_anchor(
+            logical_index, _scalar_sigma(payload["sigma"]), x=payload["x"],
+            actual_derivative=derivative,
+        )
+        diagnostics.observe_step(
+            logical_index, _scalar_sigma(payload["sigma"]), False, true_nfe,
+            actual_anchor_index=true_nfe - 1, method=config.method,
+            profile=config.evaluation_profile, policy=config.policy,
+        )
+        if callback is not None:
+            context_metadata = {
+                key: value for key, value in payload.items()
+                if key.startswith("h3_vector_")
+            }
+            with callback_metadata_scope(context_metadata):
+                callback(payload)
+
+    started = time.perf_counter()
+    result = core_sampler(
+        timed_model, x, effective_sigmas, extra_args=extra_args,
+        callback=core_callback, disable=disable,
+    )
+    wall_seconds = time.perf_counter() - started
+    if callback_count != timed_model.calls:
+        raise RuntimeError(
+            f"core sampler callback count {callback_count} did not match true NFE {timed_model.calls}"
+        )
+    diagnostics.finish_run(
+        model_call_seconds=timed_model.elapsed,
+        sampler_overhead_seconds=max(0.0, wall_seconds - timed_model.elapsed),
+        wall_seconds=wall_seconds,
+    )
+    return result
+
+
 def sample_vector_accel(model, x, sigmas, extra_args=None, callback=None, disable=None,
                         config=None, diagnostics=None, latent_shapes=None):
-    """Run native Euler or a fixed forecast mask over a nominal sigma grid."""
+    """Run an actual-only core solver or a forecast method over a source sigma grid."""
     extra_args = {} if extra_args is None else extra_args
     config = config if isinstance(config, SamplerConfig) else SamplerConfig(**(config or {}))
     sigma_values = torch.as_tensor(sigmas)
@@ -224,13 +351,17 @@ def sample_vector_accel(model, x, sigmas, extra_args=None, callback=None, disabl
     logical_steps = int(sigma_values.numel() - 1)
     config.validate_schedule_length(logical_steps)
     context = resolve_h3_sampling(model, latent_shapes=latent_shapes or extra_args.get("latent_shapes"))
-    if config.method == "native" and not _is_const(context.sampling):
-        raise RuntimeError("native vector sampling requires CONST flow sampling")
-    if config.method != "native":
+    if config.method in PREDICTOR_METHODS:
         if not context.is_h3_flow_av:
             raise RuntimeError("forecast methods require ModelSamplingAV combined with CONST flow sampling")
         if not context.latent_shapes or len(context.latent_shapes) < 2:
             raise RuntimeError("forecast methods require video and audio latent_shapes")
+    if config.method in CORE_SOLVER_METHODS:
+        return _sample_core_solver(
+            model, x, sigma_values, extra_args, callback, disable, config,
+            diagnostics or RunDiagnostics(config=config, latent_shapes=context.latent_shapes,
+                                          model_fingerprint=context.model_fingerprint), context,
+        )
 
     profile = None
     if config.policy == "adaptive_repair":
@@ -246,7 +377,7 @@ def sample_vector_accel(model, x, sigmas, extra_args=None, callback=None, disabl
         ))
         config = replace(config, adaptive_profile_hash=profile.hash)
 
-    predictor = make_predictor(config.method, latent_shapes=context.latent_shapes) if config.method != "native" else None
+    predictor = make_predictor(config.method, latent_shapes=context.latent_shapes)
     policy = make_policy(config, profile=profile, logical_steps=logical_steps)
     policy.reset()
     if predictor is not None:

@@ -16,7 +16,7 @@ sys.argv = [sys.argv[0], "--cpu"]
 import comfy.options  # noqa: E402
 comfy.options.enable_args_parsing()
 
-from comfy.k_diffusion.sampling import sample_euler  # noqa: E402
+from comfy.k_diffusion.sampling import sample_euler, sample_res_multistep  # noqa: E402
 from h3_vector_accel.config import PROFILES, SamplerConfig  # noqa: E402
 from h3_vector_accel.diagnostics import RunDiagnostics, current_callback_metadata  # noqa: E402
 from h3_vector_accel.predictor import Prediction  # noqa: E402
@@ -36,6 +36,22 @@ class ModelSamplingAV(CONST):
 class Inner:
     model_sampling = ModelSamplingAV()
     latent_shapes = [torch.Size((1, 1, 1, 1, 2)), torch.Size((1, 1, 2))]
+
+
+class ModelPatcher:
+    def __init__(self, sampling):
+        self.sampling = sampling
+
+    def get_model_object(self, name):
+        if name != "model_sampling":
+            raise KeyError(name)
+        return self.sampling
+
+
+class ResInner:
+    model_sampling = ModelSamplingAV()
+    model_patcher = ModelPatcher(model_sampling)
+    latent_shapes = [torch.Size((1, 1, 4)), torch.Size((1, 1, 2))]
 
 
 class FakeModel:
@@ -58,6 +74,10 @@ class GenericInner:
 
 class GenericModel(FakeModel):
     inner_model = GenericInner()
+
+
+class ResModel(FakeModel):
+    inner_model = ResInner()
 
 
 class GuardPredictor:
@@ -105,7 +125,7 @@ class SamplerTests(unittest.TestCase):
         self.sigmas = torch.linspace(20.0, 0.0, 21)
         self.x = torch.zeros(1, 1, 4)
 
-    def test_native_matches_stock_euler_and_callbacks(self):
+    def test_full_schedule_euler_matches_core_and_callbacks(self):
         velocity = lambda x, sigma: x * 0.125 + sigma * 0.01 + 1.0
         stock_model = FakeModel(velocity)
         custom_model = FakeModel(velocity)
@@ -117,7 +137,7 @@ class SamplerTests(unittest.TestCase):
         custom = sample_vector_accel(
             custom_model, self.x.clone(), self.sigmas,
             callback=custom_callbacks.append,
-            config=SamplerConfig(method="native"),
+            config=SamplerConfig(method="euler", evaluation_profile="full_20"),
         )
         self.assertTrue(torch.equal(stock, custom))
         self.assertEqual(stock_model.calls, custom_model.calls)
@@ -134,11 +154,11 @@ class SamplerTests(unittest.TestCase):
             calls.append((count, disable))
             return range(count)
 
-        with mock.patch("h3_vector_accel.sampler.trange", side_effect=tracked_trange):
+        with mock.patch("comfy.k_diffusion.sampling.trange", side_effect=tracked_trange):
             sample_vector_accel(
                 FakeModel(constant_velocity()), self.x.clone(), self.sigmas,
                 disable=False,
-                config=SamplerConfig(method="native"),
+                config=SamplerConfig(method="euler", evaluation_profile="full_20"),
             )
         self.assertEqual(calls, [(20, False)])
 
@@ -150,22 +170,62 @@ class SamplerTests(unittest.TestCase):
         self.assertEqual(sampler.h3_vector_config.method, "linear_velocity")
         self.assertEqual(len(sampler.h3_vector_fingerprint), 64)
 
-    def test_forecasts_reject_generic_const_but_native_allows_it(self):
-        native = GenericModel(constant_velocity())
-        sample_vector_accel(
-            native, self.x.clone(), self.sigmas,
-            config=SamplerConfig(method="native"),
+    def test_node_exposes_res_benchmark_without_changing_widget_order(self):
+        schema = MiniMaxH3VectorAccelSampler.define_schema()
+        inputs = {value.id: value for value in schema.inputs}
+        self.assertEqual(
+            [value.id for value in schema.inputs],
+            [
+                "method", "evaluation_profile", "diagnostics", "policy",
+                "quality_preset", "repairability_profile", "conditioning_mode",
+                "fallback_on_guard", "max_extrapolation_ratio",
+            ],
         )
-        self.assertEqual(native.calls, 20)
-        with self.assertRaisesRegex(RuntimeError, "ModelSamplingAV"):
-            sample_vector_accel(
-                GenericModel(constant_velocity()), self.x.clone(), self.sigmas,
-                config=SamplerConfig(method="hold", evaluation_profile="conservative_12"),
-            )
+        self.assertEqual(inputs["method"].options, [
+            "euler", "res_multistep", "hold", "linear_velocity", "vde",
+        ])
+        self.assertIn("full_20", inputs["evaluation_profile"].options)
+        self.assertIn("late_aggressive_13", inputs["evaluation_profile"].options)
+        self.assertEqual(inputs["method"].display_name, "solver / forecast mode")
+        self.assertEqual(inputs["evaluation_profile"].display_name, "actual-evaluation schedule")
+        output = MiniMaxH3VectorAccelSampler.execute(
+            "res_multistep", "late_aggressive_13", "off"
+        )
+        config = output.result[0].h3_vector_config
+        self.assertEqual(config.method, "res_multistep")
+        self.assertEqual(config.evaluation_profile, "late_aggressive_13")
+        self.assertEqual(len(config.actual_indices), 13)
+
+    def test_node_hides_unavailable_adaptive_controls_without_removing_them(self):
+        with mock.patch("h3_vector_accel.nodes._profile_names", return_value=[]):
+            schema = MiniMaxH3VectorAccelSampler.define_schema()
+        inputs = {value.id: value for value in schema.inputs}
+        self.assertEqual(inputs["policy"].options, ["fixed"])
+        for name in ("policy", "quality_preset", "repairability_profile", "conditioning_mode"):
+            self.assertTrue(inputs[name].extra_dict["hidden"])
+        self.assertEqual(inputs["quality_preset"].display_name, "adaptive quality tolerance")
+        self.assertIn("does not scale", inputs["max_extrapolation_ratio"].tooltip)
+
+    def test_node_reveals_adaptive_controls_when_a_profile_exists(self):
+        with mock.patch("h3_vector_accel.nodes._profile_names", return_value=["measured.json"]):
+            schema = MiniMaxH3VectorAccelSampler.define_schema()
+        inputs = {value.id: value for value in schema.inputs}
+        self.assertEqual(inputs["policy"].options, ["fixed", "adaptive_repair"])
+        for name in ("policy", "quality_preset", "repairability_profile", "conditioning_mode"):
+            self.assertNotIn("hidden", inputs[name].extra_dict)
+        self.assertEqual(inputs["repairability_profile"].options, ["measured.json"])
+
+    def test_h3_modes_reject_generic_const(self):
+        for method in ("euler", "res_multistep", "hold"):
+            with self.assertRaisesRegex(RuntimeError, "ModelSamplingAV"):
+                sample_vector_accel(
+                    GenericModel(constant_velocity()), self.x.clone(), self.sigmas,
+                    config=SamplerConfig(method=method, evaluation_profile="conservative_12"),
+                )
 
     def test_constant_velocity_and_profile_call_counts(self):
         expected_counts = {
-            "native_20": 20,
+            "full_20": 20,
             "conservative_12": 12,
             "early_aggressive_13": 13,
             "uniform_13": 13,
@@ -185,7 +245,7 @@ class SamplerTests(unittest.TestCase):
                 self.assertTrue(torch.equal(out, expected), (method, profile))
                 self.assertEqual(model.calls, expected_counts[profile], (method, profile))
 
-    def test_dense_hold_equals_sparse_euler_at_same_anchors(self):
+    def test_dense_hold_equals_reduced_schedule_euler_at_same_anchors(self):
         intervals = torch.tensor([
             20.0, 18.5, 17.0, 15.0, 14.5, 13.0, 11.0, 10.0, 8.0, 7.5,
             6.0, 5.0, 4.5, 4.0, 3.0, 2.5, 2.0, 1.5, 1.0, 0.5, 0.0,
@@ -195,16 +255,125 @@ class SamplerTests(unittest.TestCase):
         dense_model = FakeModel(velocity)
         dense = sample_vector_accel(dense_model, self.x.clone(), intervals, config=config)
 
-        sparse_model = FakeModel(velocity)
-        sparse = self.x.clone()
+        actual_model = FakeModel(velocity)
+        actual_only = self.x.clone()
         anchors = list(config.actual_indices)
         for position, step in enumerate(anchors):
             sigma = intervals[step]
-            denoised = sparse_model(sparse, sigma.reshape(1))
-            derivative = (sparse - denoised) / sigma
+            denoised = actual_model(actual_only, sigma.reshape(1))
+            derivative = (actual_only - denoised) / sigma
             next_step = anchors[position + 1] if position + 1 < len(anchors) else 20
-            sparse = sparse + derivative * (intervals[next_step] - sigma)
-        self.assertTrue(torch.allclose(dense, sparse, atol=1e-6, rtol=1e-6))
+            actual_only = actual_only + derivative * (intervals[next_step] - sigma)
+        self.assertTrue(torch.allclose(dense, actual_only, atol=1e-6, rtol=1e-6))
+
+    def test_euler_matches_core_on_reduced_schedule_and_maps_callbacks(self):
+        config = SamplerConfig(method="euler", evaluation_profile="late_aggressive_13")
+        effective = torch.cat((self.sigmas[list(config.actual_indices)], self.sigmas[-1:]))
+        velocity = lambda x, sigma: 0.2 * x + 0.03 * sigma + 1.0
+        direct = sample_euler(FakeModel(velocity), self.x.clone(), effective, disable=True)
+        callbacks, contexts = [], []
+        diagnostics = RunDiagnostics(config=config, latent_shapes=Inner.latent_shapes)
+        actual_only = sample_vector_accel(
+            FakeModel(velocity), self.x.clone(), self.sigmas,
+            callback=lambda payload: (callbacks.append(payload), contexts.append(current_callback_metadata())),
+            config=config, diagnostics=diagnostics,
+        )
+        self.assertTrue(torch.equal(direct, actual_only))
+        self.assertEqual(len(callbacks), len(config.actual_indices))
+        self.assertEqual(callbacks[-1]["i"], 19)
+        self.assertEqual(callbacks[-1]["h3_vector_true_nfe"], len(config.actual_indices))
+        self.assertTrue(contexts[-1]["h3_vector_actual_only"])
+        self.assertEqual(contexts[-1]["h3_vector_core_solver"], "euler")
+        self.assertEqual(diagnostics._run_metadata["actual_indices"], list(config.actual_indices))
+        self.assertEqual(diagnostics._run_metadata["effective_sigma_sequence"], effective.tolist())
+        self.assertIn("source_sigma_hash", diagnostics._run_metadata)
+        self.assertIn("effective_sigma_hash", diagnostics._run_metadata)
+        self.assertGreaterEqual(
+            diagnostics._run_metadata["wall_seconds"],
+            diagnostics._run_metadata["model_call_seconds"],
+        )
+
+    def test_res_matches_core_on_nonuniform_reduced_schedule(self):
+        sigmas = torch.tensor([
+            20.0, 18.5, 17.0, 15.0, 14.5, 13.0, 11.0, 10.0, 8.0, 7.5,
+            6.0, 5.0, 4.5, 4.0, 3.0, 2.5, 2.0, 1.5, 1.0, 0.5, 0.0,
+        ])
+        config = SamplerConfig(method="res_multistep", evaluation_profile="late_aggressive_13")
+        effective = torch.cat((sigmas[list(config.actual_indices)], sigmas[-1:]))
+        velocity = lambda x, sigma: 0.2 * x + 0.03 * sigma + 1.0
+        direct_model = ResModel(velocity)
+        configured_model = ResModel(velocity)
+        callbacks = []
+        direct = sample_res_multistep(direct_model, self.x.clone(), effective, disable=True)
+        configured = sample_vector_accel(
+            configured_model, self.x.clone(), sigmas, callback=callbacks.append,
+            disable=True, config=config,
+        )
+        self.assertTrue(torch.equal(direct, configured))
+        self.assertEqual(direct_model.calls, 13)
+        self.assertEqual(configured_model.calls, 13)
+        self.assertEqual([row["i"] for row in callbacks], list(config.actual_indices))
+        self.assertEqual(
+            [float(row["sigma"]) for row in callbacks],
+            [float(value) for value in effective[:-1]],
+        )
+        self.assertEqual(float(effective[-1]), 0.0)
+
+    def test_res_full_profile_matches_full_core_res(self):
+        config = SamplerConfig(method="res_multistep", evaluation_profile="full_20")
+        velocity = lambda x, sigma: 0.2 * x + 0.03 * sigma + 1.0
+        direct_model = ResModel(velocity)
+        configured_model = ResModel(velocity)
+        direct = sample_res_multistep(
+            direct_model, self.x.clone(), self.sigmas, disable=True,
+        )
+        configured = sample_vector_accel(
+            configured_model, self.x.clone(), self.sigmas, disable=True,
+            config=config,
+        )
+        self.assertTrue(torch.equal(direct, configured))
+        self.assertEqual(direct_model.calls, 20)
+        self.assertEqual(configured_model.calls, 20)
+
+    def test_core_solvers_reject_adaptive_and_invalid_source_schedule(self):
+        with self.assertRaisesRegex(ValueError, "core solver methods require the fixed policy"):
+            SamplerConfig(method="euler", policy="adaptive_repair", repairability_profile="measured.json")
+        with self.assertRaisesRegex(ValueError, "exactly 20 logical steps"):
+            sample_vector_accel(
+                FakeModel(constant_velocity()), self.x.clone(), self.sigmas[:-1],
+                config=SamplerConfig(method="euler"),
+            )
+        invalid = self.sigmas.clone()
+        invalid[4] = invalid[3]
+        with self.assertRaisesRegex(ValueError, "strictly descending"):
+            sample_vector_accel(
+                FakeModel(constant_velocity()), self.x.clone(), invalid,
+                config=SamplerConfig(method="euler"),
+            )
+
+    def test_legacy_solver_and_profile_names_normalize(self):
+        self.assertEqual(SamplerConfig(method="native").method, "euler")
+        self.assertEqual(SamplerConfig(method="native").evaluation_profile, "full_20")
+        self.assertEqual(SamplerConfig(method="sparse_euler").method, "euler")
+        self.assertEqual(SamplerConfig(method="sparse_res_multistep").method, "res_multistep")
+        self.assertEqual(
+            SamplerConfig(evaluation_profile="native_20").evaluation_profile,
+            "full_20",
+        )
+        self.assertIs(
+            MiniMaxH3VectorAccelSampler.validate_inputs("native", "native_20"),
+            True,
+        )
+        self.assertIs(
+            MiniMaxH3VectorAccelSampler.validate_inputs(
+                "sparse_res_multistep", "late_aggressive_13"
+            ),
+            True,
+        )
+        self.assertIn(
+            "unknown vector acceleration method",
+            MiniMaxH3VectorAccelSampler.validate_inputs("magic", "full_20"),
+        )
 
     def test_callback_metadata_and_pre_update_state(self):
         callbacks = []
@@ -295,7 +464,7 @@ class SamplerTests(unittest.TestCase):
     def test_adaptive_profile_drives_one_forecast_then_actual(self):
         model = FakeModel(constant_velocity())
         config = SamplerConfig(
-            method="linear_velocity", evaluation_profile="native_20",
+            method="linear_velocity", evaluation_profile="full_20",
             policy="adaptive_repair", repairability_profile="measured.json",
         )
         with mock.patch(

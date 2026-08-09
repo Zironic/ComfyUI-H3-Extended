@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.dirname(_HERE))
 from h3_vector_accel.study import (
     adaptive_comparison_arms,
     fixed_policy_arms,
+    four_arm_study_arms,
     run_fixed_policy_study,
 )
 
@@ -61,6 +62,19 @@ class StudyTests(unittest.TestCase):
         self.assertEqual({arm.quality_preset for arm in arms[1:]}, {
             "conservative", "balanced", "aggressive",
         })
+
+    def test_four_arm_study_isolates_anchor_placement_and_integrator(self):
+        arms = four_arm_study_arms()
+        self.assertEqual(
+            [(arm.method, arm.evaluation_profile, arm.expected_true_nfe) for arm in arms],
+            [
+                ("res_multistep", "full_20", 20),
+                ("res_multistep", "late_aggressive_13", 13),
+                ("linear_velocity", "late_aggressive_13", 13),
+                ("euler", "late_aggressive_13", 13),
+            ],
+        )
+        self.assertEqual({arm.phase for arm in arms}, {"solver_comparison"})
 
 
 if __name__ == "__main__":

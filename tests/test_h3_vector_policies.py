@@ -67,9 +67,8 @@ class PolicyTests(unittest.TestCase):
 
 
     def test_schedule_and_guard_validation(self):
-        SamplerConfig(method="native").validate_schedule_length(7)
         with self.assertRaisesRegex(ValueError, "exactly 20"):
-            SamplerConfig(method="hold").validate_schedule_length(19)
+            SamplerConfig(method="euler").validate_schedule_length(19)
         for value in (float("nan"), float("inf"), 0.0):
             with self.assertRaises(ValueError):
                 SamplerConfig(max_extrapolation_ratio=value)
