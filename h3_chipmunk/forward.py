@@ -65,19 +65,25 @@ def make_forward(block, layer_index, config, session, original_forward=None):
                     )
                     return out
 
-                with timed_stage(transformer_options, "chipmunk_mlp"):
-                    out, path = run_chipmunk_chunk(
-                        block=block,
-                        h=h,
-                        layer_index=layer_index,
-                        chunk_index=chunk_index,
-                        chunk_start=chunk.start,
-                        chunk_stop=chunk.stop,
-                        snapshot=snapshot,
-                        session=session,
-                        config=config,
-                        dense_runner=dense_runner,
-                    )
+                # Do not publish a Chipmunk-only timing stage through the shared
+                # request timer yet. Hybrid Sparse intentionally validates a
+                # closed timing-stage schema, and the full Chipmunk selector /
+                # delta work is already included by total_dit_block. The exact
+                # dense MLP sub-operations continue to use mlp_fc1 and
+                # mlp_swiglu_fc2 above. Add dedicated shared timing stages only
+                # when the production sparse kernels have a stable breakdown.
+                out, path = run_chipmunk_chunk(
+                    block=block,
+                    h=h,
+                    layer_index=layer_index,
+                    chunk_index=chunk_index,
+                    chunk_start=chunk.start,
+                    chunk_stop=chunk.stop,
+                    snapshot=snapshot,
+                    session=session,
+                    config=config,
+                    dense_runner=dense_runner,
+                )
                 with timed_stage(transformer_options, "final_mlp_gate"):
                     _gate_add(x[chunk.start:chunk.stop], out, gate_mlp[chunk.mod_row])
                 del h, out

@@ -1,0 +1,3 @@
+Chipmunk live integration fixes after PR #41:
+- remove private chipmunk_mlp timing stage from Hybrid Sparse timer
+- reuse an existing H3 runtime session across model-patch nodes
