@@ -31,10 +31,20 @@ def install(model_patcher, config):
     chip_session = H3ChipmunkSession()
     listener = H3ChipmunkReportListener(chip_session, config)
     if runtime is None:
-        runtime = H3RuntimeSession(listeners=[listener])
+        runtime = H3RuntimeSession(
+            listeners=[listener],
+            forbid_device_sync=True,
+        )
         install_runtime_wrapper(model_patcher, runtime)
         options["minimax_h3_runtime_session"] = runtime
     else:
+        enable_no_sync = getattr(runtime, "enable_no_device_sync", None)
+        if not callable(enable_no_sync):
+            raise H3ChipmunkPatchError(
+                "existing H3 runtime cannot guarantee no-device-sync execution; "
+                "update the runtime before enabling Chipmunk"
+            )
+        enable_no_sync()
         runtime.add_listener(listener)
 
     existing = getattr(model_patcher, "object_patches", {})
@@ -82,23 +92,18 @@ def install(model_patcher, config):
         "token_group_rows": int(config.token_group_rows),
         "chunk_rows": int(config.chunk_rows),
         "effective_chunk_rows": int(config.effective_chunk_rows),
-        "measure_layer_stride": int(config.measure_layer_stride),
-        "shadow_layer_stride": int(config.shadow_layer_stride),
-        "shadow_sample_rows": int(config.shadow_sample_rows),
-        "shadow_profile": [list(item) for item in config.shadow_profile],
         "scope": config.scope,
         "cache_location": config.cache_location,
         "cache_budget_gb": float(config.cache_budget_gb),
         "layer_range": [int(config.layer_start), int(config.layer_stop)],
-        # shadow_validate is output-exact: it computes approximation error beside
-        # the dense result but never feeds the shadow result into the model.
         "approximate": config.mode == "reference_delta",
+        "forbid_device_sync": True,
+        "cuda_metrics_materialized": False,
     }
     options["minimax_h3_chipmunk_session"] = chip_session
     logging.info(
         "%s installed: mode=%s top=%.3f refresh=%d group=%d token_group=%d "
-        "chunk=%d effective_chunk=%d measure_stride=%d shadow_stride=%d "
-        "shadow_rows=%d scope=%s cache=%s budget=%.1fGiB",
+        "chunk=%d effective_chunk=%d scope=%s cache=%s budget=%.1fGiB no_sync=true",
         LOG_PREFIX,
         config.mode,
         config.top_fraction,
@@ -107,9 +112,6 @@ def install(model_patcher, config):
         config.token_group_rows,
         config.chunk_rows,
         config.effective_chunk_rows,
-        config.measure_layer_stride,
-        config.shadow_layer_stride,
-        config.shadow_sample_rows,
         config.scope,
         config.cache_location,
         config.cache_budget_gb,
