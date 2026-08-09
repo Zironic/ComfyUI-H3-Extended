@@ -3,10 +3,7 @@ from __future__ import annotations
 import math
 import torch
 
-import comfy.quant_ops
-
-from ..h3_activation_memory.linear import acquire_linear, _convrot_parts
-from .selector import logical_swiglu, select_top_groups
+from .selector import select_top_groups
 
 
 class ChipmunkExecutionError(RuntimeError):
@@ -42,7 +39,6 @@ def _must_dense(config, snapshot, layer_index: int):
 
 
 def _store_gpu(value):
-    """Detach and retain state on the current CUDA device only."""
     value = value.detach()
     if value.device.type != "cuda":
         raise ChipmunkExecutionError(
@@ -68,19 +64,34 @@ def _dynamic_rows(snapshot, scope):
     return sum(int(b) - int(a) for a, b, kind in segments if str(kind) in kinds)
 
 
+def _selected_feature_count(config, ffn: int):
+    """Static selected width for the balanced two-tile selector."""
+    fg = int(config.feature_group)
+    groups = int(ffn) // fg
+    if groups % 2:
+        raise ChipmunkExecutionError("H3 FFN group count must split into two ConvRot tiles")
+    half_groups = groups // 2
+    keep = max(
+        1,
+        min(
+            half_groups,
+            int(math.ceil(half_groups * float(config.top_fraction))),
+        ),
+    )
+    if float(config.random_groups) > 0.0 and keep < half_groups:
+        keep += min(
+            half_groups - keep,
+            max(1, int(math.ceil(half_groups * float(config.random_groups)))),
+        )
+    return int(2 * keep * fg)
+
+
 def estimated_cache_bytes(snapshot, config, hidden: int, ffn: int):
     rows = _dynamic_rows(snapshot, config.scope)
     layer_start = max(int(config.layer_start), int(config.first_dense_layers))
     layers = max(0, int(config.layer_stop) - layer_start)
-    groups = int(ffn) // int(config.feature_group)
-    keep = max(1, min(groups, int(math.ceil(groups * float(config.top_fraction)))))
-    if float(config.random_groups) > 0 and keep < groups:
-        keep += min(
-            groups - keep,
-            max(1, int(math.ceil(groups * float(config.random_groups)))),
-        )
-    selected = keep * int(config.feature_group)
-    return int(rows) * int(layers) * (int(hidden) + selected) * 2
+    selected = _selected_feature_count(config, ffn)
+    return int(rows) * int(layers) * (int(hidden) + int(selected)) * 2
 
 
 def _check_gpu_budget(snapshot, config, hidden, ffn):
@@ -100,121 +111,7 @@ def _check_gpu_budget(snapshot, config, hidden, ffn):
         )
 
 
-class ConvRotFC1:
-    """Short-lived fc1 lease. Never overlaps an fc2 lease."""
-
-    def __init__(self, mlp, sample):
-        self.mlp = mlp
-        self.sample = sample
-        self.lease = None
-        self.q = self.scale = None
-
-    def __enter__(self):
-        self.lease = acquire_linear(self.mlp.fc1, self.sample)
-        if self.lease.bias is not None:
-            raise ChipmunkExecutionError("H3 Chipmunk requires bias-free fc1")
-        self.q, self.scale = _convrot_parts(self.lease.weight, "chipmunk.fc1")
-        if self.q.shape[0] % 2:
-            raise ChipmunkExecutionError("fc1 output must split into a SwiGLU pair")
-        if self.ffn % 256 or self.hidden % 256:
-            raise ChipmunkExecutionError("H3 Chipmunk requires ConvRot-256 alignment")
-        return self
-
-    @property
-    def ffn(self):
-        return int(self.q.shape[0]) // 2
-
-    @property
-    def hidden(self):
-        return int(self.q.shape[1])
-
-    def full(self, x):
-        return comfy.quant_ops.ck.int8_linear(
-            x,
-            self.q,
-            self.scale,
-            None,
-            x.dtype,
-            convrot=True,
-            convrot_groupsize=256,
-        )
-
-    def selected_activation(self, x, logical_indices):
-        logical_indices = logical_indices.long()
-        rows = torch.cat((logical_indices, logical_indices + self.ffn), dim=0)
-        q = self.q.index_select(0, rows).contiguous()
-        scale = (
-            self.scale
-            if self.scale.numel() == 1
-            else self.scale.index_select(0, rows).contiguous()
-        )
-        expanded = comfy.quant_ops.ck.int8_linear(
-            x,
-            q,
-            scale,
-            None,
-            x.dtype,
-            convrot=True,
-            convrot_groupsize=256,
-        )
-        return logical_swiglu(expanded)
-
-    def __exit__(self, exc_type, exc, tb):
-        if self.lease is not None:
-            self.lease.release()
-            self.lease = None
-        self.q = self.scale = None
-        return False
-
-
-class ConvRotFC2:
-    """Short-lived fc2 lease acquired only after fc1 has been released."""
-
-    def __init__(self, mlp, sample):
-        self.mlp = mlp
-        self.sample = sample
-        self.lease = None
-        self.q = self.scale = None
-
-    def __enter__(self):
-        self.lease = acquire_linear(self.mlp.fc2, self.sample)
-        if self.lease.bias is not None:
-            raise ChipmunkExecutionError("H3 Chipmunk requires bias-free fc2")
-        self.q, self.scale = _convrot_parts(self.lease.weight, "chipmunk.fc2")
-        if self.ffn % 256:
-            raise ChipmunkExecutionError("fc2 input must be ConvRot-256 aligned")
-        return self
-
-    @property
-    def ffn(self):
-        return int(self.q.shape[1])
-
-    @property
-    def hidden(self):
-        return int(self.q.shape[0])
-
-    def selected(self, activation, logical_indices):
-        q = self.q.index_select(1, logical_indices.long()).contiguous()
-        return comfy.quant_ops.ck.int8_linear(
-            activation,
-            q,
-            self.scale,
-            None,
-            activation.dtype,
-            convrot=True,
-            convrot_groupsize=256,
-        )
-
-    def __exit__(self, exc_type, exc, tb):
-        if self.lease is not None:
-            self.lease.release()
-            self.lease = None
-        self.q = self.scale = None
-        return False
-
-
 def _logical_indices(groups: torch.Tensor, feature_group: int):
-    """Expand complete ConvRot group ids without reading device values on host."""
     groups = groups.long()
     offsets = torch.arange(feature_group, device=groups.device, dtype=torch.long)
     return (groups[:, None] * feature_group + offsets[None]).reshape(-1)
@@ -232,9 +129,14 @@ def _token_means(h, token_group_rows: int):
     return pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=0)
 
 
-def _selector(fc1, h, cache, config):
-    """Choose groups entirely on CUDA and retain selector state on CUDA."""
-    act = logical_swiglu(fc1.full(_token_means(h, config.token_group_rows))).float()
+def _balanced_selector(full_activation, cache, config):
+    """Select a fixed number of groups from each prepacked ConvRot half.
+
+    Equal per-half counts make the selected fc1/fc2 tensors rectangular without
+    host reads or CUDA-value-dependent Python branches. At top_fraction=0.30,
+    H3's 56 groups become 9+9 selected groups (32.14% actual density).
+    """
+    act = full_activation.float()
     fg = int(config.feature_group)
     if act.shape[-1] % fg:
         raise ChipmunkExecutionError("H3 FFN is not feature-group aligned")
@@ -246,32 +148,52 @@ def _selector(fc1, h, cache, config):
         .mean(dim=-1)
         .sqrt()
     )
-    indices, _counts = select_top_groups(
-        scores,
+    groups = int(scores.shape[1])
+    if groups % 2:
+        raise ChipmunkExecutionError("selector group count must split into two tiles")
+    half = groups // 2
+    first, _ = select_top_groups(
+        scores[:, :half],
         config.top_fraction,
         config.random_groups,
     )
+    second, _ = select_top_groups(
+        scores[:, half:],
+        config.top_fraction,
+        config.random_groups,
+    )
+    second = second + half
+    indices = torch.cat((first, second), dim=1).contiguous()
     cache.selector_summary = _store_gpu(act.to(torch.bfloat16))
     cache.selected_groups = _store_gpu(indices)
     cache.selected_counts = None
     return indices
 
 
-def _selected_activation_all_groups(fc1, h, indices, config):
+def _selected_activation_all_groups(
+    h,
+    indices,
+    config,
+    selected_activation_runner,
+):
     indices = _load_gpu(indices, h.device)
     tg = int(config.token_group_rows)
     fg = int(config.feature_group)
     pieces = []
     for gi, a in enumerate(range(0, h.shape[0], tg)):
         b = min(h.shape[0], a + tg)
-        # Every row of indices has the same static width because top-k returns a
-        # rectangular tensor. No counts tensor or .item() is required.
         logical = _logical_indices(indices[gi], fg)
-        pieces.append(fc1.selected_activation(h[a:b], logical))
+        pieces.append(selected_activation_runner(h[a:b], logical))
     return torch.cat(pieces, dim=0)
 
 
-def _delta_update(block, h, cache, config):
+def _delta_update(
+    h,
+    cache,
+    config,
+    selected_activation_runner,
+    selected_fc2_runner,
+):
     if (
         cache.selected_groups is None
         or cache.activation is None
@@ -282,39 +204,51 @@ def _delta_update(block, h, cache, config):
     indices = _load_gpu(cache.selected_groups, h.device)
     old_activation = _load_gpu(cache.activation, h.device)
     out = _load_gpu(cache.output, h.device)
-
-    with ConvRotFC1(block.mlp, h[:1]) as fc1:
-        current_activation = _selected_activation_all_groups(
-            fc1,
-            h,
-            indices,
-            config,
-        )
+    current_activation = _selected_activation_all_groups(
+        h,
+        indices,
+        config,
+        selected_activation_runner,
+    )
 
     tg = int(config.token_group_rows)
     fg = int(config.feature_group)
-    with ConvRotFC2(block.mlp, current_activation[:1]) as fc2:
-        for gi, a in enumerate(range(0, h.shape[0], tg)):
-            b = min(h.shape[0], a + tg)
-            logical = _logical_indices(indices[gi], fg)
-            old_part = fc2.selected(old_activation[a:b], logical)
-            new_part = fc2.selected(current_activation[a:b], logical)
-            out[a:b].sub_(old_part).add_(new_part)
+    for gi, a in enumerate(range(0, h.shape[0], tg)):
+        b = min(h.shape[0], a + tg)
+        logical = _logical_indices(indices[gi], fg)
+        old_part = selected_fc2_runner(old_activation[a:b], logical)
+        new_part = selected_fc2_runner(current_activation[a:b], logical)
+        out[a:b].sub_(old_part).add_(new_part)
 
     cache.activation = _store_gpu(current_activation)
     cache.output = out.detach()
     return out
 
 
-def _refresh_cache(block, h, out, cache, config, snapshot):
-    with ConvRotFC1(block.mlp, h[:1]) as fc1:
-        _check_gpu_budget(snapshot, config, fc1.hidden, fc1.ffn)
-        indices = _selector(fc1, h, cache, config)
-        selected = _selected_activation_all_groups(fc1, h, indices, config)
-        active = float(indices.shape[1] * config.feature_group / fc1.ffn)
+def _refresh_cache(
+    h,
+    out,
+    cache,
+    config,
+    snapshot,
+    hidden,
+    ffn,
+    full_activation_runner,
+    selected_activation_runner,
+):
+    _check_gpu_budget(snapshot, config, hidden, ffn)
+    means = _token_means(h, config.token_group_rows)
+    full_activation = full_activation_runner(means)
+    indices = _balanced_selector(full_activation, cache, config)
+    selected = _selected_activation_all_groups(
+        h,
+        indices,
+        config,
+        selected_activation_runner,
+    )
     cache.activation = _store_gpu(selected)
     cache.output = _store_gpu(out)
-    return active
+    return float(selected.shape[-1] / int(ffn))
 
 
 def run_chipmunk_chunk(
@@ -329,18 +263,21 @@ def run_chipmunk_chunk(
     session,
     config,
     dense_runner,
+    full_activation_runner=None,
+    selected_activation_runner=None,
+    selected_fc2_runner=None,
     **_unused,
 ):
     """Return raw MLP output before H3's current-step residual gate.
 
-    Production invariant: this function never materializes CUDA data on the CPU.
+    Production invariant: this function never materializes CUDA data on the CPU
+    and never reacquires MLP weights for the sparse path.
     """
     session.ensure_request(snapshot)
     branch = tuple(getattr(snapshot, "branch", (0,)))
     kind = _segment_kind(snapshot, chunk_start, chunk_stop)
     step = int(getattr(snapshot, "step_index", -1))
 
-    # Output-exact smoke mode: no selector, no CUDA diagnostics, no cache.
     if config.mode == "measure":
         return dense_runner(h), "chipmunk_measure_dense"
 
@@ -352,18 +289,33 @@ def run_chipmunk_chunk(
         and _kind_eligible(config, kind)
     )
 
+    if eligible and (
+        full_activation_runner is None
+        or selected_activation_runner is None
+        or selected_fc2_runner is None
+    ):
+        raise ChipmunkExecutionError(
+            "reference_delta requires held ConvRot fc1/fc2 runners"
+        )
+
+    hidden = int(block.mlp.fc2.out_features)
+    ffn = int(block.mlp.fc2.in_features)
+
     if not eligible or _must_dense(config, snapshot, layer_index):
         out = dense_runner(h)
         cache.dense_calls += 1
         if eligible:
             try:
                 active = _refresh_cache(
-                    block,
                     h,
                     out,
                     cache,
                     config,
                     snapshot,
+                    hidden,
+                    ffn,
+                    full_activation_runner,
+                    selected_activation_runner,
                 )
                 cache.refresh_step = step
                 cache.update_step = step
@@ -391,12 +343,14 @@ def run_chipmunk_chunk(
         return out, "chipmunk_dense"
 
     try:
-        out = _delta_update(block, h, cache, config)
-        active = float(
-            cache.selected_groups.shape[1]
-            * config.feature_group
-            / int(block.mlp.fc2.in_features)
+        out = _delta_update(
+            h,
+            cache,
+            config,
+            selected_activation_runner,
+            selected_fc2_runner,
         )
+        active = float(cache.activation.shape[-1] / ffn)
         cache.sparse_calls += 1
         cache.update_step = step
         session.record(
