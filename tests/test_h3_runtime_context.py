@@ -1,8 +1,8 @@
 """CPU tests for the shared H3 request/step/layout context."""
 
+import math
 import os
 import sys
-import math
 from types import SimpleNamespace
 
 import torch
@@ -59,6 +59,7 @@ def test_apply_model_wrapper():
     x = [torch.zeros(1), torch.zeros(1)]
     context = torch.zeros(1, 10, 4, dtype=torch.bfloat16)
     options = {"sample_sigmas": torch.tensor([0.25, 0.0]), "cond_or_uncond": [0]}
+
     class Timing:
         def __init__(self):
             self.samples = []
@@ -72,6 +73,7 @@ def test_apply_model_wrapper():
     timing = Timing()
     publish_timing(options, timing)
     calls = []
+
     def executor(*args, **kwargs):
         calls.append(args[5][RUNTIME_KEY])
         return "result"
@@ -126,9 +128,63 @@ def test_apply_model_wrapper_unpacks_sampler_latent():
     check(seen == [tuple(tuple(shape) for shape in latent_shapes)], "layout sees unpacked video and audio streams")
 
 
+def test_no_device_sync_step_counter():
+    print("no-device-sync host step counter")
+    listener = Listener()
+    session = H3RuntimeSession(
+        listeners=[listener],
+        forbid_device_sync=True,
+    )
+    session._resolve_layout = lambda x, context, payload: layout()
+
+    # If the no-sync path ever falls back to value-based sigma matching, fail.
+    session._step_index_from_sigma = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("no-sync runtime attempted sigma matching")
+    )
+
+    x = [torch.zeros(1), torch.zeros(1)]
+    context = torch.zeros(1, 10, 4, dtype=torch.bfloat16)
+    schedule = torch.tensor([1.0, 0.5, 0.0])
+    token = session.begin_outer_request()
+    try:
+        first = session.observe(
+            x,
+            torch.tensor([999.0]),
+            context,
+            {"sample_sigmas": schedule, "sigmas": schedule[0:1], "cond_or_uncond": [0]},
+            {},
+        )
+        second = session.observe(
+            x,
+            torch.tensor([123.0]),
+            context,
+            {"sample_sigmas": schedule, "sigmas": schedule[1:2], "cond_or_uncond": [0]},
+            {},
+        )
+    finally:
+        session.end_outer_request(token)
+
+    check(math.isnan(first.sigma) and math.isnan(second.sigma), "no-sync runtime never materializes sigma")
+    check(first.step_index == 0 and second.step_index == 1, "explicit sampler calls advance host step counter")
+    check(first.total_steps == 2 and second.total_steps == 2, "schedule length uses tensor metadata only")
+
+    # Without an explicit sampler boundary, no-sync mode refuses to guess from
+    # device values and publishes unknown step metadata instead.
+    direct = session.observe(
+        x,
+        torch.tensor([0.5]),
+        context,
+        {"sample_sigmas": schedule, "sigmas": schedule[1:2], "cond_or_uncond": [0]},
+        {},
+    )
+    check(direct.step_index == -1, "direct calls fall back dense instead of synchronizing")
+
+
 def main():
     test_apply_model_wrapper()
     test_apply_model_wrapper_unpacks_sampler_latent()
+    test_no_device_sync_step_counter()
+
     listener = Listener()
     session = H3RuntimeSession(listeners=[listener])
     session._resolve_layout = lambda x, context, payload: layout(payload.get("seq", 100))
@@ -145,20 +201,17 @@ def main():
     second = session.observe(x, None, context, options, {"seq": 100})
     check(second.request_id == 0 and second.step_index == 1, "step advances within request")
 
-    # A second CFG branch at the same step does not reset the request.
     options = {"sample_sigmas": schedule, "sigmas": schedule[1:2], "cond_or_uncond": [1]}
     branch = session.observe(x, None, context, options, {"seq": 100})
     check(branch.request_id == 0 and branch.branch == (1,), "CFG branches share request state")
 
-    # Step reversal marks a new sampler request.
     options = {"sample_sigmas": schedule, "sigmas": schedule[0:1], "cond_or_uncond": [0]}
     again = session.observe(x, None, context, options, {"seq": 100})
     check(again.request_id == 1 and again.step_index == 0, "schedule reversal resets request")
 
-    # Layout changes also reset state.
     options = {"sample_sigmas": schedule, "sigmas": schedule[0:1], "cond_or_uncond": [0]}
     changed = session.observe(x, None, context, options, {"seq": 120})
-    check(changed.request_id == 2, "packed-layout change resets request")
+    check(changed.request_id == 2, "packed-layout change resets state")
     session.after_forward(changed, object(), options)
     check(listener.resets == [0, 1, 2], "listeners receive every request reset")
     check(listener.after == [0], "listeners receive post-forward notification")

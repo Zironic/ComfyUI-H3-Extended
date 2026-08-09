@@ -34,29 +34,47 @@ def make_forward(block, layer_index, config, session, original_forward=None):
         with timed_stage(transformer_options, "adaln_proj"):
             shifts = block.adaln_proj(t_emb)
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = shifts
-        segments = validate_mod_segments(mod_segments, x.shape[0], mod_rows=shift_msa.shape[0])
+        segments = validate_mod_segments(
+            mod_segments,
+            x.shape[0],
+            mod_rows=shift_msa.shape[0],
+        )
 
         with timed_stage(transformer_options, "norm1_modulation"):
             h = block.norm1(x)
             for start, stop, row in segments:
                 _scale_shift(h[start:stop], shift_msa[row], scale_msa[row])
-        attn_out = block.attn(h, rope_freqs=rope_freqs, transformer_options=transformer_options)
+        attn_out = block.attn(
+            h,
+            rope_freqs=rope_freqs,
+            transformer_options=transformer_options,
+        )
         with timed_stage(transformer_options, "attention_residual_gate"):
             for start, stop, row in segments:
                 _gate_add(x[start:stop], attn_out[start:stop], gate_msa[row])
         del h, attn_out
 
         chunk_rows = int(config.effective_chunk_rows)
-        chunks = tuple(iter_mod_chunks(
-            segments, x.shape[0], chunk_rows,
-            alignment=min(256, chunk_rows), mod_rows=shift_mlp.shape[0],
-        ))
+        chunks = tuple(
+            iter_mod_chunks(
+                segments,
+                x.shape[0],
+                chunk_rows,
+                alignment=min(256, chunk_rows),
+                mod_rows=shift_mlp.shape[0],
+            )
+        )
 
         held = ConvRotTwoSliceMLP(block.mlp, x[:1])
         held.__enter__()
         try:
-            def measure_activation_runner(value):
-                """Compute logical SwiGLU activations from already-held fc1 tiles."""
+            if held.tiles is None or len(held.tiles) != 2:
+                raise RuntimeError("Chipmunk requires exactly two held ConvRot MLP tiles")
+            tile_ffn = int(held.tiles[0]["fc2_weight"].shape[1])
+            if any(int(tile["fc2_weight"].shape[1]) != tile_ffn for tile in held.tiles):
+                raise RuntimeError("Chipmunk requires equal-width ConvRot fc2 tiles")
+
+            def full_activation_runner(value):
                 pieces = []
                 for tile in held.tiles:
                     expanded = held.convrot_linear(
@@ -68,24 +86,52 @@ def make_forward(block, layer_index, config, session, original_forward=None):
                     pieces.append(logical_swiglu(expanded))
                 return torch.cat(pieces, dim=-1)
 
-            def shadow_fc2_runner(selected_activation, logical_indices):
-                """Project selected logical features using already-held fc2 tiles.
+            def selected_activation_runner(value, logical_indices):
+                # The balanced selector always emits equal group counts from the
+                # two 7168-wide logical feature tiles. Split by static tensor
+                # shape, never by a CUDA value.
+                half = int(logical_indices.shape[0]) // 2
+                local_indices = (
+                    logical_indices[:half].long(),
+                    logical_indices[half:].long() - tile_ffn,
+                )
+                pieces = []
+                for tile, local in zip(held.tiles, local_indices):
+                    rows = torch.cat((local, local + tile_ffn), dim=0)
+                    q = tile["fc1_weight"].index_select(0, rows).contiguous()
+                    scale = tile["fc1_scale"]
+                    if scale.numel() != 1:
+                        scale = scale.index_select(0, rows).contiguous()
+                    expanded = held.convrot_linear(
+                        value,
+                        q,
+                        scale,
+                        input_act=None,
+                    )
+                    pieces.append(logical_swiglu(expanded))
+                return torch.cat(pieces, dim=-1)
 
-                Unselected logical features are represented as zeros. This avoids
-                reacquiring/staging fc2 for every sampled shadow window while
-                preserving complete ConvRot-256 groups and the same two-slice
-                weight representation used by the exact dense path.
-                """
-                tile_widths = [int(tile["fc2_weight"].shape[1]) for tile in held.tiles]
-                ffn = sum(tile_widths)
-                full = selected_activation.new_zeros((selected_activation.shape[0], ffn))
-                full.index_copy_(1, logical_indices.long(), selected_activation)
+            def selected_fc2_runner(selected_activation, logical_indices):
+                half_indices = int(logical_indices.shape[0]) // 2
+                half_activation = int(selected_activation.shape[-1]) // 2
+                local_indices = (
+                    logical_indices[:half_indices].long(),
+                    logical_indices[half_indices:].long() - tile_ffn,
+                )
+                activations = (
+                    selected_activation[:, :half_activation],
+                    selected_activation[:, half_activation:],
+                )
                 result = None
-                offset = 0
-                for tile, width in zip(held.tiles, tile_widths):
+                for tile, activation, local in zip(
+                    held.tiles,
+                    activations,
+                    local_indices,
+                ):
+                    q = tile["fc2_weight"].index_select(1, local).contiguous()
                     partial = held.convrot_linear(
-                        full[:, offset:offset + width].contiguous(),
-                        tile["fc2_weight"],
+                        activation,
+                        q,
                         tile["fc2_scale"],
                         input_act=None,
                     )
@@ -93,24 +139,28 @@ def make_forward(block, layer_index, config, session, original_forward=None):
                         result = partial
                     else:
                         result.add_(partial)
-                    offset += width
                 return result
 
             for chunk_index, chunk in enumerate(chunks):
                 with timed_stage(transformer_options, "norm2_modulation"):
                     h = block.norm2(x[chunk.start:chunk.stop])
-                    _scale_shift(h, shift_mlp[chunk.mod_row], scale_mlp[chunk.mod_row])
+                    _scale_shift(
+                        h,
+                        shift_mlp[chunk.mod_row],
+                        scale_mlp[chunk.mod_row],
+                    )
 
                 def dense_runner(value):
                     out, _path = held.fc1_fc2(
                         value,
-                        stage_factory=lambda name: timed_stage(transformer_options, name),
+                        stage_factory=lambda name: timed_stage(
+                            transformer_options,
+                            name,
+                        ),
                     )
                     return out
 
-                # Chipmunk-specific work remains inside total_dit_block rather
-                # than adding private stage names to Hybrid Sparse's shared timer.
-                out, path = run_chipmunk_chunk(
+                out, _path = run_chipmunk_chunk(
                     block=block,
                     h=h,
                     layer_index=layer_index,
@@ -121,16 +171,16 @@ def make_forward(block, layer_index, config, session, original_forward=None):
                     session=session,
                     config=config,
                     dense_runner=dense_runner,
-                    measure_activation_runner=measure_activation_runner,
-                    shadow_fc2_runner=shadow_fc2_runner,
-                    # At this point x is the exact post-attention residual and
-                    # has not yet received the MLP gate. shadow_validate uses it
-                    # only to score post-block error, never to alter execution.
-                    residual_base=x[chunk.start:chunk.stop],
-                    mlp_gate=gate_mlp[chunk.mod_row],
+                    full_activation_runner=full_activation_runner,
+                    selected_activation_runner=selected_activation_runner,
+                    selected_fc2_runner=selected_fc2_runner,
                 )
                 with timed_stage(transformer_options, "final_mlp_gate"):
-                    _gate_add(x[chunk.start:chunk.stop], out, gate_mlp[chunk.mod_row])
+                    _gate_add(
+                        x[chunk.start:chunk.stop],
+                        out,
+                        gate_mlp[chunk.mod_row],
+                    )
                 del h, out
         finally:
             held.__exit__(None, None, None)
@@ -138,7 +188,13 @@ def make_forward(block, layer_index, config, session, original_forward=None):
 
     def forward(x, t_emb, mod_segments, rope_freqs, transformer_options={}):
         with timed_stage(transformer_options, "total_dit_block"):
-            return _forward(x, t_emb, mod_segments, rope_freqs, transformer_options)
+            return _forward(
+                x,
+                t_emb,
+                mod_segments,
+                rope_freqs,
+                transformer_options,
+            )
 
     forward._h3_chipmunk = True
     forward._h3_chipmunk_config = config.signature
