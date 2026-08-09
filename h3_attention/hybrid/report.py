@@ -174,11 +174,11 @@ def render(payload):
 
     lines.extend([
         "",
-        "Phase A uses direct 128Q x 64KV Sparse Sage routing.",
+        "Portable Sparse Sage routing uses the resolved architecture tile geometry.",
         "Flex, compatibility fallback, and Sol head dispatch are not enabled.",
         "Timing stages cover the DiT block, activation/MLP stages, attention "
         "projection stages (including fused QKV when selected), direct LUT "
-        "construction, V FP8 preparation, Q/K "
+        "construction, V preparation, Q/K "
         "int8 quantization, and the low-level Sparse Sage kernel. Compiled "
         "runs replace those internal events with one model-call event so "
         "timing does not split the compiled tensor graph.",

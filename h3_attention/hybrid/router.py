@@ -11,6 +11,8 @@ from .adaptive import (
 )
 from .config import DENSITY_ADAPTIVE_BUDGET, DENSITY_FIXED
 
+# The default Sage2 geometry is retained for callers that do not yet have a
+# resolved device spec (notably the fused-QKV Triton projection).
 Q_TILE = 128
 KV_TILE = 64
 
@@ -83,10 +85,15 @@ class SparseMaskMetadata:
 
 
 class SparseTileRouter:
-    """Build a per-head route for each global 128-token query tile."""
+    """Build a per-head route using the resolved Sparse Sage geometry."""
 
-    def __init__(self, config=None):
+    def __init__(self, config=None, *, spec=None, q_tile=None, kv_tile=None):
         self.config = config
+        self.spec = spec
+        self.q_tile = int(q_tile if q_tile is not None else getattr(spec, "q_tile", Q_TILE))
+        self.kv_tile = int(kv_tile if kv_tile is not None else getattr(spec, "kv_tile", KV_TILE))
+        if self.q_tile <= 0 or self.kv_tile <= 0:
+            raise ValueError("Sparse Sage tile sizes must be positive")
         self._geometry_cache = {}
 
     @staticmethod
@@ -117,10 +124,10 @@ class SparseTileRouter:
         geometry = SparseTileGeometry(
             signature=signature,
             sequence=sequence,
-            q_tiles=(sequence + Q_TILE - 1) // Q_TILE,
-            kv_tiles=(sequence + KV_TILE - 1) // KV_TILE,
-            pure_video_q_start=(video_start + Q_TILE - 1) // Q_TILE,
-            pure_video_kv_start=(video_start + KV_TILE - 1) // KV_TILE,
+            q_tiles=(sequence + self.q_tile - 1) // self.q_tile,
+            kv_tiles=(sequence + self.kv_tile - 1) // self.kv_tile,
+            pure_video_q_start=(video_start + self.q_tile - 1) // self.q_tile,
+            pure_video_kv_start=(video_start + self.kv_tile - 1) // self.kv_tile,
         )
         if not geometry.pure_video_q_tiles or not geometry.pure_video_kv_tiles:
             raise SparseRouterError(
@@ -238,8 +245,8 @@ class SparseTileRouter:
         if plan.target == geometry.pure_video_kv_tiles:
             return self._dense_lut(q, geometry, metadata)
         return self._build_lut_from_summaries(
-            self._mean_pool(q, Q_TILE),
-            self._mean_pool(k, KV_TILE),
+            self._mean_pool(q, self.q_tile),
+            self._mean_pool(k, self.kv_tile),
             geometry,
             video_budget,
         )

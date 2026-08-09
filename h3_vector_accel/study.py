@@ -81,6 +81,16 @@ def adaptive_history_v2_arm():
                     "res_multistep", "adaptive_history_v2", None)
 
 
+def adaptive_history_v3_arm():
+    return StudyArm("res_multistep_adaptive_history_v3", "adaptive_history",
+                    "res_multistep", "adaptive_history_v3", None)
+
+
+def adaptive_embedded_res_v1_arm():
+    return StudyArm("res_multistep_adaptive_embedded_res_v1", "adaptive_history",
+                    "res_multistep", "adaptive_embedded_res_v1", None)
+
+
 def adaptive_comparison_arms(best_fixed_method, best_fixed_profile,
                              repairability_profile, predictor_method,
                              conditioning_mode, quality_presets=("conservative", "balanced", "aggressive")):

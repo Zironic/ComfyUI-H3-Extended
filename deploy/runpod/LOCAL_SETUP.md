@@ -81,19 +81,22 @@ export RUNPOD_ENDPOINT_ID=...
 Then submit a Comfy API-format workflow:
 
 ```bash
-python deploy/runpod/submit_job.py workflow_api.json \
-  --asset reference.mp4="https://signed.example/reference.mp4"
+python deploy/runpod/run_h3.py workflow_api_export.json
 ```
 
-This is the operation that creates demand on the endpoint. If no worker is alive, RunPod schedules a matching RTX 6000 Ada worker. Because the endpoint has the H3 Hugging Face repository attached as a cached-model reference, RunPod selects a host with that cache when possible; otherwise RunPod populates the cache before the worker starts. The worker then runs the bootstrap, links the cached files, launches ComfyUI, executes the workflow, uploads artifacts, becomes idle, and scales back to zero.
+`run_h3.py` walks backward from connected `SaveVideo` nodes, reads the filenames saved in connected image/audio/video loaders, resolves them beneath the local Comfy input directory, and uploads them inline. Unconnected loader nodes are ignored. It also keeps `MiniMaxH3HybridSparseAttentionZi` enabled, replaces only the custom preview sampler, bypasses the local Ziro image scaler, and applies the cached-model and inline-I/O placeholders.
+
+The input directory is normally inferred from a workflow stored below `ComfyUI/User`. Use `COMFY_INPUT_DIR` or `--input-root` for a different layout. The optional `--input [NAME=]PATH` argument overrides one of the connected saved inputs; it is not required for the normal path.
+
+The `run_h3.py` operation creates demand on the endpoint. If no worker is alive, RunPod schedules a matching RTX 6000 Ada worker. Because the endpoint has the H3 Hugging Face repository attached as a cached-model reference, RunPod selects a host with that cache when possible; otherwise RunPod populates the cache before the worker starts. The worker then runs the bootstrap, links the cached files, launches ComfyUI, executes the workflow, returns artifacts inline, becomes idle, and scales back to zero.
 
 The recurring local workflow is therefore only:
 
 ```text
-workflow + input URLs
+workflow + local input files
         |
         v
-submit_job.py
+run_h3.py
         |
         v
 RunPod endpoint queue
@@ -108,4 +111,4 @@ H3 inference
 worker scales 1 -> 0
 ```
 
-There is no explicit local `rent_gpu()` or `stop_gpu()` call in the Serverless path.
+There is no explicit local `rent_gpu()` or `stop_gpu()` call in the Serverless path. Inputs and outputs are inline, so the endpoint also needs no S3 credentials or persistent volume.

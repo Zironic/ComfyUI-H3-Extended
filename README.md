@@ -61,6 +61,22 @@ completion, proposed next position, step scale, and decision reason.
 The `adaptive RES maximum step scale` control defaults to `3.0`; higher values
 let low-change decisions test wider intervals and are recorded in diagnostics.
 
+`adaptive_history_v3` keeps three bootstrap anchors, takes one baseline interval,
+holds 1x while that first residual establishes the run reference, then controls
+spacing from local linear-in-log-sigma prediction residuals. It
+logs the completed interval length, previous scale, separate video/audio
+derivative and x0 errors, reference values and ratios, action, and next scale.
+Predictions never enter RES state or count as evaluations. Audio residuals are
+diagnostic only. At minimum 1x, high or nonfinite video residuals report
+`minimum_step_hold`; critical recovery after an accelerated interval adds one
+extra 1x interval. V3 does not protect late source anchors: after bootstrap,
+residual feedback chooses every interval until terminal zero.
+
+`adaptive_embedded_res_v1` uses one fixed bootstrap interval, then solves the
+eta-zero IncrementalRES embedded correction defect from video x0 changes by
+bounded scalar bisection. Safety, absolute, growth, and final-positive-sigma
+clamps are recorded explicitly; audio disagreement is diagnostic only.
+
 `late_aggressive_13` is the current accelerated reference profile. The first
 controlled placement comparison found that the equal-NFE early profile severely
 corrupted video. Version one and the forecast-repair policy therefore protect
@@ -98,16 +114,15 @@ attention.
 
 ## Hybrid sparse attention
 
-`MiniMaxH3HybridSparseAttentionZi` is the Phase-A production experiment. It
-routes once per globally aligned 128-query tile, scores globally aligned
-64-token KV tiles, and retains the configured fraction of pure target-video KV
-tiles per head. Text, references, audio, mixed boundary tiles, and non-video Q
-tiles remain dense. Reports are written to
+`MiniMaxH3HybridSparseAttentionZi` is the production Sparse Sage experiment. It
+routes at the selected architecture's query/KV tile geometry and retains the
+configured fraction of pure target-video KV tiles per head. Text, references,
+audio, mixed boundary tiles, and non-video Q tiles remain dense. Reports are written to
 `output/h3_hybrid_sparse/<run_tag>_<timestamp>/`.
 
 The `timing` input defaults to enabled. On CUDA it records deferred event pairs
 for each executed DiT block and its activation/MLP stages, attention
-projections, direct LUT construction, V FP8 preparation, Q/K int8
+projections, direct LUT construction, V preparation, Q/K int8
 quantization, the low-level Sparse Sage kernel, and total hybrid attention;
 events are synchronized once at request end. CUDA event time overlaps request
 wall time; the reported ratios are indicative rather than an exact
@@ -121,12 +136,16 @@ graph. Per-stage CUDA events are omitted inside that graph; `total_dit_block`
 is measured around each invocation. CUDA graph capture is disabled for this
 path so every AIMDO lifecycle and custom-kernel call executes normally.
 
-Phase A is SM89-only and requires the compiled `spas_sage_attn` package. The
-default `sage128` mode retains the established BF16 QKV projection. The opt-in
-`sage128_fused_qkv` mode projects directly from the checkpoint's ConvRot-256
-INT8 weights into Sparse Sage's INT8 Q/K carriers, a BF16 V carrier, and the
-128Q/64KV routing summaries. It avoids the full BF16 QKV allocation; K smoothing
-is disabled on this path, so it remains an explicitly approximate experiment.
+The default `sage128` mode requires `spas_sage_attn` compiled for the active
+device and resolves its architecture contract at preflight: SM80/86/87 use
+128Q/64KV tiles with FP16 V, SM89 uses 128Q/64KV with FP8 V, and SM90 uses
+64Q/128KV with FP8 V. Both current monolithic and architecture-split compiled
+extension layouts are normalized at this boundary. Blackwell is not supported.
+This mode retains the established BF16 QKV projection. The opt-in `sage128_fused_qkv` mode remains
+SM89-only because its projection emits 128Q/64KV routing summaries. It projects
+directly from the checkpoint's ConvRot-256 INT8 weights into Sparse Sage's INT8
+Q/K carriers and a BF16 V carrier. It avoids the full BF16 QKV allocation; K
+smoothing is disabled on this path, so it remains an explicitly approximate experiment.
 `benchmarks/bench_fused_qkv.py` compares both projection paths using one real
 checkpoint block. With no `--frames` it retains the sequence-only projection
 microbenchmark (default sequence 54006); adding geometry runs both production

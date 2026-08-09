@@ -180,7 +180,8 @@ class SamplerTests(unittest.TestCase):
                 "method", "evaluation_profile", "diagnostics", "policy",
                 "quality_preset", "repairability_profile", "conditioning_mode",
                 "fallback_on_guard", "max_extrapolation_ratio",
-                "max_adaptive_step_scale",
+                "max_adaptive_step_scale", "embedded_video_tolerance",
+                "adaptive_safety_factor", "max_adaptive_growth_ratio",
             ],
         )
         self.assertEqual(inputs["method"].options, [
@@ -190,10 +191,15 @@ class SamplerTests(unittest.TestCase):
         self.assertIn("late_aggressive_13", inputs["evaluation_profile"].options)
         self.assertIn("adaptive_history_v1", inputs["evaluation_profile"].options)
         self.assertIn("adaptive_history_v2", inputs["evaluation_profile"].options)
+        self.assertIn("adaptive_history_v3", inputs["evaluation_profile"].options)
+        self.assertIn("adaptive_embedded_res_v1", inputs["evaluation_profile"].options)
         self.assertEqual(inputs["method"].display_name, "solver / forecast mode")
         self.assertEqual(inputs["evaluation_profile"].display_name, "actual-evaluation schedule")
         self.assertEqual(inputs["max_adaptive_step_scale"].default, 3.0)
         self.assertEqual(inputs["max_adaptive_step_scale"].min, 1.0)
+        self.assertEqual(inputs["embedded_video_tolerance"].default, 0.05)
+        self.assertEqual(inputs["adaptive_safety_factor"].default, 0.8)
+        self.assertEqual(inputs["max_adaptive_growth_ratio"].default, 2.0)
         output = MiniMaxH3VectorAccelSampler.execute(
             "res_multistep", "late_aggressive_13", "off"
         )
@@ -224,6 +230,31 @@ class SamplerTests(unittest.TestCase):
         self.assertIn(
             "requires the res_multistep method",
             MiniMaxH3VectorAccelSampler.validate_inputs("euler", "adaptive_history_v2"),
+        )
+        output = MiniMaxH3VectorAccelSampler.execute(
+            "res_multistep", "adaptive_history_v3", "off",
+            max_adaptive_step_scale=5.0,
+        )
+        self.assertEqual(output.result[0].h3_vector_config.evaluation_profile,
+                         "adaptive_history_v3")
+        self.assertIn(
+            "requires the res_multistep method",
+            MiniMaxH3VectorAccelSampler.validate_inputs("euler", "adaptive_history_v3"),
+        )
+        output = MiniMaxH3VectorAccelSampler.execute(
+            "res_multistep", "adaptive_embedded_res_v1", "off",
+            max_adaptive_step_scale=7.0, embedded_video_tolerance=.03,
+            adaptive_safety_factor=.75, max_adaptive_growth_ratio=1.75,
+        )
+        embedded = output.result[0].h3_vector_config
+        self.assertEqual(embedded.evaluation_profile, "adaptive_embedded_res_v1")
+        self.assertEqual(embedded.max_adaptive_step_scale, 7.0)
+        self.assertEqual(embedded.embedded_video_tolerance, .03)
+        self.assertEqual(embedded.adaptive_safety_factor, .75)
+        self.assertEqual(embedded.max_adaptive_growth_ratio, 1.75)
+        self.assertIn(
+            "requires the res_multistep method",
+            MiniMaxH3VectorAccelSampler.validate_inputs("euler", "adaptive_embedded_res_v1"),
         )
 
     def test_node_hides_unavailable_adaptive_controls_without_removing_them(self):
@@ -477,12 +508,130 @@ class SamplerTests(unittest.TestCase):
         self.assertIn("est. compute", progress[0])
         self.assertIn("schedule 0.00/20", progress[0])
         self.assertIn("scale 1.00x", progress[0])
+        self.assertIn("delta_t=", progress[0])
+        self.assertIn("video raw v=", progress[0])
         self.assertIn("video rate v=", progress[0])
         self.assertIn("x0=", progress[0])
         self.assertIn("combined=", progress[0])
         self.assertIn("ref=", progress[0])
         self.assertIn("ratio=", progress[0])
         self.assertIn("-> 20.00", progress[-1])
+
+    def test_adaptive_res_v3_reports_predictive_residuals_and_honest_nfe(self):
+        sigmas = torch.tensor([
+            1.0, 0.9956331849, 0.9908256531, 0.9855073094, 0.9795918465,
+            0.9729729891, 0.9655172229, 0.9570552111, 0.9473683834,
+            0.9361702204, 0.9230769277, 0.9075629711, 0.8888888955,
+            0.8659793735, 0.8372092843, 0.8000000119, 0.75,
+            0.6792452931, 0.5714285970, 0.3870967925, 0.0,
+        ])
+        config = SamplerConfig(
+            method="res_multistep", evaluation_profile="adaptive_history_v3",
+            max_adaptive_step_scale=5.0,
+        )
+        diagnostics = RunDiagnostics(config=config, latent_shapes=ResInner.latent_shapes)
+        callbacks = []
+        model = ResModel(lambda x, sigma: torch.full_like(
+            x, 1.0 + .1 * sigma + .02 * sigma * sigma
+        ))
+        with self.assertLogs(level="INFO") as captured_logs:
+            sample_vector_accel(
+                model, torch.zeros(1, 1, 6), sigmas, disable=True, config=config,
+                diagnostics=diagnostics, callback=callbacks.append,
+            )
+        effective = diagnostics._run_metadata["effective_sigma_sequence"]
+        decisions = diagnostics._run_metadata["adaptive_decisions"]
+        self.assertEqual(effective[:4], sigmas[:4].tolist())
+        self.assertEqual(effective[-1], 0.0)
+        self.assertEqual(diagnostics._run_metadata["controller_constants"]["protected_tail"], ())
+        self.assertTrue(all(row["reason"] != "protected_tail" for row in decisions))
+        self.assertTrue(all(row["reason"] != "reserve_protected_tail" for row in decisions))
+        self.assertEqual([row["action"] for row in decisions[:3]], ["bootstrap"] * 3)
+        self.assertEqual(decisions[2]["reason"], "bootstrap_predict")
+        self.assertIsNotNone(decisions[3]["residuals"])
+        self.assertEqual(decisions[3]["action"], "reference_calibration")
+        for name in (
+            "video_v_error", "video_x0_error", "video_error",
+            "audio_v_error", "audio_x0_error", "audio_error",
+        ):
+            self.assertIn(name, decisions[3]["residuals"])
+        self.assertGreater(decisions[3]["actual_delta_t"], 0.0)
+        self.assertEqual(model.calls, diagnostics.true_nfe)
+        self.assertEqual(model.calls, len(callbacks))
+        self.assertLessEqual(model.calls, 20)
+        self.assertTrue(all(not row["h3_vector_forecast"] for row in callbacks))
+        self.assertIn("h3_vector_video_error", callbacks[3])
+        self.assertIn("h3_vector_reference_video_error", callbacks[3])
+        self.assertIn("h3_vector_video_error_ratio", callbacks[3])
+        self.assertIn("h3_vector_reference_audio_error", callbacks[3])
+        self.assertIn("h3_vector_audio_error_ratio", callbacks[3])
+        self.assertIn("h3_vector_actual_delta_t", callbacks[3])
+        self.assertIsNotNone(callbacks[3]["h3_vector_reference_video_error"])
+        self.assertEqual(callbacks[3]["h3_vector_video_error_ratio"], 1.0)
+        self.assertEqual(
+            diagnostics._anchors[3]["trajectory_metrics"]["reference_video_error"],
+            callbacks[3]["h3_vector_reference_video_error"],
+        )
+        self.assertEqual(
+            diagnostics._run_metadata["configuration"]["adaptive_controller"]["version"],
+            "adaptive_history_v3",
+        )
+        progress = [line for line in captured_logs.output if "[H3 Adaptive RES v3]" in line]
+        self.assertEqual(len(progress), model.calls)
+        self.assertIn("previous scale=", progress[3])
+        self.assertIn("delta_t=", progress[3])
+        self.assertIn("error video v=", progress[3])
+        self.assertIn("audio v=", progress[3])
+        self.assertIn("action=", progress[3])
+        self.assertIn("next scale=", progress[3])
+
+    def test_adaptive_embedded_res_reserves_terminal_anchor_and_reports_defect(self):
+        sigmas = torch.tensor([
+            1.0, 0.9956331849, 0.9908256531, 0.9855073094, 0.9795918465,
+            0.9729729891, 0.9655172229, 0.9570552111, 0.9473683834,
+            0.9361702204, 0.9230769277, 0.9075629711, 0.8888888955,
+            0.8659793735, 0.8372092843, 0.8000000119, 0.75,
+            0.6792452931, 0.5714285970, 0.3870967925, 0.0,
+        ])
+        config = SamplerConfig(
+            method="res_multistep", evaluation_profile="adaptive_embedded_res_v1",
+            embedded_video_tolerance=1e-8, adaptive_safety_factor=.8,
+            max_adaptive_step_scale=1.0, max_adaptive_growth_ratio=2.0,
+        )
+        diagnostics = RunDiagnostics(config=config, latent_shapes=ResInner.latent_shapes)
+        callbacks = []
+        model = ResModel(lambda x, sigma: torch.full_like(x, 1.0 + .1 * sigma))
+        with self.assertLogs(level="INFO") as captured_logs:
+            sample_vector_accel(
+                model, torch.zeros(1, 1, 6), sigmas, disable=True, config=config,
+                diagnostics=diagnostics, callback=callbacks.append,
+            )
+        effective = diagnostics._run_metadata["effective_sigma_sequence"]
+        decisions = diagnostics._run_metadata["adaptive_decisions"]
+        self.assertEqual(model.calls, 20)
+        self.assertEqual(model.calls, diagnostics.true_nfe)
+        self.assertEqual(model.calls, len(callbacks))
+        self.assertEqual(effective[-2:], [float(sigmas[19]), 0.0])
+        self.assertEqual(decisions[0]["reason"], "bootstrap")
+        self.assertEqual(decisions[-2]["reason"], "max_nfe_terminal_floor")
+        self.assertEqual(decisions[-2]["clamp_selected"], "terminal_floor")
+        self.assertEqual(decisions[-1]["reason"], "terminal_zero")
+        self.assertEqual(callbacks[-1]["i"], 19)
+        self.assertTrue(all(not row["h3_vector_forecast"] for row in callbacks))
+        self.assertIn("h3_vector_tolerance_solution_h", callbacks[1])
+        self.assertIn("h3_vector_defect_at_accepted_h", callbacks[1])
+        self.assertIn("h3_vector_audio_defect_at_accepted_h", callbacks[1])
+        self.assertEqual(
+            diagnostics._run_metadata["configuration"]["adaptive_controller"]["version"],
+            "adaptive_embedded_res_v1",
+        )
+        progress = [line for line in captured_logs.output
+                    if "[H3 Adaptive RES embedded v1]" in line]
+        self.assertEqual(len(progress), model.calls)
+        self.assertIn("NFE 1/~", progress[0])
+        self.assertIn("schedule 0.00/20", progress[0])
+        self.assertIn("defect=", progress[1])
+        self.assertIn("clamp=", progress[1])
 
     def test_core_solvers_reject_adaptive_and_invalid_source_schedule(self):
         with self.assertRaisesRegex(ValueError, "core solver methods require the fixed policy"):

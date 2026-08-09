@@ -27,6 +27,7 @@ from h3_attention.hybrid.config import (  # noqa: E402
 )
 from h3_attention.hybrid.router import SparseTileRouter  # noqa: E402
 from h3_attention.hybrid.sparse_sage import (  # noqa: E402
+    SparseSageKernelSpec,
     SparseSageExecutor,
 )
 from h3_runtime.context import RUNTIME_KEY, RuntimeSnapshot  # noqa: E402
@@ -36,6 +37,21 @@ def check(value, message):
     if not value:
         raise AssertionError(message)
     print("  ok: %s" % message)
+
+
+def sparse_spec(kernel=None):
+    return SparseSageKernelSpec(
+        version="fake-sparge",
+        architecture="sm89",
+        capability=(8, 9),
+        q_tile=128,
+        kv_tile=64,
+        v_format="fp8",
+        kernel=kernel or (lambda *args: None),
+        accumulator="f32",
+        fused_v_ops="fake-v-fused",
+        kernel_name="fake_sparse_kernel",
+    )
 
 
 def expect_error(fn, text):
@@ -120,15 +136,15 @@ def test_prepared_validation():
 
 def test_mode_selection():
     print("fused QKV mode selection")
-    api = SimpleNamespace(version="fake-sparge", v_fused="fake-v-fused")
+    api = sparse_spec()
     established = HybridSparseBackend(
         HybridSparseConfig(mode=MODE_SAGE128),
-        api=api,
+        kernel_spec=api,
         allow_cpu_for_tests=True,
     )
     fused = HybridSparseBackend(
         HybridSparseConfig(mode=MODE_SAGE128_FUSED_QKV),
-        api=api,
+        kernel_spec=api,
         allow_cpu_for_tests=True,
     )
     check(established.projector is None, "established sage128 mode retains BF16 projection")
@@ -206,7 +222,7 @@ def test_projected_sparse_sage():
         kernel_calls.append(args)
         args[3].fill_(3)
 
-    api = SimpleNamespace(version="fake-sparge", v_fused="fake-v-fused")
+    api = sparse_spec(fake_kernel)
     executor = SparseSageExecutor(
         api,
         allow_cpu_for_tests=True,
@@ -250,7 +266,7 @@ def test_projected_backend_integration():
 
     backend = HybridSparseBackend(
         HybridSparseConfig(mode=MODE_SAGE128_FUSED_QKV, video_budget=0.5),
-        api=SimpleNamespace(version="fake-sparge", v_fused="fake-v-fused"),
+        kernel_spec=sparse_spec(fake_kernel),
         allow_cpu_for_tests=True,
         v_preparer=fake_v_preparer,
         low_level_selector=lambda _q: fake_kernel,

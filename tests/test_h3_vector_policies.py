@@ -83,6 +83,14 @@ class PolicyTests(unittest.TestCase):
         for value in (float("nan"), float("inf"), 0.99):
             with self.assertRaises(ValueError):
                 SamplerConfig(max_adaptive_step_scale=value)
+        for kwargs in (
+            {"embedded_video_tolerance": 0.0},
+            {"adaptive_safety_factor": 0.0},
+            {"adaptive_safety_factor": 1.01},
+            {"max_adaptive_growth_ratio": 0.99},
+        ):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                SamplerConfig(**kwargs)
 
     def test_adaptive_uses_video_surviving_risk_and_one_forecast_limit(self):
         policy = AdaptiveRepairPolicy(

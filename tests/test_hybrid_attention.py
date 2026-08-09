@@ -1,4 +1,4 @@
-"""CPU contract tests plus explicitly opt-in CUDA checks for Phase A."""
+"""CPU contracts plus explicitly opt-in CUDA checks for Hybrid Sparse."""
 
 import os
 import sys
@@ -14,20 +14,30 @@ _ROOT = os.path.abspath(os.path.join(_HERE, "..", "..", ".."))
 sys.path.insert(0, _PACK)
 sys.path.insert(0, _ROOT)
 
+sys.argv = [sys.argv[0], "--cpu"]
+import comfy.options  # noqa: E402
+comfy.options.enable_args_parsing()
+
 from h3_attention.hybrid import (  # noqa: E402
     DeferredCudaTiming,
     HybridSparseBackend,
     HybridSparseConfig,
     HybridStatsCollector,
     TIMING_STAGES,
-    SparseSageAPI,
+    SparseSageKernelSpec,
     SparseSageError,
-    load_sparse_sage_api,
+    SparseSageExecutor,
+    SparseTileRouter,
+    load_sparse_sage_spec,
+    resolve_sparse_sage_spec,
 )
 from h3_runtime.context import RUNTIME_KEY, RuntimeSnapshot  # noqa: E402
 from h3_sparse_attention.nodes import MiniMaxH3HybridSparseAttention  # noqa: E402
 from h3_attention.hybrid.report import render  # noqa: E402
-from h3_attention.hybrid.sparse_sage import quantize_qk  # noqa: E402
+from h3_attention.hybrid.sparse_sage import (  # noqa: E402
+    _load_qattn_surface,
+    quantize_qk,
+)
 from h3_attention.hybrid import sparse_quant  # noqa: E402
 
 
@@ -90,6 +100,23 @@ class FakeSparseKernel:
         output.zero_()
 
 
+def kernel_spec(kernel=None, *, capability=(8, 9), q_tile=128, kv_tile=64,
+                v_format="fp8", accumulator="f32", fused=object()):
+    kernel = kernel or FakeSparseKernel()
+    return SparseSageKernelSpec(
+        version="0.1.test",
+        architecture="sm%d%d" % capability,
+        capability=capability,
+        q_tile=q_tile,
+        kv_tile=kv_tile,
+        v_format=v_format,
+        kernel=kernel,
+        accumulator=accumulator,
+        fused_v_ops=fused if v_format == "fp8" else None,
+        kernel_name="fake_sparse_kernel",
+    )
+
+
 def fake_v_preparer(v, *_):
     b, h, sequence, dim = v.shape
     padded = (sequence + 127) // 128 * 128
@@ -130,10 +157,9 @@ def test_deferred_timing():
     factory = lambda **kwargs: FakeTimingEvent(clock, events)
     collector = HybridStatsCollector("output", "timing")
     config = HybridSparseConfig(timing=True)
-    api = SparseSageAPI(version="0.1.test", low_level_f16=FakeSparseKernel(),
-                        low_level_f32=FakeSparseKernel())
+    api = kernel_spec()
     hybrid = HybridSparseBackend(
-        config, api=api, collector=collector, event_factory=factory,
+        config, kernel_spec=api, collector=collector, event_factory=factory,
         allow_cpu_for_tests=True,
         v_preparer=fake_v_preparer,
         qk_quantizer=quantize_qk,
@@ -150,7 +176,7 @@ def test_deferred_timing():
     summary = collector._timing._resolved
     check(summary["call_count"] == 1 and all(
         summary["stages"][stage]["count"] == 1
-        for stage in ("direct_lut_construction", "v_fp8_preparation",
+        for stage in ("direct_lut_construction", "v_preparation",
                       "q_k_int8_quantization", "sparse_sage_low_level_kernel",
                       "total_hybrid_attention")
     ), "all deferred timing stages resolve once")
@@ -239,12 +265,11 @@ def test_per_step_timing():
 
 def backend(kernel=None, collector=None, budget=0.5):
     kernel = kernel or FakeSparseKernel()
-    api = SparseSageAPI(version="0.1.test", low_level_f16=kernel,
-                        low_level_f32=kernel)
+    api = kernel_spec(kernel)
     config = HybridSparseConfig(video_budget=budget)
     return HybridSparseBackend(
         config,
-        api=api,
+        kernel_spec=api,
         collector=collector,
         allow_cpu_for_tests=True,
         v_preparer=fake_v_preparer,
@@ -266,7 +291,7 @@ def test_prepare_execute_lifetime():
     ), "prepared carrier retains no view into fused QKV storage")
     check(sparse.q_int8.dtype == torch.int8 and sparse.k_int8.dtype == torch.int8,
           "prepared Q/K are quantized int8 buffers")
-    check(sparse.v_fp8.dtype == torch.float8_e4m3fn,
+    check(sparse.v_carrier.dtype == torch.float8_e4m3fn,
           "prepared V is FP8")
     check(sparse.lut.shape == (1, 2, 3, 6) and sparse.lut.is_contiguous()
           and sparse.valid_block_num.dtype == torch.int32,
@@ -320,7 +345,7 @@ def test_dependency_and_disabled_node():
     print("dependency and disabled node")
     with mock.patch("importlib.import_module", side_effect=ModuleNotFoundError("missing")):
         try:
-            load_sparse_sage_api()
+            load_sparse_sage_spec()
         except SparseSageError as exc:
             check("compiled" in str(exc), "missing SpargeAttention raises explicit dependency error")
         else:
@@ -331,9 +356,202 @@ def test_dependency_and_disabled_node():
     check(result.args[0] is marker, "disabled node is an exact model pass-through")
 
 
+def test_kernel_spec_resolution():
+    print("portable kernel spec resolution")
+    ampere = FakeSparseKernel()
+    ada_f16 = FakeSparseKernel()
+    ada_f32 = FakeSparseKernel()
+    hopper = FakeSparseKernel()
+    qattn = SimpleNamespace()
+    setattr(
+        qattn,
+        "qk_int8_sv_f16_accum_f16_block_sparse_attn_inst_buf_with_pv_threshold",
+        ampere,
+    )
+    setattr(
+        qattn,
+        "qk_int8_sv_f8_accum_f16_block_sparse_attn_inst_buf_fuse_v_scale_with_pv_threshold",
+        ada_f16,
+    )
+    setattr(
+        qattn,
+        "qk_int8_sv_f8_accum_f32_block_sparse_attn_inst_buf_fuse_v_scale_with_pv_threshold",
+        ada_f32,
+    )
+    setattr(
+        qattn,
+        "qk_int8_sv_f8_accum_f32_block_sparse_attn_inst_buf_fuse_v_scale_with_pv_threshold_sm90",
+        hopper,
+    )
+    fused = object()
+
+    for capability in ((8, 0), (8, 6), (8, 7)):
+        spec = resolve_sparse_sage_spec(
+            qattn, fused, capability=capability, version="test",
+            cuda_version=(12, 6),
+        )
+        check(
+            spec.capability == capability and spec.q_tile == 128
+            and spec.kv_tile == 64 and spec.v_format == "fp16"
+            and spec.kernel is ampere,
+            "%s resolves Ampere FP16-V geometry" % spec.architecture,
+        )
+
+    ada = resolve_sparse_sage_spec(
+        qattn, fused, capability=(8, 9), version="test",
+        cuda_version=(12, 6),
+    )
+    check(
+        ada.kernel is ada_f32 and ada.accumulator == "f32"
+        and ada.v_format == "fp8" and ada.v_quant_bound == 2.25
+        and (ada.q_tile, ada.kv_tile) == (128, 64),
+        "SM89 CUDA 12.6 resolves the FP8-V f32 accumulator",
+    )
+    ada_128 = resolve_sparse_sage_spec(
+        qattn, fused, capability=(8, 9), version="test",
+        cuda_version=(12, 8),
+    )
+    check(
+        ada_128.kernel is ada_f16 and ada_128.accumulator == "f16",
+        "SM89 CUDA 12.8 prefers the Sage2++ f16 accumulator",
+    )
+    sm90 = resolve_sparse_sage_spec(
+        qattn, fused, capability=(9, 0), version="test",
+        cuda_version=(12, 6),
+    )
+    check(
+        sm90.kernel is hopper and sm90.v_format == "fp8"
+        and sm90.v_quant_bound == 2.25
+        and (sm90.q_tile, sm90.kv_tile) == (64, 128),
+        "SM90 resolves Hopper FP8-V 64Q x 128KV geometry",
+    )
+
+    for capability, expected in (((12, 0), "12.0"), ((9, 0), "_sm90")):
+        surface = SimpleNamespace() if capability == (9, 0) else qattn
+        try:
+            resolve_sparse_sage_spec(
+                surface, fused, capability=capability, version="test",
+                cuda_version=(12, 8),
+            )
+        except SparseSageError as exc:
+            check(expected in str(exc), "unsupported or missing architecture fails explicitly")
+        else:
+            raise AssertionError("invalid Sparse Sage architecture was accepted")
+
+    split = SimpleNamespace(split=True)
+
+    def split_import(name):
+        if name == "spas_sage_attn._qattn":
+            raise ModuleNotFoundError(name=name)
+        if name == "spas_sage_attn._qattn_sm89":
+            return SimpleNamespace()
+        raise AssertionError("unexpected split extension import %s" % name)
+
+    with mock.patch(
+            "h3_attention.hybrid.sparse_sage.importlib.import_module",
+            side_effect=split_import,
+    ), mock.patch.object(
+            torch.ops, "spas_sage_attn_qattn_sm89", split, create=True,
+    ):
+        check(
+            _load_qattn_surface((8, 9)) == (split, "split"),
+            "architecture registry normalizes split compiled extension packages",
+        )
+
+    monolithic = SimpleNamespace(monolithic=True)
+    with mock.patch(
+            "h3_attention.hybrid.sparse_sage.importlib.import_module",
+            return_value=monolithic,
+    ):
+        check(
+            _load_qattn_surface((9, 0)) == (monolithic, "monolithic"),
+            "architecture registry prefers current upstream's monolithic extension",
+        )
+
+
+def test_architecture_specific_carriers_and_abis():
+    print("architecture-specific carriers and ABIs")
+    ampere_kernel = FakeSparseKernel()
+    ampere = kernel_spec(
+        ampere_kernel, capability=(8, 0), v_format="fp16", accumulator="f16",
+    )
+    q, k, v = fused_hnd()
+    ampere_lut = torch.zeros((1, 2, 3, 6), dtype=torch.int32)
+    ampere_valid = torch.zeros((1, 2, 3), dtype=torch.int32)
+    ampere_executor = SparseSageExecutor(ampere, allow_cpu_for_tests=True)
+    prepared = ampere_executor.prepare(
+        q, k, v, ampere_lut, ampere_valid, layer_index=0, metadata={},
+    )
+    check(
+        prepared.v_carrier.dtype == torch.float16
+        and prepared.v_carrier.is_contiguous()
+        and prepared.v_scale.numel() == 0,
+        "Ampere prepares an independent contiguous FP16 HND V carrier",
+    )
+    ampere_executor.execute(prepared)
+    check(
+        len(ampere_kernel.calls) == 1
+        and ampere_kernel.calls[0][4][5:8] == (1, 0, 1),
+        "Ampere dispatch omits the FP8 V scale argument",
+    )
+
+    hopper_kernel = FakeSparseKernel()
+    hopper = kernel_spec(
+        hopper_kernel, capability=(9, 0), q_tile=64, kv_tile=128,
+    )
+    router = SparseTileRouter(HybridSparseConfig(), spec=hopper)
+    lut, valid, metadata = router.build_lut(q, k, layout(), 0.5)
+    check(
+        lut.shape == (1, 2, 6, 3)
+        and metadata.q_tiles == 6 and metadata.kv_tiles == 3,
+        "Hopper router uses 64Q x 128KV geometry",
+    )
+    hopper_executor = SparseSageExecutor(
+        hopper, allow_cpu_for_tests=True, v_preparer=fake_v_preparer,
+    )
+    prepared = hopper_executor.prepare(
+        q, k, v, lut, valid, layer_index=0, metadata={},
+    )
+    check(
+        prepared.q_scale.shape == (1, 2, 6)
+        and prepared.k_scale.shape == (1, 2, 3),
+        "Hopper Q/K quantization uses the same resolved geometry",
+    )
+    hopper_executor.execute(prepared)
+    check(
+        len(hopper_kernel.calls) == 1
+        and hopper_kernel.calls[0][4][6:9] == (1, 0, 1),
+        "Hopper dispatch includes the FP8 V scale argument",
+    )
+
+    try:
+        HybridSparseBackend(
+            HybridSparseConfig(mode="sage128_fused_qkv"), kernel_spec=hopper,
+            allow_cpu_for_tests=True, v_preparer=fake_v_preparer,
+        )
+    except SparseSageError as exc:
+        check("SM89" in str(exc), "fused QKV rejects non-Ada geometry before patching")
+    else:
+        raise AssertionError("fused QKV accepted Hopper geometry")
+
+    try:
+        HybridSparseBackend(
+            HybridSparseConfig(), kernel_spec=hopper, router=SparseTileRouter(),
+            allow_cpu_for_tests=True, v_preparer=fake_v_preparer,
+        )
+    except SparseSageError as exc:
+        check("router geometry" in str(exc), "injected router must match the resolved ABI")
+    else:
+        raise AssertionError("mismatched injected router geometry was accepted")
+
+
 def test_node_mode_schema():
     print("node mode schema")
     schema = MiniMaxH3HybridSparseAttention.define_schema()
+    check(
+        "SM89" not in schema.description and "128Q x 64KV" not in schema.description,
+        "node describes architecture-native routing rather than one GPU geometry",
+    )
     mode = next(item for item in schema.inputs if item.id == "mode")
     check(mode.options == ["sage128", "sage128_fused_qkv"],
           "node exposes established and fused-QKV modes")
@@ -435,11 +653,11 @@ def optional_cuda_numerical():
     if os.environ.get("H3_RUN_SPARSE_SAGE_CUDA_TESTS") != "1":
         print("CUDA numerical parity: SKIP (set H3_RUN_SPARSE_SAGE_CUDA_TESTS=1 after authorization)")
         return
-    api = load_sparse_sage_api()
+    api = load_sparse_sage_spec()
     for budget in (1.0, 0.5):
         q, k, v = fused_hnd(sequence=256, heads=2, device="cuda", dtype=torch.float16)
         config = HybridSparseConfig(video_budget=budget)
-        hybrid = HybridSparseBackend(config, api=api)
+        hybrid = HybridSparseBackend(config, kernel_spec=api)
         prepared = hybrid.prepare(
             q, k, v, layer_index=0,
             transformer_options=options(256, 128, torch.device("cuda")),
@@ -453,6 +671,8 @@ def optional_cuda_numerical():
 
 
 def main():
+    test_kernel_spec_resolution()
+    test_architecture_specific_carriers_and_abis()
     test_prepare_execute_lifetime()
     test_strict_errors()
     test_dependency_and_disabled_node()

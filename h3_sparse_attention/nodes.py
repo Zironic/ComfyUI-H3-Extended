@@ -71,8 +71,9 @@ class MiniMaxH3HybridSparseAttention(io.ComfyNode):
             display_name="MiniMax H3 Hybrid Sparse Attention (Zi)",
             category="model/patch/minimax",
             description=(
-                "Experimental SM89 path: route H3 directly at Sparse Sage's "
-                "128Q x 64KV geometry. Fixed density retains the same fraction "
+                "Experimental portable Sparse Sage path: route H3 directly at "
+                "the selected architecture's tile geometry. Fixed density "
+                "retains the same fraction "
                 "for every pure target-video row. Adaptive budget density keeps "
                 "the same aggregate block budget while moving blocks toward "
                 "head/query rows with larger omitted coarse attention mass."
@@ -189,13 +190,13 @@ class MiniMaxH3HybridSparseAttention(io.ComfyNode):
                 )
         collector = HybridStatsCollector(_output_root(), hybrid_config.run_tag)
         environment = RuntimeEnvironment.detect()
-        api = preflight_sparse_sage(
+        kernel_spec = preflight_sparse_sage(
             cuda_available=lambda: environment.cuda_available,
             capability_getter=lambda: environment.capability,
         )
         backend = HybridSparseBackend(
             hybrid_config,
-            api=api,
+            kernel_spec=kernel_spec,
             collector=collector,
         )
         decision = AttentionDecision(
@@ -204,7 +205,7 @@ class MiniMaxH3HybridSparseAttention(io.ComfyNode):
             backend=backend,
             adapter=ATTENTION_HYBRID,
             reason=(
-                "explicit direct 128Q x 64KV Sparse Sage experiment (%s)"
+                "explicit portable Sparse Sage experiment (%s)"
                 % hybrid_config.density_mode
             ),
             environment=environment,

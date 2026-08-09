@@ -32,11 +32,12 @@ from .router import (
 )
 from .sparse_sage import (
     PreparedSparseSage,
-    SparseSageAPI,
+    SparseSageKernelSpec,
     SparseSageError,
     SparseSageExecutor,
-    load_sparse_sage_api,
+    load_sparse_sage_spec,
     preflight_sparse_sage,
+    resolve_sparse_sage_spec,
 )
 from .stats import DeferredCudaTiming, HybridStatsCollector, TIMING_STAGES
 
@@ -65,11 +66,12 @@ __all__ = [
     "SparseTileGeometry",
     "SparseTileRouter",
     "PreparedSparseSage",
-    "SparseSageAPI",
+    "SparseSageKernelSpec",
     "SparseSageError",
     "SparseSageExecutor",
-    "load_sparse_sage_api",
+    "load_sparse_sage_spec",
     "preflight_sparse_sage",
+    "resolve_sparse_sage_spec",
     "HybridStatsCollector",
     "DeferredCudaTiming",
     "TIMING_STAGES",

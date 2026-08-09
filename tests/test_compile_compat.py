@@ -41,6 +41,7 @@ from h3_attention.hybrid.config import (  # noqa: E402
 from h3_attention.hybrid.fused_qkv import FusedQKVProjector  # noqa: E402
 from h3_attention.hybrid.router import SparseTileRouter  # noqa: E402
 from h3_attention.hybrid.sparse_sage import (  # noqa: E402
+    SparseSageKernelSpec,
     prepare_sparse_sage_v_op,
     sparse_sage_attention_op,
 )
@@ -436,7 +437,18 @@ def test_active_hybrid_attention_reaches_operator_graphs():
     module.q_norm = SimpleNamespace(weight=norm, eps=1e-6)
     module.k_norm = SimpleNamespace(weight=norm, eps=1e-6)
     module.out_proj = lambda value: value
-    api = SimpleNamespace(version="test", v_fused=None)
+    api = SparseSageKernelSpec(
+        version="test",
+        architecture="sm89",
+        capability=(8, 9),
+        q_tile=128,
+        kv_tile=64,
+        v_format="fp8",
+        kernel=lambda *args: None,
+        accumulator="f32",
+        fused_v_ops=object(),
+        kernel_name="fake_sparse_kernel",
+    )
     backend = HybridSparseBackend(
         HybridSparseConfig(
             mode=MODE_SAGE128_FUSED_QKV,
@@ -444,7 +456,7 @@ def test_active_hybrid_attention_reaches_operator_graphs():
             strict=True,
             timing=False,
         ),
-        api=api,
+        kernel_spec=api,
         projector=FusedQKVProjector(),
     )
     forward = make_attention_forward(
@@ -463,8 +475,9 @@ def test_active_hybrid_attention_reaches_operator_graphs():
     torch.cuda.get_device_capability = lambda device=None: (8, 9)
     torch._dynamo.utils.counters.clear()
     try:
-        compiled = torch.compile(forward, backend=graph_backend, fullgraph=False)
-        result = compiled(x, rope, transformer_options=options)
+        with mode:
+            compiled = torch.compile(forward, backend=graph_backend, fullgraph=False)
+            result = compiled(x, rope, transformer_options=options)
         graph_breaks = sum(
             torch._dynamo.utils.counters.get("graph_break", {}).values()
         )

@@ -86,7 +86,7 @@ class PreparedCall:
 
 SPARSE_TIMING_STAGES = (
     "direct_lut_construction",
-    "v_fp8_preparation",
+    "v_preparation",
     "q_k_int8_quantization",
     "sparse_sage_low_level_kernel",
     "total_hybrid_attention",

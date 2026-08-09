@@ -75,8 +75,10 @@ def main() -> int:
         for filename in missing:
             print(f"  - {filename}")
 
-    if REQUIRED and linked == 0:
-        raise SystemExit("No expected H3 model files were linked from the cached model")
+    if REQUIRED and missing:
+        raise SystemExit(
+            "Required H3 cached-model files are missing: " + ", ".join(missing)
+        )
 
     return 0
 

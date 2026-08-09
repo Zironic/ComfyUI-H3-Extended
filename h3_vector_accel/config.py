@@ -11,8 +11,8 @@ PROFILES = (
     "late_aggressive_12", "late_max_11", "conservative_12",
     "early_aggressive_13", "uniform_13",
 )
-ADAPTIVE_PROFILES = frozenset(("adaptive_history_v1", "adaptive_history_v2"))
-EVALUATION_PROFILES = PROFILES + ("adaptive_history_v1", "adaptive_history_v2")
+ADAPTIVE_PROFILES = frozenset(("adaptive_history_v1", "adaptive_history_v2", "adaptive_history_v3", "adaptive_embedded_res_v1"))
+EVALUATION_PROFILES = PROFILES + ("adaptive_history_v1", "adaptive_history_v2", "adaptive_history_v3", "adaptive_embedded_res_v1")
 DIAGNOSTICS = ("off", "summary", "full")
 POLICIES = ("fixed", "adaptive_repair")
 QUALITY_PRESETS = ("conservative", "balanced", "aggressive")
@@ -26,6 +26,9 @@ DEFAULT_MAX_ADAPTIVE_STEP_SCALE = 3.0
 DEFAULT_SAFETY_FACTOR = 1.25
 DEFAULT_PROTECTED_PREFIX_STEPS = 6
 DEFAULT_AUDIO_EMERGENCY_MULTIPLIER = 4.0
+DEFAULT_EMBEDDED_VIDEO_TOLERANCE = 0.05
+DEFAULT_ADAPTIVE_SAFETY_FACTOR = 0.8
+DEFAULT_MAX_ADAPTIVE_GROWTH_RATIO = 2.0
 
 _MASKS = {
     "full_20": (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19),
@@ -81,6 +84,9 @@ class SamplerConfig:
     protected_prefix_steps: int = DEFAULT_PROTECTED_PREFIX_STEPS
     audio_emergency_multiplier: float = DEFAULT_AUDIO_EMERGENCY_MULTIPLIER
     max_adaptive_step_scale: float = DEFAULT_MAX_ADAPTIVE_STEP_SCALE
+    embedded_video_tolerance: float = DEFAULT_EMBEDDED_VIDEO_TOLERANCE
+    adaptive_safety_factor: float = DEFAULT_ADAPTIVE_SAFETY_FACTOR
+    max_adaptive_growth_ratio: float = DEFAULT_MAX_ADAPTIVE_GROWTH_RATIO
     _mask: tuple[bool, ...] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self):
@@ -128,6 +134,11 @@ class SamplerConfig:
                             ("audio_emergency_multiplier", self.audio_emergency_multiplier)):
             if not isinstance(value, (int, float)) or not math.isfinite(value):
                 raise ValueError(f"{name} must be finite")
+        for name, value in (("embedded_video_tolerance", self.embedded_video_tolerance),
+                            ("adaptive_safety_factor", self.adaptive_safety_factor),
+                            ("max_adaptive_growth_ratio", self.max_adaptive_growth_ratio)):
+            if not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise ValueError(f"{name} must be finite")
         if self.max_extrapolation_ratio <= 0:
             raise ValueError("max_extrapolation_ratio must be positive")
         if self.max_adaptive_step_scale < 1:
@@ -146,6 +157,12 @@ class SamplerConfig:
             raise ValueError("protected_prefix_steps must be a non-negative integer")
         if self.audio_emergency_multiplier <= 0:
             raise ValueError("audio_emergency_multiplier must be positive")
+        if self.embedded_video_tolerance <= 0:
+            raise ValueError("embedded_video_tolerance must be positive")
+        if not 0 < self.adaptive_safety_factor <= 1:
+            raise ValueError("adaptive_safety_factor must be greater than zero and at most one")
+        if self.max_adaptive_growth_ratio < 1:
+            raise ValueError("max_adaptive_growth_ratio must be at least one")
         mask = tuple() if self.evaluation_profile in ADAPTIVE_PROFILES else profile_mask(self.evaluation_profile, 20)
         object.__setattr__(self, "_mask", mask)
 

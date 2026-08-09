@@ -1,4 +1,4 @@
-"""CPU tests for direct 128Q x 64KV hybrid routing."""
+"""CPU tests for architecture-native Sparse Sage routing."""
 
 import os
 import sys
@@ -8,6 +8,7 @@ import torch
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(_HERE))
+sys.path.insert(0, os.path.abspath(os.path.join(_HERE, "..", "..", "..")))
 
 from h3_attention.hybrid.router import SparseTileRouter  # noqa: E402
 

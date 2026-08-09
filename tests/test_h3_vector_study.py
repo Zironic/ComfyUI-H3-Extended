@@ -17,6 +17,8 @@ from h3_vector_accel.study import (
     adaptive_comparison_arms,
     adaptive_history_arm,
     adaptive_history_v2_arm,
+    adaptive_history_v3_arm,
+    adaptive_embedded_res_v1_arm,
     fixed_policy_arms,
     four_arm_study_arms,
     run_fixed_policy_study,
@@ -89,6 +91,8 @@ class StudyTests(unittest.TestCase):
         for arm, profile in (
             (adaptive_history_arm(), "adaptive_history_v1"),
             (adaptive_history_v2_arm(), "adaptive_history_v2"),
+            (adaptive_history_v3_arm(), "adaptive_history_v3"),
+            (adaptive_embedded_res_v1_arm(), "adaptive_embedded_res_v1"),
         ):
             self.assertEqual(arm.method, "res_multistep")
             self.assertEqual(arm.evaluation_profile, profile)

@@ -397,7 +397,7 @@ class SharedBlockDispatcher:
             "sparse_sage_heads": int(topology.heads),
             "sol_heads": 0,
             "flex_fallback_tiles": 0,
-            "total_128q_video_tiles": (
+            "total_q_video_tiles": (
                 int(geometry.pure_video_q_tiles) * int(topology.heads)
             ),
             "qkv_projection": "fused_int8",

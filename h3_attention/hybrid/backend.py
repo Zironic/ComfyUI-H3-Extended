@@ -1,4 +1,4 @@
-"""Prepared H3 hybrid backend, implemented through Phase A Sparse Sage."""
+"""Prepared H3 hybrid backend, implemented through portable Sparse Sage."""
 
 from dataclasses import dataclass
 
@@ -7,7 +7,7 @@ import torch
 from .config import HybridSparseConfig, MODE_SAGE128_FUSED_QKV
 from .fused_qkv import FusedQKVProjector
 from .router import SparseRouterError, SparseTileRouter
-from .sparse_sage import SparseSageError, SparseSageExecutor, load_sparse_sage_api
+from .sparse_sage import SparseSageError, SparseSageExecutor, load_sparse_sage_spec
 from .stats import DeferredCudaTiming, ROUTE_HISTOGRAM_KEY, build_route_histogram
 
 try:
@@ -28,16 +28,14 @@ class HybridSparseBackend:
     requires_runtime_context = True
     approximate = True
 
-    def __init__(self, config=None, *, api=None, router=None, collector=None,
+    def __init__(self, config=None, *, kernel_spec=None, router=None, collector=None,
                  allow_cpu_for_tests=False, event_factory=None, timing_timer=None,
                  qk_quantizer=None, v_preparer=None, low_level_selector=None,
                  projector=None):
         self.config = config or HybridSparseConfig()
         if not isinstance(self.config, HybridSparseConfig):
             raise TypeError("config must be HybridSparseConfig")
-        self.router = (
-            router if router is not None else SparseTileRouter(self.config)
-        )
+        kernel_spec = kernel_spec if kernel_spec is not None else load_sparse_sage_spec()
         self.collector = collector
         self.runtime_listeners = () if collector is None else (collector,)
         self.timing = DeferredCudaTiming(
@@ -54,12 +52,32 @@ class HybridSparseBackend:
         if self.config.mode == MODE_SAGE128_FUSED_QKV and self.projector is None:
             self.projector = FusedQKVProjector()
         self.executor = SparseSageExecutor(
-            api if api is not None else load_sparse_sage_api(),
+            kernel_spec,
             allow_cpu_for_tests=allow_cpu_for_tests,
             qk_quantizer=qk_quantizer,
             v_preparer=v_preparer,
             low_level_selector=low_level_selector,
         )
+        self.router = (
+            router if router is not None else SparseTileRouter(
+                self.config, spec=self.executor.spec
+            )
+        )
+        if (self.router.q_tile, self.router.kv_tile) != (
+                self.executor.spec.q_tile, self.executor.spec.kv_tile):
+            raise SparseSageError(
+                "Sparse Sage router geometry %dQ x %dKV does not match %s's %dQ x %dKV ABI"
+                % (self.router.q_tile, self.router.kv_tile,
+                   self.executor.spec.architecture, self.executor.spec.q_tile,
+                   self.executor.spec.kv_tile)
+            )
+        if self.config.mode == MODE_SAGE128_FUSED_QKV and (
+                self.executor.spec.capability != (8, 9)
+                or self.executor.spec.q_tile != 128
+                or self.executor.spec.kv_tile != 64):
+            raise SparseSageError(
+                "sage128_fused_qkv requires SM89 and the 128Q x 64KV Sparse Sage ABI"
+            )
 
     @staticmethod
     def _callable_signature(value):
@@ -76,7 +94,7 @@ class HybridSparseBackend:
     def installation_signature(self):
         collector = self.collector
         projector = self.projector
-        api = self.executor.api
+        spec = self.executor.spec
         return (
             self.name,
             self.config.signature,
@@ -87,12 +105,7 @@ class HybridSparseBackend:
                 str(collector.output_root),
                 str(collector.run_tag),
             ),
-            getattr(api, "signature", (
-                str(getattr(api, "version", "unknown")),
-                id(getattr(api, "low_level_f16", None)),
-                id(getattr(api, "low_level_f32", None)),
-                id(getattr(api, "v_fused", None)),
-            )),
+            spec.signature,
             self._callable_signature(self.executor.qk_quantizer),
             self._callable_signature(self.executor.v_preparer),
             self._callable_signature(self.executor.low_level_selector),
@@ -159,7 +172,7 @@ class HybridSparseBackend:
             "sparse_sage_heads": int(q.shape[1]),
             "sol_heads": 0,
             "flex_fallback_tiles": 0,
-            "total_128q_video_tiles": (
+            "total_q_video_tiles": (
                 int(mask_metadata.pure_video_q_tiles) * int(q.shape[1])
             ),
         })
@@ -230,7 +243,7 @@ class HybridSparseBackend:
             "sparse_sage_heads": heads,
             "sol_heads": 0,
             "flex_fallback_tiles": 0,
-            "total_128q_video_tiles": (
+            "total_q_video_tiles": (
                 int(mask_metadata.pure_video_q_tiles) * heads
             ),
         })
@@ -267,7 +280,13 @@ class HybridSparseBackend:
             "max_video_density": float(self.config.max_video_density),
             "adaptive_temperature": float(self.config.adaptive_temperature),
             "adaptive_target_mass": float(self.config.adaptive_target_mass),
-            "sparge_attention": self.executor.api.version,
+            "sparge_attention": self.executor.spec.version,
+            "sparse_architecture": self.executor.spec.architecture,
+            "sparse_q_tile": self.executor.spec.q_tile,
+            "sparse_kv_tile": self.executor.spec.kv_tile,
+            "sparse_v_format": self.executor.spec.v_format,
+            "sparse_v_quant_bound": self.executor.spec.v_quant_bound,
+            "sparse_extension_layout": self.executor.spec.extension_layout,
             "approximate": True,
             "timing": bool(self.config.timing),
             "fused_qkv": self.projector is not None,

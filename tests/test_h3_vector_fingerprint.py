@@ -25,6 +25,9 @@ class FingerprintTests(unittest.TestCase):
             SamplerConfig(protected_prefix_steps=7),
             SamplerConfig(audio_emergency_multiplier=5.0),
             SamplerConfig(max_adaptive_step_scale=5.0),
+            SamplerConfig(embedded_video_tolerance=.03),
+            SamplerConfig(adaptive_safety_factor=.7),
+            SamplerConfig(max_adaptive_growth_ratio=1.5),
         ]
         for config in variants:
             self.assertNotEqual(base, configuration_fingerprint(config, s))
@@ -62,8 +65,16 @@ class FingerprintTests(unittest.TestCase):
         v2 = SamplerConfig(
             method="res_multistep", evaluation_profile="adaptive_history_v2",
         )
+        v3 = SamplerConfig(
+            method="res_multistep", evaluation_profile="adaptive_history_v3",
+        )
+        embedded = SamplerConfig(
+            method="res_multistep", evaluation_profile="adaptive_embedded_res_v1",
+        )
         v1_payload = configuration_payload(v1, sigmas)
         v2_payload = configuration_payload(v2, sigmas)
+        v3_payload = configuration_payload(v3, sigmas)
+        embedded_payload = configuration_payload(embedded, sigmas)
         self.assertIsNone(v1_payload["actual_mask"])
         self.assertIsNone(v2_payload["actual_mask"])
         self.assertEqual(v1_payload["adaptive_controller"]["version"], "adaptive_history_v1")
@@ -72,6 +83,19 @@ class FingerprintTests(unittest.TestCase):
         self.assertEqual(v2_payload["adaptive_controller"]["constants"]["bootstrap_anchors"], 3)
         self.assertEqual(v2_payload["adaptive_controller"]["constants"]["reference_anchors"], 2)
         self.assertEqual(v2_payload["adaptive_controller"]["constants"]["protected_prefix"], 0)
+        self.assertEqual(v3_payload["adaptive_controller"]["version"], "adaptive_history_v3")
+        self.assertEqual(v3_payload["adaptive_controller"]["constants"]["predictor"],
+                         "linear_secant_negative_log_sigma")
+        self.assertEqual(v3_payload["adaptive_controller"]["constants"]["grow_below"], .40)
+        self.assertEqual(v3_payload["adaptive_controller"]["constants"]["reset_below"], 1.30)
+        self.assertEqual(v3_payload["adaptive_controller"]["constants"]["protected_tail"], ())
+        self.assertEqual(embedded_payload["adaptive_controller"]["version"],
+                         "adaptive_embedded_res_v1")
+        self.assertEqual(embedded_payload["adaptive_controller"]["constants"]["defect"],
+                         "eta_zero_incremental_res")
+        self.assertEqual(embedded_payload["adaptive_controller"]["constants"]["control"],
+                         "video_only")
+        self.assertEqual(embedded_payload["embedded_video_tolerance"], .05)
         v2_5x = SamplerConfig(
             method="res_multistep", evaluation_profile="adaptive_history_v2",
             max_adaptive_step_scale=5.0,
@@ -82,6 +106,10 @@ class FingerprintTests(unittest.TestCase):
                             configuration_fingerprint(v2_5x, sigmas))
         self.assertNotEqual(configuration_fingerprint(v1, sigmas),
                             configuration_fingerprint(v2, sigmas))
+        self.assertNotEqual(configuration_fingerprint(v2, sigmas),
+                            configuration_fingerprint(v3, sigmas))
+        self.assertNotEqual(configuration_fingerprint(v3, sigmas),
+                            configuration_fingerprint(embedded, sigmas))
         self.assertNotEqual(
             configuration_fingerprint(v1, sigmas),
             configuration_fingerprint(SamplerConfig(method="res_multistep"), sigmas),

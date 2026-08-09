@@ -189,6 +189,220 @@ class AdaptiveResTests(unittest.TestCase):
                     ValueError, "max_step_scale must be finite and at least one"):
                 _MOD.AdaptiveHistoryControllerV2(source, max_step_scale=value)
 
+    def test_v3_linear_t_prediction_has_zero_residual_after_baseline_interval(self):
+        source = torch.tensor([
+            1.0, .95, .89, .82, .74, .65, .56, .48, .40, .33,
+            .27, .22, .18, .14, .11, .08, .06, .04, .025, .01, 0.0,
+        ])
+        shapes = [torch.Size((1, 1, 2)), torch.Size((1, 1, 2))]
+        controller = _MOD.AdaptiveHistoryControllerV3(source, shapes, max_step_scale=5.0)
+        previous_d = previous_x0 = previous_sigma = None
+        decisions = []
+        for index in range(4):
+            sigma = float(source[index])
+            t = -math.log(sigma)
+            derivative = torch.tensor([[[1.0 + 2.0 * t, 2.0 - t,
+                                         3.0 + .5 * t, 4.0 - .25 * t]]])
+            denoised = torch.tensor([[[5.0 - t, 6.0 + .75 * t,
+                                      7.0 + .2 * t, 8.0 - .4 * t]]])
+            observation = controller.observe(
+                sigma, derivative, denoised,
+                previous_d, previous_x0, previous_sigma,
+            )
+            _, decision = controller.propose(sigma, observation)
+            decisions.append(decision)
+            previous_d, previous_x0, previous_sigma = derivative, denoised, sigma
+        self.assertEqual([row["reason"] for row in decisions[:2]], ["bootstrap"] * 2)
+        self.assertEqual(decisions[2]["reason"], "bootstrap_predict")
+        self.assertEqual(decisions[3]["action"], "reference_calibration")
+        self.assertAlmostEqual(decisions[3]["actual_delta_t"],
+                               -math.log(float(source[3])) + math.log(float(source[2])))
+        for name, value in decisions[3]["residuals"].items():
+            if name.endswith("_ratio"):
+                continue
+            if value is not None:
+                self.assertLess(value, 1e-6)
+        self.assertEqual(controller.step_scale, 1.0)
+        self.assertIsNotNone(controller.reference_video_error)
+        self.assertIsNotNone(controller.reference_audio_error)
+        self.assertFalse(hasattr(controller, "_history"))
+
+    def test_v3_ratio_bands_minimum_hold_and_recovery(self):
+        source = torch.linspace(1.0, 0.0, 21)
+
+        def observation(video_error, audio_error=.0, previous_scale=1.0):
+            residuals = {
+                "video_v_error": video_error,
+                "video_x0_error": video_error / 2,
+                "video_error": video_error,
+                "audio_v_error": audio_error,
+                "audio_x0_error": audio_error / 2,
+                "audio_error": audio_error,
+                "video_error_ratio": video_error,
+                "audio_error_ratio": audio_error,
+            }
+            return _MOD.AnchorObservation(
+                .75, 5, None, None, None, None, None, None,
+                previous_step_scale=previous_scale, actual_delta_t=.1,
+                residuals=residuals,
+            )
+
+        cases = (
+            (.01, 1.0, "grow", 1.5),
+            (.03, 2.0, "grow", 3.0),
+            (.70, 2.0, "shrink", 1.4),
+            (1.20, 2.0, "reset", 1.0),
+        )
+        for error, initial_scale, action, expected in cases:
+            with self.subTest(error=error):
+                controller = _MOD.AdaptiveHistoryControllerV3(source, max_step_scale=5.0)
+                controller.step_scale = initial_scale
+                _, decision = controller.propose(.75, observation(error, previous_scale=initial_scale))
+                self.assertEqual(decision["action"], action)
+                self.assertAlmostEqual(decision["step_scale"], expected)
+
+        boundaries = (
+            (.40, "hold", 2.0),
+            (.70, "shrink", 1.4),
+            (1.00, "reset", 1.0),
+            (1.30, "critical_recovery", 1.0),
+        )
+        for ratio, action, expected in boundaries:
+            with self.subTest(boundary=ratio):
+                controller = _MOD.AdaptiveHistoryControllerV3(source, max_step_scale=5.0)
+                controller.step_scale = 2.0
+                _, decision = controller.propose(.75, observation(ratio, previous_scale=2.0))
+                self.assertEqual(decision["action"], action)
+                self.assertAlmostEqual(decision["step_scale"], expected)
+
+        minimum = _MOD.AdaptiveHistoryControllerV3(source, max_step_scale=5.0)
+        _, decision = minimum.propose(.75, observation(float("inf")))
+        self.assertEqual(decision["action"], "minimum_step_hold")
+        self.assertEqual(decision["recovery_remaining"], 0)
+
+        capped = _MOD.AdaptiveHistoryControllerV3(source, max_step_scale=5.0)
+        capped.step_scale = 4.0
+        _, decision = capped.propose(.75, observation(.01, previous_scale=4.0))
+        self.assertEqual(decision["action"], "capped")
+        self.assertEqual(decision["step_scale"], 5.0)
+
+        audio = _MOD.AdaptiveHistoryControllerV3(source, max_step_scale=5.0)
+        audio.step_scale = 4.0
+        _, decision = audio.propose(.75, observation(.01, 2.0, 4.0))
+        self.assertEqual(decision["action"], "capped")
+        self.assertFalse(decision["audio_emergency"])
+        self.assertEqual(decision["step_scale"], 5.0)
+
+        audio_nonfinite = _MOD.AdaptiveHistoryControllerV3(source, max_step_scale=5.0)
+        audio_nonfinite.step_scale = 4.0
+        _, decision = audio_nonfinite.propose(
+            .75, observation(.01, float("inf"), previous_scale=4.0)
+        )
+        self.assertEqual(decision["action"], "capped")
+        self.assertFalse(decision["audio_emergency"])
+
+        critical = _MOD.AdaptiveHistoryControllerV3(source, max_step_scale=5.0)
+        critical.step_scale = 4.0
+        _, first = critical.propose(.75, observation(1.30, previous_scale=4.0))
+        _, recovery = critical.propose(.70, observation(.01))
+        _, resumed = critical.propose(.65, observation(.01))
+        self.assertEqual(first["action"], "critical_recovery")
+        self.assertEqual(recovery["action"], "forced_recovery")
+        self.assertEqual(recovery["step_scale"], 1.0)
+        self.assertEqual(resumed["action"], "grow")
+
+        terminal = _MOD.AdaptiveHistoryControllerV3(source, max_step_scale=10.0)
+        self.assertEqual(terminal.constants["protected_tail"], ())
+        terminal.step_scale = 10.0
+        _, decision = terminal.propose(float(source[16]), observation(.01, previous_scale=10.0))
+        self.assertEqual(decision["next_sigma"], 0.0)
+        self.assertEqual(decision["action"], "capped")
+
+    def test_embedded_defect_is_monotonic_and_tolerance_selects_interval(self):
+        values = torch.exp(-torch.linspace(0.0, 2.0, 20))
+        source = torch.cat((values, torch.zeros(1)))
+        shapes = [torch.Size((1, 1, 2)), torch.Size((1, 1, 2))]
+        controller = _MOD.AdaptiveEmbeddedRESController(
+            source, shapes, max_step_scale=10.0, video_tolerance=.05,
+            safety_factor=.8, max_growth_ratio=10.0,
+        )
+        h_previous = -math.log(float(source[1])) + math.log(float(source[0]))
+        controller.previous_accepted_h = h_previous
+        defects = [controller.embedded_defect(h, h_previous, .2, 1.0)
+                   for h in (.01, .05, .1, .2, .4)]
+        self.assertTrue(all(a < b for a, b in zip(defects, defects[1:])))
+
+        observation = _MOD.AnchorObservation(
+            float(source[1]), 1, None, None, None, None, None, None,
+            video_x0_difference_rms=.2, audio_x0_difference_rms=.4,
+        )
+        next_sigma, decision = controller.propose(
+            float(source[1]), observation,
+            current_x=torch.ones(1, 1, 4), current_x0=torch.ones(1, 1, 4),
+        )
+        self.assertEqual(decision["clamp_selected"], "tolerance")
+        self.assertAlmostEqual(
+            controller.embedded_defect(
+                decision["tolerance_solution_h"], h_previous, .2, 1.0
+            ), .05, places=6,
+        )
+        self.assertAlmostEqual(
+            decision["accepted_h"], decision["tolerance_solution_h"] * .8, places=7
+        )
+        self.assertLess(decision["defect_at_accepted_h"], .05)
+        self.assertGreater(next_sigma, float(source[19]))
+        self.assertLess(next_sigma, float(source[1]))
+
+    def test_embedded_clamps_and_audio_is_diagnostic_only(self):
+        values = torch.exp(-torch.linspace(0.0, 2.0, 20))
+        source = torch.cat((values, torch.zeros(1)))
+        shapes = [torch.Size((1, 1, 2)), torch.Size((1, 1, 2))]
+        h_previous = -math.log(float(source[1])) + math.log(float(source[0]))
+
+        def propose(index, *, max_scale, growth, video=.1, audio=.1):
+            controller = _MOD.AdaptiveEmbeddedRESController(
+                source, shapes, max_step_scale=max_scale, video_tolerance=100.0,
+                safety_factor=1.0, max_growth_ratio=growth,
+            )
+            controller.previous_accepted_h = h_previous
+            observation = _MOD.AnchorObservation(
+                float(source[index]), index, None, None, None, None, None, None,
+                video_x0_difference_rms=video, audio_x0_difference_rms=audio,
+            )
+            _, decision = controller.propose(
+                float(source[index]), observation,
+                current_x=torch.ones(1, 1, 4), current_x0=torch.ones(1, 1, 4),
+            )
+            return decision
+
+        absolute = propose(5, max_scale=1.0, growth=100.0)
+        self.assertEqual(absolute["clamp_selected"], "absolute")
+        self.assertAlmostEqual(absolute["step_scale"], 1.0, places=6)
+        growth = propose(5, max_scale=100.0, growth=1.5)
+        self.assertEqual(growth["clamp_selected"], "growth")
+        self.assertAlmostEqual(growth["growth_ratio"], 1.5, places=6)
+        terminal = propose(18, max_scale=100.0, growth=100.0)
+        self.assertEqual(terminal["clamp_selected"], "terminal_floor")
+        self.assertAlmostEqual(terminal["next_sigma"], float(source[19]), places=7)
+
+        quiet_audio = propose(5, max_scale=10.0, growth=10.0, audio=.01)
+        loud_audio = propose(5, max_scale=10.0, growth=10.0, audio=100.0)
+        self.assertAlmostEqual(quiet_audio["accepted_h"], loud_audio["accepted_h"], places=12)
+        self.assertGreater(loud_audio["audio_defect_at_accepted_h"],
+                           quiet_audio["audio_defect_at_accepted_h"])
+
+    def test_embedded_bootstraps_once_and_terminal_zero_is_special(self):
+        values = torch.exp(-torch.linspace(0.0, 2.0, 20))
+        source = torch.cat((values, torch.zeros(1)))
+        controller = _MOD.AdaptiveEmbeddedRESController(source)
+        next_sigma, first = controller.propose(float(source[0]))
+        self.assertEqual(first["reason"], "bootstrap")
+        self.assertAlmostEqual(next_sigma, float(source[1]))
+        next_sigma, terminal = controller.propose(float(source[19]))
+        self.assertEqual(next_sigma, 0.0)
+        self.assertEqual(terminal["reason"], "terminal_zero")
+        self.assertEqual(controller.constants["protected_tail"], ())
+
 
 if __name__ == "__main__":
     unittest.main()

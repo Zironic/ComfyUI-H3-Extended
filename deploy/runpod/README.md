@@ -25,7 +25,7 @@ Recommended first smoke-test configuration:
 - execution timeout: 7200 seconds
 - network volume: none
 - Cached Model: `Comfy-Org/MiniMax-H3`
-- Hybrid Sparse Attention: disabled for the first smoke test
+- Hybrid Sparse Attention: enabled by the submitted workflow
 
 The endpoint must use a RunPod `worker-comfyui` base image that contains `/start.sh`, `/opt/venv`, `uv`, `git`, and `wget`. The deployment currently targets the `5.8.6` worker layout.
 
@@ -90,7 +90,7 @@ The exact filenames are deployment policy, not an H3 core requirement. Update `M
 
 ## Input assets
 
-Large reference images, audio, and video are not embedded in the RunPod JSON request. Put them in HTTP-accessible object storage and submit signed URLs.
+Input files are embedded directly in the RunPod request as base64. No object storage or signed URL is required.
 
 Request schema:
 
@@ -101,14 +101,15 @@ Request schema:
     "assets": [
       {
         "name": "reference.mp4",
-        "url": "https://signed.example/reference.mp4"
+        "content_type": "video/mp4",
+        "base64": "AAAA..."
       }
     ]
   }
 }
 ```
 
-The handler downloads each asset into:
+The handler decodes each asset into:
 
 ```text
 /comfyui/input/runpod/<job_id>/<name>
@@ -141,16 +142,7 @@ The stock RunPod Comfy handler only treats image outputs specially. `handler.py`
 
 This allows MP4, WAV, PNG, JSON diagnostics, sparse-attention reports, and similar artifacts to be returned from the same job.
 
-Configure RunPod's S3-compatible bucket environment variables supported by the RunPod SDK:
-
-```text
-BUCKET_ENDPOINT_URL
-BUCKET_ACCESS_KEY_ID
-BUCKET_SECRET_ACCESS_KEY
-BUCKET_NAME        # optional; otherwise RunPod's helper uses its default bucket naming behavior
-```
-
-The handler uses `runpod.serverless.utils.rp_upload.upload_file_to_bucket`, which performs multipart upload for arbitrary files and returns a presigned URL.
+Artifacts are returned inline as base64 and decoded by `run_h3.py`. RunPod currently limits `/runsync` payloads to 20 MB, so this transport is intended for reference files and outputs that remain comfortably below that limit after base64 and JSON overhead. The client rejects encoded requests above 19 MB, and the handler applies the same guard to its result.
 
 A successful result has the form:
 
@@ -163,9 +155,9 @@ A successful result has the form:
   "artifacts": [
     {
       "name": "result_00001.mp4",
-      "bytes": 12345678,
+      "bytes": 3456789,
       "content_type": "video/mp4",
-      "url": "https://..."
+      "base64": "AAAA..."
     }
   ]
 }
@@ -173,12 +165,20 @@ A successful result has the form:
 
 ## Submit a job
 
-Export the Comfy workflow in API format, then run:
+Export the Comfy workflow in API format, then pass that export directly to `run_h3.py`:
 
 ```bash
-python deploy/runpod/submit_job.py workflow_api.json \
-  --endpoint "$RUNPOD_ENDPOINT_ID" \
-  --asset reference.mp4="https://signed.example/reference.mp4"
+python deploy/runpod/run_h3.py workflow_api_export.json
+```
+
+The runner normalizes the workflow in memory. It keeps `MiniMaxH3HybridSparseAttentionZi` enabled, replaces the custom preview sampler with core `SamplerCustomAdvanced`, bypasses `ZiroScaleImageToNativeCanvas`, and selects the cached-model filenames. Starting at each connected `SaveVideo`, it walks upstream and automatically collects saved files from connected core `LoadImage`, `LoadImageMask`, `LoadAudio`, and `LoadVideo` nodes. Disconnected loaders are ignored.
+
+When the workflow lives under the normal `ComfyUI/User/.../workflows` directory, the local `ComfyUI/Input` directory is inferred. Otherwise set `COMFY_INPUT_DIR` or pass `--input-root`. `--input [NAME=]PATH` remains available only to override an automatically discovered asset.
+
+To inspect or save the normalized workflow without submitting it, use:
+
+```bash
+python deploy/runpod/prepare_workflow.py workflow_api_export.json workflow_runpod.json
 ```
 
 Credentials can be supplied with environment variables:
@@ -188,11 +188,11 @@ RUNPOD_API_KEY
 RUNPOD_ENDPOINT_ID
 ```
 
-`submit_job.py` uses RunPod's asynchronous `/run` API and polls the job until it reaches a terminal state. The default requested execution timeout is two hours.
+`run_h3.py` uses `/runsync` with the maximum five-minute wait, then polls the returned job ID when inference takes longer. It decodes returned artifacts into `runpod-output` by default. `submit_job.py` remains as a compatibility entry point for the same client.
 
 ## First smoke test
 
-Do not test the custom SM89 Sparse Sage path at the same time as the serverless deployment plumbing. Start with a known-good dense or ordinary Sage H3 workflow on the RTX 6000 Ada.
+Keep `MiniMaxH3HybridSparseAttentionZi` enabled in the target workflow. GPU portability is owned by that H3 node; the deployment bootstrap does not install or gate a GPU-specific Sparse Sage package.
 
 The first test should establish, in order:
 
@@ -203,16 +203,13 @@ The first test should establish, in order:
 5. an API workflow validates,
 6. H3 runs on the 48 GB worker,
 7. MP4/audio output is produced,
-8. the artifact uploads to object storage,
+8. the MP4 is returned inline and decoded locally,
 9. the worker scales back to zero.
-
-After that works, install a precompiled SM89 `spas_sage_attn` wheel or move that dependency to a dedicated image revision and test `MiniMaxH3HybridSparseAttentionZi` separately.
 
 ## Current limitations
 
 - No automatic workflow conversion is performed. Submit ComfyUI API-format JSON.
-- Asset URLs must be HTTP(S) URLs accessible from the worker.
-- Input assets are downloaded serially. This is intentional for the first implementation and can be parallelized later.
+- Inline requests and results must remain below RunPod's payload limits after base64 expansion.
 - The handler assumes a single ComfyUI process on `127.0.0.1:8188`, matching RunPod's stock worker architecture.
 - Cached-model file discovery is filename-based and deliberately fails on duplicate matches.
 - The branch has not yet been exercised on a live RunPod endpoint; the first live run is the validation step.

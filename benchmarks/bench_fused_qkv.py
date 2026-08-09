@@ -45,7 +45,7 @@ from h3_attention.hybrid.router import KV_TILE, Q_TILE, SparseTileRouter  # noqa
 from h3_attention.hybrid.sparse_quant import _run as quantize_blocks  # noqa: E402
 from h3_attention.hybrid.sparse_sage import (  # noqa: E402
     SparseSageExecutor,
-    load_sparse_sage_api,
+    load_sparse_sage_spec,
     preflight_sparse_sage,
 )
 from h3_probe.layout import TokenLayout  # noqa: E402
@@ -99,7 +99,7 @@ def sparse_sage_carrier_tensors(prepared):
     return (
         prepared.q_int8,
         prepared.k_int8,
-        prepared.v_fp8,
+        prepared.v_carrier,
         prepared.lut,
         prepared.valid_block_num,
         prepared.pv_threshold,
@@ -176,14 +176,14 @@ def benchmark_sparse_sage_compile(prepared, executor, warmup, iterations, device
                 "fused_qkv_projection",
                 "direct_lut_construction",
                 "q_k_int8_quantization",
-                "v_fp8_preparation",
+                "v_preparation",
             ],
         },
         "excluded_stages": [
             "fused_qkv_projection",
             "direct_lut_construction",
             "q_k_int8_quantization",
-            "v_fp8_preparation",
+            "v_preparation",
         ],
         "op_identity": sparse_sage_op_identity(kernel),
         "eager": eager,
@@ -524,7 +524,7 @@ def verify_attention(module, x, rope, block_index):
         dtype=torch.int32,
         device=x.device,
     )
-    executor = SparseSageExecutor(load_sparse_sage_api())
+    executor = SparseSageExecutor(load_sparse_sage_spec())
 
     q, k, v = project_qkv(module, x, rope)
     q, k, v = to_hnd(q, k, v)
@@ -579,7 +579,7 @@ def run_routed_geometry(args, checkpoint, module, hidden, prefix, sequence, layo
             timing=True,
             run_tag="bench_fused_qkv_established",
         ),
-        api=api,
+        kernel_spec=api,
         router=router,
     )
     fused = HybridSparseBackend(
@@ -589,7 +589,7 @@ def run_routed_geometry(args, checkpoint, module, hidden, prefix, sequence, layo
             timing=True,
             run_tag="bench_fused_qkv_fused",
         ),
-        api=api,
+        kernel_spec=api,
         router=router,
     )
     generator = torch.Generator(device=device).manual_seed(args.seed)
@@ -613,7 +613,7 @@ def run_routed_geometry(args, checkpoint, module, hidden, prefix, sequence, layo
                 timing=False,
                 run_tag="bench_fused_qkv_sparse_sage_compile",
             ),
-            api=api,
+            kernel_spec=api,
             router=router,
         )
         carrier = _prepare_sparse_sage_carrier(
@@ -637,7 +637,7 @@ def run_routed_geometry(args, checkpoint, module, hidden, prefix, sequence, layo
                 timing=True,
                 run_tag="bench_fused_qkv_compiled",
             ),
-            api=api,
+            kernel_spec=api,
             router=router,
         )
         compiled.projector = FusedQKVProjector(compiled_core)
@@ -653,12 +653,12 @@ def run_routed_geometry(args, checkpoint, module, hidden, prefix, sequence, layo
     # One untimed comparison uses the same real production backend contracts.
     compare_established = HybridSparseBackend(
         HybridSparseConfig(mode=MODE_SAGE128, video_budget=args.video_budget, timing=False),
-        api=api, router=router,
+        kernel_spec=api, router=router,
     )
     compare_fused = HybridSparseBackend(
         HybridSparseConfig(mode=MODE_SAGE128_FUSED_QKV,
                            video_budget=args.video_budget, timing=False),
-        api=api, router=router,
+        kernel_spec=api, router=router,
     )
     compare_established.timing.begin_request(2001, cuda=True)
     compare_fused.timing.begin_request(2002, cuda=True)
@@ -682,7 +682,7 @@ def run_routed_geometry(args, checkpoint, module, hidden, prefix, sequence, layo
                 video_budget=args.video_budget,
                 timing=False,
             ),
-            api=api,
+            kernel_spec=api,
             router=router,
             projector=FusedQKVProjector(compiled_core),
         )

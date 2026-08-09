@@ -6,6 +6,9 @@ from comfy_api.latest import ComfyExtension, io
 from .config import (
     DEFAULT_MAX_EXTRAPOLATION_RATIO,
     DEFAULT_MAX_ADAPTIVE_STEP_SCALE,
+    DEFAULT_EMBEDDED_VIDEO_TOLERANCE,
+    DEFAULT_ADAPTIVE_SAFETY_FACTOR,
+    DEFAULT_MAX_ADAPTIVE_GROWTH_RATIO,
     CONDITIONING_MODES,
     DIAGNOSTICS,
     EVALUATION_PROFILES,
@@ -47,7 +50,7 @@ class MiniMaxH3VectorAccelSampler(io.ComfyNode):
                     options=list(EVALUATION_PROFILES),
                     default="full_20",
                     display_name="actual-evaluation schedule",
-                    tooltip="Select full_20, a named reduced schedule, or adaptive_history_v1/v2. Adaptive history schedules are causal and require res_multistep.",
+                    tooltip="Select full_20, a named reduced schedule, or adaptive_history_v1/v2/v3. Adaptive history schedules are causal and require res_multistep.",
                 ),
                 io.Combo.Input(
                     "diagnostics",
@@ -116,6 +119,12 @@ class MiniMaxH3VectorAccelSampler(io.ComfyNode):
                     tooltip="Adaptive RES only. Caps causal low-change spacing growth.",
                     advanced=True,
                 ),
+                io.Float.Input("embedded_video_tolerance", default=DEFAULT_EMBEDDED_VIDEO_TOLERANCE,
+                               min=0.0001, max=10.0, step=0.01, round=False, advanced=True),
+                io.Float.Input("adaptive_safety_factor", default=DEFAULT_ADAPTIVE_SAFETY_FACTOR,
+                               min=0.01, max=1.0, step=0.01, round=False, advanced=True),
+                io.Float.Input("max_adaptive_growth_ratio", default=DEFAULT_MAX_ADAPTIVE_GROWTH_RATIO,
+                               min=1.0, max=10.0, step=0.1, round=False, advanced=True),
             ],
             outputs=[io.Sampler.Output()],
         )
@@ -126,7 +135,10 @@ class MiniMaxH3VectorAccelSampler(io.ComfyNode):
                 max_extrapolation_ratio=DEFAULT_MAX_EXTRAPOLATION_RATIO,
                 policy="fixed", quality_preset="balanced",
                 repairability_profile="", conditioning_mode="default",
-                max_adaptive_step_scale=DEFAULT_MAX_ADAPTIVE_STEP_SCALE):
+                max_adaptive_step_scale=DEFAULT_MAX_ADAPTIVE_STEP_SCALE,
+                embedded_video_tolerance=DEFAULT_EMBEDDED_VIDEO_TOLERANCE,
+                adaptive_safety_factor=DEFAULT_ADAPTIVE_SAFETY_FACTOR,
+                max_adaptive_growth_ratio=DEFAULT_MAX_ADAPTIVE_GROWTH_RATIO):
         config = SamplerConfig(
             method=method,
             evaluation_profile=evaluation_profile,
@@ -134,6 +146,9 @@ class MiniMaxH3VectorAccelSampler(io.ComfyNode):
             fallback_on_guard=fallback_on_guard,
             max_extrapolation_ratio=max_extrapolation_ratio,
             max_adaptive_step_scale=max_adaptive_step_scale,
+            embedded_video_tolerance=embedded_video_tolerance,
+            adaptive_safety_factor=adaptive_safety_factor,
+            max_adaptive_growth_ratio=max_adaptive_growth_ratio,
             policy=policy,
             quality_preset=quality_preset,
             repairability_profile=repairability_profile or None,

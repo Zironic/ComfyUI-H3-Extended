@@ -1,6 +1,7 @@
 """CPU tests for the read-only vector-run analyzer."""
 
 import json
+import math
 import os
 from pathlib import Path
 import sys
@@ -122,6 +123,121 @@ class AnalyzeVectorRunsTests(unittest.TestCase):
         self.assertTrue(check_invariants(data)["pass"])
         data["anchors"][-2]["source_index"] = 17
         self.assertFalse(check_invariants(data)["checks"]["adaptive_source_anchors"])
+
+    def test_v3_analyzer_exposes_interval_residuals_and_action(self):
+        with tempfile.TemporaryDirectory() as root:
+            residuals = {
+                "video_v_error": .01, "video_x0_error": .02, "video_error": .02,
+                "audio_v_error": .03, "audio_x0_error": .04, "audio_error": .04,
+                "video_error_ratio": .5, "audio_error_ratio": .8,
+            }
+            path = _run(
+                root,
+                evaluation_profile="adaptive_history_v3",
+                adaptive_decisions=[{
+                    "sigma": .8, "next_sigma": .6, "reason": "moderate_residual_hold",
+                    "action": "hold", "step_scale": 2.0,
+                    "previous_step_scale": 2.0, "actual_delta_t": .25,
+                    "reference_video_error": .04, "video_error_ratio": .5,
+                    "reference_audio_error": .05, "audio_error_ratio": .8,
+                    "residuals": residuals,
+                }],
+                anchors=[{
+                    "actual": True, "source_index": 3, "step": 3, "sigma": .8,
+                    "previous_step_scale": 2.0, "actual_delta_t": .25,
+                    "action": "hold", "trajectory_metrics": {"residuals": residuals},
+                }],
+                controller_constants={"bootstrap_anchors": 3, "reference_anchors": 0},
+            )
+            row = summarize(path)["decisions"][0]
+            self.assertEqual(row["previous_step_scale"], 2.0)
+            self.assertEqual(row["actual_delta_t"], .25)
+            self.assertEqual(row["video_v_error"], .01)
+            self.assertEqual(row["video_x0_error"], .02)
+            self.assertEqual(row["video_error"], .02)
+            self.assertEqual(row["reference_video_error"], .04)
+            self.assertEqual(row["video_error_ratio"], .5)
+            self.assertEqual(row["audio_v_error"], .03)
+            self.assertEqual(row["audio_x0_error"], .04)
+            self.assertEqual(row["audio_error"], .04)
+            self.assertEqual(row["reference_audio_error"], .05)
+            self.assertEqual(row["audio_error_ratio"], .8)
+            self.assertEqual(row["action"], "hold")
+
+    def test_v3_invariants_do_not_require_tail_anchors(self):
+        source = [1.0 - index * .04 for index in range(20)] + [0.0]
+        anchors = [
+            {"actual": True, "source_index": index} for index in (0, 1, 2)
+        ] + [{"actual": True, "source_index": None}]
+        data = {
+            "evaluation_profile": "adaptive_history_v3",
+            "true_nfe": len(anchors), "forecast_count": 0, "fallback_count": 0,
+            "source_sigma_sequence": source,
+            "effective_sigma_sequence": source[:3] + [.7, 0.0],
+            "steps": [{"forecast": False}] * len(anchors),
+            "anchors": anchors,
+        }
+        self.assertTrue(check_invariants(data)["pass"])
+
+    def test_embedded_analyzer_requires_terminal_floor_and_exposes_defect(self):
+        source = [1.0 - index * .03 for index in range(20)] + [0.0]
+        with tempfile.TemporaryDirectory() as root:
+            decision = {
+                "sigma": .8, "next_sigma": source[19], "source_index": None,
+                "step_scale": 3.0, "reason": "embedded_res", "action": "accept",
+                "tolerance_solution_h": .5, "safety_adjusted_h": .4,
+                "accepted_h": .3, "previous_accepted_h": .1, "growth_ratio": 3.0,
+                "defect_at_accepted_h": .03, "audio_defect_at_accepted_h": 4.0,
+                "video_x0_difference_rms": .2, "audio_x0_difference_rms": 20.0,
+                "video_normalization_scale": 1.5, "audio_normalization_scale": 2.5,
+                "clamp_selected": "terminal_floor",
+            }
+            path = _run(
+                root, evaluation_profile="adaptive_embedded_res_v1", true_nfe=3,
+                source_sigma_sequence=source,
+                effective_sigma_sequence=[source[0], .8, source[19], 0.0],
+                steps=[{"forecast": False}] * 3,
+                anchors=[
+                    {"actual": True, "source_index": 0},
+                    {"actual": True, "source_index": None, "trajectory_metrics": {}},
+                    {"actual": True, "source_index": 19},
+                ],
+                adaptive_decisions=[decision],
+                controller_constants={"bootstrap_intervals": 1},
+            )
+            summary = summarize(path)
+            self.assertTrue(summary["invariants"]["pass"])
+            row = summary["decisions"][0]
+            self.assertEqual(row["accepted_h"], .3)
+            self.assertEqual(row["defect_at_accepted_h"], .03)
+            self.assertEqual(row["audio_defect_at_accepted_h"], 4.0)
+            self.assertEqual(row["clamp_selected"], "terminal_floor")
+
+            data = json.loads(path.read_text(encoding="utf-8"))
+            data["anchors"][-1]["source_index"] = 18
+            self.assertFalse(check_invariants(data)["checks"]["adaptive_source_anchors"])
+
+    def test_analyzer_reconstructs_old_v2_interval_fields(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = _run(
+                root,
+                evaluation_profile="adaptive_history_v2",
+                adaptive_decisions=[
+                    {"sigma": 1.0, "next_sigma": .8, "step_scale": 1.5},
+                    {"sigma": .8, "next_sigma": .5, "step_scale": 2.25},
+                ],
+                anchors=[
+                    {"actual": True, "sigma": 1.0, "trajectory_metrics": {}},
+                    {"actual": True, "sigma": .8, "trajectory_metrics": {
+                        "video_change": .35, "video_x0_change": .28,
+                    }},
+                ],
+            )
+            row = summarize(path)["decisions"][1]
+            self.assertAlmostEqual(row["actual_delta_t"], math.log(1.0 / .8))
+            self.assertEqual(row["previous_step_scale"], 1.5)
+            self.assertEqual(row["video_velocity_change"], .35)
+            self.assertEqual(row["video_x0_change"], .28)
 
     def test_comparison_is_explicit_and_raw(self):
         result = compare_runs({"run_id": "a", "true_nfe": 12, "wall_seconds": 90},

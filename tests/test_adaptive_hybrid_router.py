@@ -10,6 +10,11 @@ import torch.nn.functional as F
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(_HERE))
+sys.path.insert(0, os.path.abspath(os.path.join(_HERE, "..", "..", "..")))
+
+sys.argv = [sys.argv[0], "--cpu"]
+import comfy.options  # noqa: E402
+comfy.options.enable_args_parsing()
 
 from h3_attention.hybrid.config import (  # noqa: E402
     DENSITY_ADAPTIVE_BUDGET,

@@ -9,7 +9,7 @@ import torch
 from comfy.utils import model_trange as trange
 from comfy.k_diffusion.sampling import sample_euler, sample_res_multistep
 
-from .config import CORE_SOLVER_METHODS, PREDICTOR_METHODS, SamplerConfig
+from .config import ADAPTIVE_PROFILES, CORE_SOLVER_METHODS, PREDICTOR_METHODS, SamplerConfig
 from .diagnostics import RunDiagnostics, callback_metadata_scope
 from .fingerprint import (
     configuration_fingerprint,
@@ -20,7 +20,13 @@ from .fingerprint import (
 from .policy import make_policy
 from .predictor import make_predictor
 from .repairability import ProfileCompatibility, RepairabilityProfile
-from .adaptive_res import AdaptiveHistoryController, AdaptiveHistoryControllerV2, IncrementalRES
+from .adaptive_res import (
+    AdaptiveHistoryController,
+    AdaptiveHistoryControllerV2,
+    AdaptiveHistoryControllerV3,
+    AdaptiveEmbeddedRESController,
+    IncrementalRES,
+)
 
 
 @dataclass(frozen=True)
@@ -249,18 +255,22 @@ def _adaptive_source_coordinate(controller, sigma):
 
 
 def _adaptive_estimated_total_nfe(controller, current_nfe, next_sigma):
-    """Estimate total genuine calls from the current scale and protected tail."""
+    """Estimate total genuine calls from the current scale and terminal policy."""
     if next_sigma <= 0.0:
         return current_nfe
     next_coordinate = _adaptive_source_coordinate(controller, next_sigma)
     tail = controller.constants["protected_tail"]
-    tail_start = tail[0]
-    if next_coordinate < tail_start:
+    if not tail:
         scale = max(controller.constants["step_scale_min"], controller.step_scale)
-        intermediate = max(1, math.ceil((tail_start - next_coordinate) / scale))
-        remaining = intermediate + len(tail)
+        remaining = max(1, math.ceil((len(controller.source) - 1 - next_coordinate) / scale))
     else:
-        remaining = sum(index + 1e-6 >= next_coordinate for index in tail)
+        tail_start = tail[0]
+        if next_coordinate < tail_start:
+            scale = max(controller.constants["step_scale_min"], controller.step_scale)
+            intermediate = max(1, math.ceil((tail_start - next_coordinate) / scale))
+            remaining = intermediate + len(tail)
+        else:
+            remaining = sum(index + 1e-6 >= next_coordinate for index in tail)
     return min(controller.max_nfe, current_nfe + remaining)
 
 
@@ -281,10 +291,14 @@ def _log_adaptive_v2_progress(controller, current_nfe, sigma, next_sigma, decisi
     logging.info(
         "[H3 Adaptive RES v2] NFE %d/~%d (est. compute %.0f%%) | "
         "schedule %.2f/%d (%.0f%%) -> %.2f | scale %.2fx | %s | "
+        "delta_t=%s | video raw v=%s x0=%s | "
         "video rate v=%s x0=%s combined=%s ref=%s ratio=%s",
         current_nfe, estimated_total, current_nfe / max(1, estimated_total) * 100.0,
         current_coordinate, schedule_steps, current_coordinate / schedule_steps * 100.0,
         next_coordinate, decision["step_scale"], decision["reason"],
+        _adaptive_metric(observation.actual_delta_t),
+        _adaptive_metric(observation.video_change),
+        _adaptive_metric(observation.video_x0_change),
         _adaptive_metric(observation.video_velocity_rate),
         _adaptive_metric(observation.video_x0_rate),
         _adaptive_metric(observation.video_rate),
@@ -292,16 +306,68 @@ def _log_adaptive_v2_progress(controller, current_nfe, sigma, next_sigma, decisi
     )
 
 
+def _log_adaptive_v3_progress(controller, current_nfe, sigma, next_sigma, decision):
+    current_coordinate = _adaptive_source_coordinate(controller, sigma)
+    next_coordinate = _adaptive_source_coordinate(controller, next_sigma)
+    estimated_total = _adaptive_estimated_total_nfe(controller, current_nfe, next_sigma)
+    schedule_steps = len(controller.source) - 1
+    residuals = decision.get("residuals") or {}
+    logging.info(
+        "[H3 Adaptive RES v3] NFE %d/~%d (est. compute %.0f%%) | "
+        "schedule %.2f/%d (%.0f%%) -> %.2f | previous scale=%s delta_t=%s | "
+        "error video v=%s x0=%s max=%s ref=%s ratio=%s | "
+        "audio v=%s x0=%s max=%s ref=%s ratio=%s | "
+        "action=%s next scale=%.2fx",
+        current_nfe, estimated_total, current_nfe / max(1, estimated_total) * 100.0,
+        current_coordinate, schedule_steps, current_coordinate / schedule_steps * 100.0,
+        next_coordinate,
+        _adaptive_metric(decision.get("previous_step_scale")),
+        _adaptive_metric(decision.get("actual_delta_t")),
+        _adaptive_metric(residuals.get("video_v_error")),
+        _adaptive_metric(residuals.get("video_x0_error")),
+        _adaptive_metric(residuals.get("video_error")),
+        _adaptive_metric(decision.get("reference_video_error")),
+        _adaptive_metric(decision.get("video_error_ratio")),
+        _adaptive_metric(residuals.get("audio_v_error")),
+        _adaptive_metric(residuals.get("audio_x0_error")),
+        _adaptive_metric(residuals.get("audio_error")),
+        _adaptive_metric(decision.get("reference_audio_error")),
+        _adaptive_metric(decision.get("audio_error_ratio")),
+        decision.get("action"), decision["step_scale"],
+    )
+
+
+def _log_embedded_progress(controller, current_nfe, sigma, next_sigma, decision):
+    current_coordinate = _adaptive_source_coordinate(controller, sigma)
+    next_coordinate = _adaptive_source_coordinate(controller, next_sigma)
+    estimated_total = _adaptive_estimated_total_nfe(controller, current_nfe, next_sigma)
+    schedule_steps = len(controller.source) - 1
+    logging.info("[H3 Adaptive RES embedded v1] NFE %d/~%d (est. compute %.0f%%) | "
+                 "schedule %.2f/%d (%.0f%%) -> %.2f | h=%s defect=%s tol=%s clamp=%s",
+                 current_nfe, estimated_total, current_nfe / max(1, estimated_total) * 100.0,
+                 current_coordinate, schedule_steps, current_coordinate / schedule_steps * 100.0,
+                 next_coordinate,
+                 _adaptive_metric(decision.get("accepted_h")),
+                 _adaptive_metric(decision.get("defect_at_accepted_h")),
+                 _adaptive_metric(decision.get("video_tolerance")), decision.get("clamp_selected"))
+
+
 def _sample_adaptive_res(model, x, source_sigmas, extra_args, callback, disable, config,
                          diagnostics, context):
     """Run causal adaptive RES with one genuine model call per accepted anchor."""
     source = source_sigmas.detach().cpu().tolist()
     source_hash = sigma_hash(source_sigmas)
-    controller_class = (AdaptiveHistoryControllerV2
-                        if config.evaluation_profile == "adaptive_history_v2"
+    controller_class = (AdaptiveEmbeddedRESController if config.evaluation_profile == "adaptive_embedded_res_v1"
+                        else AdaptiveHistoryControllerV3 if config.evaluation_profile == "adaptive_history_v3"
+                        else AdaptiveHistoryControllerV2 if config.evaluation_profile == "adaptive_history_v2"
                         else AdaptiveHistoryController)
-    controller = controller_class(source, latent_shapes=context.latent_shapes,
-                                  max_step_scale=config.max_adaptive_step_scale)
+    controller_kwargs = {"latent_shapes": context.latent_shapes,
+                         "max_step_scale": config.max_adaptive_step_scale}
+    if config.evaluation_profile == "adaptive_embedded_res_v1":
+        controller_kwargs.update(video_tolerance=config.embedded_video_tolerance,
+                                safety_factor=config.adaptive_safety_factor,
+                                max_growth_ratio=config.max_adaptive_growth_ratio)
+    controller = controller_class(source, **controller_kwargs)
     stepper = IncrementalRES()
     timed_model = _TimedModel(model)
     diagnostics = diagnostics or RunDiagnostics(config=config, latent_shapes=context.latent_shapes,
@@ -330,28 +396,81 @@ def _sample_adaptive_res(model, x, source_sigmas, extra_args, callback, disable,
             sigma, derivative, denoised,
             prev_derivative, prev_denoised, prev_sigma,
         )
-        sigma_next_value, decision = controller.propose(sigma, observation)
+        if config.evaluation_profile == "adaptive_embedded_res_v1":
+            sigma_next_value, decision = controller.propose(
+                sigma, observation, current_x=x, current_x0=denoised
+            )
+        else:
+            sigma_next_value, decision = controller.propose(sigma, observation)
         decisions.append(decision)
         current_source = controller._source_index(_scalar_sigma(sigma))
-        tail_start = controller.constants["protected_tail"][0]
-        tail_count = len(controller.constants["protected_tail"])
-        if (len(effective) >= controller.max_nfe - tail_count and
-                (current_source is None or current_source < tail_start)):
-            sigma_next_value = source[tail_start]
-            decision = dict(
-                decision,
-                reason="reserve_protected_tail",
-                next_sigma=sigma_next_value,
-                proposed_interval_t=-math.log(sigma_next_value) + math.log(_scalar_sigma(sigma)),
-                protected_region="tail",
-            )
-            decisions[-1] = decision
+        tail = controller.constants["protected_tail"]
+        if tail:
+            tail_start = tail[0]
+            tail_count = len(tail)
+            if (len(effective) >= controller.max_nfe - tail_count and
+                    (current_source is None or current_source < tail_start)):
+                sigma_next_value = source[tail_start]
+                decision = dict(
+                    decision,
+                    reason="reserve_protected_tail",
+                    next_sigma=sigma_next_value,
+                    proposed_interval_t=-math.log(sigma_next_value) + math.log(_scalar_sigma(sigma)),
+                    protected_region="tail",
+                )
+                decisions[-1] = decision
+        elif (len(effective) >= (controller.max_nfe - 1 if config.evaluation_profile == "adaptive_embedded_res_v1" else controller.max_nfe)
+              and sigma_next_value > 0.0):
+            if config.evaluation_profile == "adaptive_embedded_res_v1":
+                sigma_next_value = source[controller.constants["terminal_positive_index"]]
+                accepted_h = -math.log(sigma_next_value) + math.log(_scalar_sigma(sigma))
+                previous_h = decision.get("previous_accepted_h")
+                video_defect = (
+                    controller.embedded_defect(
+                        accepted_h, previous_h,
+                        decision.get("video_x0_difference_rms"),
+                        decision.get("video_normalization_scale"),
+                    ) if previous_h and decision.get("video_x0_difference_rms") is not None else None
+                )
+                audio_defect = (
+                    controller.embedded_defect(
+                        accepted_h, previous_h,
+                        decision.get("audio_x0_difference_rms"),
+                        decision.get("audio_normalization_scale"),
+                    ) if previous_h and decision.get("audio_x0_difference_rms") is not None and
+                    decision.get("audio_normalization_scale") else None
+                )
+                decision = dict(decision, action="terminal_floor", reason="max_nfe_terminal_floor",
+                                next_sigma=sigma_next_value, clamp_selected="terminal_floor",
+                                proposed_interval_t=accepted_h, accepted_h=accepted_h,
+                                step_scale=accepted_h / max(decision.get("local_base_interval") or 0.0, 1e-8),
+                                growth_ratio=accepted_h / previous_h if previous_h else None,
+                                defect_at_accepted_h=video_defect,
+                                audio_defect_at_accepted_h=audio_defect,
+                                protected_region="terminal_floor")
+                controller.previous_accepted_h = accepted_h
+                controller.step_scale = decision["step_scale"]
+                decisions[-1] = decision
+            else:
+                sigma_next_value = 0.0
+                decision = dict(
+                    decision,
+                    action="terminal", reason="max_nfe_terminal", next_sigma=0.0,
+                    proposed_interval_t=None, protected_region=None,
+                )
+                decisions[-1] = decision
         if not math.isfinite(sigma_next_value) or not 0.0 <= sigma_next_value < _scalar_sigma(sigma):
             raise RuntimeError("adaptive RES proposed an invalid sigma")
         if config.evaluation_profile == "adaptive_history_v2":
             _log_adaptive_v2_progress(
                 controller, len(effective), sigma, sigma_next_value, decision, observation
             )
+        elif config.evaluation_profile == "adaptive_history_v3":
+            _log_adaptive_v3_progress(
+                controller, len(effective), sigma, sigma_next_value, decision
+            )
+        elif config.evaluation_profile == "adaptive_embedded_res_v1":
+            _log_embedded_progress(controller, len(effective), sigma, sigma_next_value, decision)
         sigma_next = sigma.new_tensor(sigma_next_value)
         source_index = controller._source_index(_scalar_sigma(sigma))
         logical_step = controller._containing_index(_scalar_sigma(sigma)) if source_index is None else min(source_index, 19)
@@ -384,16 +503,41 @@ def _sample_adaptive_res(model, x, source_sigmas, extra_args, callback, disable,
             "h3_vector_audio_rate": observation.audio_rate,
             "h3_vector_video_x0_change": observation.video_x0_change,
             "h3_vector_audio_x0_change": observation.audio_x0_change,
+            "h3_vector_residuals": observation.residuals,
+            "h3_vector_previous_step_scale": decision.get("previous_step_scale"),
+            "h3_vector_actual_delta_t": decision.get("actual_delta_t", observation.actual_delta_t),
+            "h3_vector_action": decision.get("action"),
+            "h3_vector_video_v_error": (observation.residuals or {}).get("video_v_error"),
+            "h3_vector_video_x0_error": (observation.residuals or {}).get("video_x0_error"),
+            "h3_vector_video_error": (observation.residuals or {}).get("video_error"),
+            "h3_vector_reference_video_error": decision.get("reference_video_error"),
+            "h3_vector_video_error_ratio": decision.get("video_error_ratio"),
+            "h3_vector_audio_v_error": (observation.residuals or {}).get("audio_v_error"),
+            "h3_vector_audio_x0_error": (observation.residuals or {}).get("audio_x0_error"),
+            "h3_vector_audio_error": (observation.residuals or {}).get("audio_error"),
+            "h3_vector_reference_audio_error": decision.get("reference_audio_error"),
+            "h3_vector_audio_error_ratio": decision.get("audio_error_ratio"),
             "h3_vector_source_sigma_hash": source_hash,
             "h3_vector_callback_context": "h3_vector_adaptive_actual_only",
             "h3_vector_controller_version": controller.version,
         }
+        for key in ("tolerance_solution_h", "safety_adjusted_h", "accepted_h",
+                    "previous_accepted_h", "growth_ratio", "defect_at_accepted_h",
+                    "audio_defect_at_accepted_h",
+                    "video_x0_difference_rms", "audio_x0_difference_rms",
+                    "video_normalization_scale", "audio_normalization_scale",
+                    "clamp_selected", "video_tolerance"):
+            if key in decision:
+                metadata[f"h3_vector_{key}"] = decision[key]
         if callback is not None:
             with callback_metadata_scope({k: v for k, v in metadata.items() if k.startswith("h3_vector_")}):
                 callback(metadata)
         diagnostics.observe_actual_anchor(
             logical_step, _scalar_sigma(sigma), x=x, actual_derivative=derivative,
             policy_reason=decision["reason"], step_scale=decision["step_scale"],
+            previous_step_scale=decision.get("previous_step_scale"),
+            actual_delta_t=decision.get("actual_delta_t", observation.actual_delta_t),
+            action=decision.get("action"), residuals=observation.residuals,
             source_index=source_index, next_sigma=sigma_next_value,
             local_base_interval=decision.get("local_base_interval"),
             proposed_interval_t=decision.get("proposed_interval_t"),
@@ -407,21 +551,48 @@ def _sample_adaptive_res(model, x, source_sigmas, extra_args, callback, disable,
                 "video_velocity_rate": observation.video_velocity_rate,
                 "video_x0_rate": observation.video_x0_rate,
                 "reference_video_rate": controller.reference_video_rate,
+                "reference_video_error": decision.get("reference_video_error"),
+                "video_error_ratio": decision.get("video_error_ratio"),
+                "reference_audio_error": decision.get("reference_audio_error"),
+                "audio_error_ratio": decision.get("audio_error_ratio"),
                 "video_rate_ratio": (
                     None if observation.video_rate is None or controller.reference_video_rate is None
                     else observation.video_rate / max(controller.reference_video_rate, 1e-8)
                 ),
                 "video_score": observation.video_score, "audio_score": observation.audio_score,
+                "residuals": observation.residuals,
+                "tolerance_solution_h": decision.get("tolerance_solution_h"),
+                "safety_adjusted_h": decision.get("safety_adjusted_h"),
+                "accepted_h": decision.get("accepted_h"),
+                "previous_accepted_h": decision.get("previous_accepted_h"),
+                "growth_ratio": decision.get("growth_ratio"),
+                "defect_at_accepted_h": decision.get("defect_at_accepted_h"),
+                "audio_defect_at_accepted_h": decision.get("audio_defect_at_accepted_h"),
+                "video_x0_difference_rms": decision.get("video_x0_difference_rms"),
+                "audio_x0_difference_rms": decision.get("audio_x0_difference_rms"),
+                "video_normalization_scale": decision.get("video_normalization_scale"),
+                "audio_normalization_scale": decision.get("audio_normalization_scale"),
+                "clamp_selected": decision.get("clamp_selected"),
+                **(observation.residuals or {}),
             },
         )
         diagnostics.observe_step(logical_step, _scalar_sigma(sigma), False, len(effective),
                                  actual_anchor_index=anchor_index, method=config.method,
                                  profile=config.evaluation_profile, policy=config.policy,
                                  policy_reason=decision["reason"], step_scale=decision["step_scale"],
+                                 previous_step_scale=decision.get("previous_step_scale"),
+                                 actual_delta_t=decision.get("actual_delta_t", observation.actual_delta_t),
+                                 action=decision.get("action"),
                                  next_sigma=sigma_next_value,
                                  proposed_interval_t=decision.get("proposed_interval_t"),
                                  protected_region=decision.get("protected_region"))
-        if sigma_next_value <= 0.0 or len(effective) >= controller.max_nfe:
+        terminal_ready = (
+            config.evaluation_profile == "adaptive_embedded_res_v1" and
+            controller._source_index(_scalar_sigma(sigma)) == controller.constants.get("terminal_positive_index")
+        )
+        if sigma_next_value <= 0.0 or (len(effective) >= controller.max_nfe and not (
+                config.evaluation_profile == "adaptive_embedded_res_v1" and not terminal_ready
+        )):
             if sigma_next_value > 0.0:
                 sigma_next = sigma.new_zeros(())
             x = stepper.step(x, sigma, denoised, sigma_next)
@@ -462,7 +633,7 @@ def _sample_core_solver(model, x, source_sigmas, extra_args, callback, disable, 
     if not context.is_h3_flow_av:
         raise RuntimeError("core solver methods require ModelSamplingAV combined with CONST flow sampling")
 
-    if config.evaluation_profile in ("adaptive_history_v1", "adaptive_history_v2"):
+    if config.evaluation_profile in ADAPTIVE_PROFILES:
         return _sample_adaptive_res(model, x, source_sigmas, extra_args, callback, disable,
                                     config, diagnostics, context)
     actual_indices = config.actual_indices

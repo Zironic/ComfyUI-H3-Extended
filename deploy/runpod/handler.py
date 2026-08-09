@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import mimetypes
 import os
+import shutil
 import time
-import urllib.parse
-import urllib.request
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import requests
 import runpod
 import websocket
-from runpod.serverless.utils import rp_upload
 
 COMFY_HOST = os.environ.get("COMFY_HOST", "127.0.0.1:8188")
 COMFY_ROOT = Path(os.environ.get("COMFY_ROOT", "/comfyui"))
@@ -47,29 +47,34 @@ def safe_name(name: str) -> str:
     return base
 
 
-def download_asset(job_id: str, asset: dict) -> dict:
-    name = safe_name(str(asset.get("name", "")))
-    url = asset.get("url")
-    if not isinstance(url, str) or not url.startswith(("http://", "https://")):
-        raise ValueError(f"Asset {name!r} must provide an http(s) URL")
+def safe_asset_name(name: str) -> str:
+    path = PurePosixPath(name.replace("\\", "/"))
+    if path.is_absolute() or not path.parts or any(part in {"", ".", ".."} for part in path.parts):
+        raise ValueError(f"Invalid asset name: {name!r}")
+    return path.as_posix()
+
+
+def decode_asset(job_id: str, asset: dict) -> dict:
+    name = safe_asset_name(str(asset.get("name", "")))
+    encoded = asset.get("base64")
+    if not isinstance(encoded, str) or not encoded:
+        raise ValueError(f"Asset {name!r} must provide non-empty base64 data")
+    try:
+        data = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError(f"Asset {name!r} contains invalid base64 data") from exc
 
     job_input = INPUT_ROOT / job_id
     job_input.mkdir(parents=True, exist_ok=True)
-    destination = job_input / name
-
-    log(f"downloading input asset {name}")
-    with requests.get(url, stream=True, timeout=(15, 600)) as response:
-        response.raise_for_status()
-        with destination.open("wb") as handle:
-            for chunk in response.iter_content(chunk_size=8 * 1024 * 1024):
-                if chunk:
-                    handle.write(chunk)
+    destination = job_input.joinpath(*PurePosixPath(name).parts)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(data)
 
     return {
         "name": name,
         "path": str(destination),
         "comfy_path": f"runpod/{job_id}/{name}",
-        "bytes": destination.stat().st_size,
+        "bytes": len(data),
     }
 
 
@@ -201,22 +206,22 @@ def discover_job_files(job_id: str) -> set[Path]:
     return {path.resolve() for path in root.rglob("*") if path.is_file()}
 
 
-def upload_artifact(job_id: str, path: Path) -> dict:
+def encode_artifact(path: Path) -> dict:
     content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-    bucket_name = os.environ.get("BUCKET_NAME") or None
-    url = rp_upload.upload_file_to_bucket(
-        path.name,
-        str(path),
-        bucket_name=bucket_name,
-        prefix=job_id,
-        extra_args={"ContentType": content_type},
-    )
+    data = path.read_bytes()
     return {
         "name": path.name,
-        "bytes": path.stat().st_size,
+        "bytes": len(data),
         "content_type": content_type,
-        "url": url,
+        "base64": base64.b64encode(data).decode("ascii"),
     }
+
+
+def cleanup_job_files(job_id: str) -> None:
+    for root in (INPUT_ROOT, OUTPUT_ROOT):
+        path = root / job_id
+        if path.is_dir():
+            shutil.rmtree(path)
 
 
 def handler(job: dict) -> dict:
@@ -236,8 +241,8 @@ def handler(job: dict) -> dict:
 
     try:
         wait_for_comfy(float(os.environ.get("RUNPOD_COMFY_READY_TIMEOUT", "300")))
-        downloaded = [download_asset(job_id, asset) for asset in assets]
-        workflow, output_prefix = prepare_workflow(job_id, workflow, downloaded)
+        decoded = [decode_asset(job_id, asset) for asset in assets]
+        workflow, output_prefix = prepare_workflow(job_id, workflow, decoded)
 
         client_id = str(uuid.uuid4())
         prompt_id = queue_workflow(workflow, client_id)
@@ -246,17 +251,28 @@ def handler(job: dict) -> dict:
         history = get_history(prompt_id)
 
         files = discover_job_files(job_id) | discover_history_files(history)
-        artifacts = [upload_artifact(job_id, path) for path in sorted(files)]
+        artifacts = [encode_artifact(path) for path in sorted(files)]
 
-        return {
+        result = {
             "status": "success",
             "job_id": job_id,
             "prompt_id": prompt_id,
             "output_prefix": output_prefix,
-            "inputs": downloaded,
+            "inputs": [
+                {"name": item["name"], "bytes": item["bytes"]}
+                for item in decoded
+            ],
             "artifacts": artifacts,
             "elapsed_seconds": round(time.monotonic() - started, 3),
         }
+        result_bytes = len(json.dumps(result, separators=(",", ":")).encode("utf-8"))
+        max_result_bytes = int(os.environ.get("RUNPOD_MAX_INLINE_RESULT_BYTES", "19000000"))
+        if result_bytes > max_result_bytes:
+            raise ValueError(
+                f"inline result is {result_bytes} bytes; limit is {max_result_bytes}. "
+                "Reduce the output size or use an external-storage transport."
+            )
+        return result
     except Exception as exc:
         log(f"job {job_id} failed: {exc}")
         return {
@@ -264,6 +280,8 @@ def handler(job: dict) -> dict:
             "job_id": job_id,
             "elapsed_seconds": round(time.monotonic() - started, 3),
         }
+    finally:
+        cleanup_job_files(job_id)
 
 
 if __name__ == "__main__":

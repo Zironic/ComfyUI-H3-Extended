@@ -22,6 +22,8 @@ DEFAULT_DIAGNOSTICS = Path(r"D:\AI\ComfyUI\Output\h3_vector_accel")
 ADAPTIVE_PROFILE_ANCHORS = {
     "adaptive_history_v1": (tuple(range(6)), (17, 18, 19)),
     "adaptive_history_v2": (tuple(range(3)), (18, 19)),
+    "adaptive_history_v3": (tuple(range(3)), ()),
+    "adaptive_embedded_res_v1": ((0,), (19,)),
 }
 
 
@@ -116,15 +118,16 @@ def check_invariants(data: dict) -> dict:
         anchor_indices = [row.get("source_index") for row in anchors if row.get("actual", True)]
         adaptive_anchors = (
             anchor_indices[:len(prefix)] == list(prefix) and
-            anchor_indices[-len(tail):] == list(tail) and
+            (not tail or anchor_indices[-len(tail):] == list(tail)) and
             len(effective) == len(anchors) + 1
         )
         if adaptive_anchors:
             source = data.get("source_sigma_sequence") or data.get("sigma_sequence") or []
             adaptive_anchors = len(source) >= 21
             if adaptive_anchors:
+                middle_end = -len(tail) - 1 if tail else -1
                 expected = (list(source[:len(prefix)]) +
-                            list(effective[len(prefix):-len(tail) - 1]) +
+                            list(effective[len(prefix):middle_end]) +
                             [source[index] for index in tail] + [0.0])
                 adaptive_anchors = len(effective) == len(expected) and all(
                     math.isclose(float(actual), float(want), rel_tol=1e-6, abs_tol=1e-7)
@@ -174,12 +177,23 @@ def _decision_rows(data: dict) -> tuple[list[dict], dict]:
         audio_change = _first(metrics, "audio_change", "audio_velocity_change")
         video_score = _first(metrics, "video_score")
         audio_score = _first(metrics, "audio_score")
+        residuals = metrics.get("residuals") or anchor.get("residuals") or decision.get("residuals") or {}
+        sigma = _first(decision, "sigma") or anchor.get("sigma")
+        actual_delta_t = decision.get("actual_delta_t", anchor.get("actual_delta_t"))
+        if actual_delta_t is None and rows:
+            previous_sigma = _finite_number(rows[-1]["sigma"])
+            current_sigma = _finite_number(sigma)
+            if previous_sigma is not None and current_sigma is not None and previous_sigma > current_sigma > 0:
+                actual_delta_t = math.log(previous_sigma / current_sigma)
+        previous_step_scale = decision.get("previous_step_scale", anchor.get("previous_step_scale"))
+        if previous_step_scale is None and index > 0:
+            previous_step_scale = decisions[index - 1].get("step_scale")
         rows.append({
             "actual_anchor_index": anchor.get("actual_anchor_index", index),
             "logical_step": anchor.get("step", index),
             "source_index": decision.get("source_index", anchor.get("source_index")),
             "containing_source_index": containing_index(decision.get("sigma", anchor.get("sigma"))),
-            "sigma": _first(decision, "sigma") or anchor.get("sigma"),
+            "sigma": sigma,
             "next_sigma": decision.get("next_sigma", anchor.get("next_sigma")),
             "video_velocity_change": video_change,
             "audio_velocity_change": audio_change,
@@ -196,6 +210,40 @@ def _decision_rows(data: dict) -> tuple[list[dict], dict]:
             "video_score": video_score,
             "audio_score": audio_score,
             "step_scale": decision.get("step_scale", anchor.get("step_scale")),
+            "previous_step_scale": previous_step_scale,
+            "actual_delta_t": actual_delta_t,
+            "residuals": residuals or None,
+            "video_v_error": residuals.get("video_v_error"),
+            "video_x0_error": residuals.get("video_x0_error"),
+            "video_error": residuals.get("video_error"),
+            "reference_video_error": (_first(metrics, "reference_video_error")
+                                       if _first(metrics, "reference_video_error") is not None
+                                       else anchor.get("reference_video_error", decision.get("reference_video_error"))),
+            "video_error_ratio": (_first(metrics, "video_error_ratio")
+                                   if _first(metrics, "video_error_ratio") is not None
+                                   else anchor.get("video_error_ratio", decision.get("video_error_ratio"))),
+            "audio_v_error": residuals.get("audio_v_error"),
+            "audio_x0_error": residuals.get("audio_x0_error"),
+            "audio_error": residuals.get("audio_error"),
+            "reference_audio_error": (_first(metrics, "reference_audio_error")
+                                       if _first(metrics, "reference_audio_error") is not None
+                                       else anchor.get("reference_audio_error", decision.get("reference_audio_error"))),
+            "audio_error_ratio": (_first(metrics, "audio_error_ratio")
+                                   if _first(metrics, "audio_error_ratio") is not None
+                                   else anchor.get("audio_error_ratio", decision.get("audio_error_ratio"))),
+            "tolerance_solution_h": decision.get("tolerance_solution_h", metrics.get("tolerance_solution_h")),
+            "safety_adjusted_h": decision.get("safety_adjusted_h", metrics.get("safety_adjusted_h")),
+            "accepted_h": decision.get("accepted_h", metrics.get("accepted_h")),
+            "previous_accepted_h": decision.get("previous_accepted_h", metrics.get("previous_accepted_h")),
+            "growth_ratio": decision.get("growth_ratio", metrics.get("growth_ratio")),
+            "defect_at_accepted_h": decision.get("defect_at_accepted_h", metrics.get("defect_at_accepted_h")),
+            "audio_defect_at_accepted_h": decision.get("audio_defect_at_accepted_h", metrics.get("audio_defect_at_accepted_h")),
+            "video_x0_difference_rms": decision.get("video_x0_difference_rms", metrics.get("video_x0_difference_rms")),
+            "audio_x0_difference_rms": decision.get("audio_x0_difference_rms", metrics.get("audio_x0_difference_rms")),
+            "video_normalization_scale": decision.get("video_normalization_scale", metrics.get("video_normalization_scale")),
+            "audio_normalization_scale": decision.get("audio_normalization_scale", metrics.get("audio_normalization_scale")),
+            "clamp_selected": decision.get("clamp_selected", metrics.get("clamp_selected")),
+            "action": decision.get("action", anchor.get("action")),
             "reason": decision.get("reason", anchor.get("policy_reason")),
             "protected_region": decision.get("protected_region", anchor.get("protected_region")),
         })
@@ -209,6 +257,10 @@ def _decision_rows(data: dict) -> tuple[list[dict], dict]:
     reference = {
         "video_rate": sum(rates[-window:]) / len(rates[-window:]) if rates[-window:] else None,
         "audio_rate": sum(audio_rates[-window:]) / len(audio_rates[-window:]) if audio_rates[-window:] else None,
+        "video_error": next((row.get("reference_video_error") for row in rows
+                              if row.get("reference_video_error") is not None), None),
+        "audio_error": next((row.get("reference_audio_error") for row in rows
+                              if row.get("reference_audio_error") is not None), None),
         "low_ratio": constants.get("low_change_ratio"),
         "high_ratio": constants.get("high_change_ratio"),
     }
@@ -430,9 +482,21 @@ def main(argv=None) -> int:
                             f"  anchor {row['actual_anchor_index']} step={row['logical_step']} "
                             f"source={row['source_index']} containing={row['containing_source_index']} "
                             f"{row['sigma']} -> {row['next_sigma']} scale={row['step_scale']} "
+                            f"previous_scale={row['previous_step_scale']} delta_t={row['actual_delta_t']} "
+                            f"video_raw_v={row['video_velocity_change']} "
                             f"video_rate={row['video_rate']} audio_rate={row['audio_rate']} "
                             f"video_x0={row['video_x0_change']} audio_x0={row['audio_x0_change']} "
-                            f"{row['reason']} region={row['protected_region']}"
+                            f"video_error=({row['video_v_error']},{row['video_x0_error']},{row['video_error']}) "
+                            f"video_ref={row['reference_video_error']} ratio={row['video_error_ratio']} "
+                            f"audio_error=({row['audio_v_error']},{row['audio_x0_error']},{row['audio_error']}) "
+                            f"audio_ref={row['reference_audio_error']} ratio={row['audio_error_ratio']} "
+                            f"h=({row['tolerance_solution_h']},{row['safety_adjusted_h']},{row['accepted_h']}) "
+                            f"previous_h={row['previous_accepted_h']} growth={row['growth_ratio']} "
+                            f"defect=({row['defect_at_accepted_h']},{row['audio_defect_at_accepted_h']}) "
+                            f"x0_rms=({row['video_x0_difference_rms']},{row['audio_x0_difference_rms']}) "
+                            f"normalization=({row['video_normalization_scale']},{row['audio_normalization_scale']}) "
+                            f"clamp={row['clamp_selected']} "
+                            f"action={row['action']} {row['reason']} region={row['protected_region']}"
                         )
         return 0
     except (FileNotFoundError, ValueError, json.JSONDecodeError) as exc:
