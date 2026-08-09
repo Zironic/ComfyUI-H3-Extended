@@ -2,6 +2,7 @@ from dataclasses import dataclass
 
 MODES = ("measure", "reference_delta")
 SCOPES = ("target_video", "all_dynamic")
+CACHE_LOCATIONS = ("cpu", "gpu")
 
 
 @dataclass(frozen=True)
@@ -19,6 +20,8 @@ class H3ChipmunkConfig:
     token_group_rows: int = 128
     feature_group: int = 256
     scope: str = "target_video"
+    cache_location: str = "cpu"
+    cache_budget_gb: float = 24.0
     random_groups: float = 0.0
     strict: bool = True
     save_report: bool = True
@@ -29,6 +32,8 @@ class H3ChipmunkConfig:
             raise ValueError(f"unsupported Chipmunk mode: {self.mode}")
         if self.scope not in SCOPES:
             raise ValueError(f"unsupported Chipmunk scope: {self.scope}")
+        if self.cache_location not in CACHE_LOCATIONS:
+            raise ValueError(f"unsupported cache_location: {self.cache_location}")
         if not (0.0 < float(self.top_fraction) <= 1.0):
             raise ValueError("top_fraction must be in (0, 1]")
         if int(self.refresh_every) < 1:
@@ -39,6 +44,8 @@ class H3ChipmunkConfig:
             raise ValueError("feature_group must be positive")
         if not (0 <= int(self.layer_start) < int(self.layer_stop) <= 50):
             raise ValueError("layer range must satisfy 0 <= start < stop <= 50")
+        if float(self.cache_budget_gb) <= 0:
+            raise ValueError("cache_budget_gb must be positive")
         if not (0.0 <= float(self.random_groups) < 1.0):
             raise ValueError("random_groups must be in [0, 1)")
 
@@ -49,6 +56,7 @@ class H3ChipmunkConfig:
             int(self.first_dense_steps), int(self.last_dense_steps),
             int(self.first_dense_layers), int(self.layer_start), int(self.layer_stop),
             int(self.chunk_rows), int(self.token_group_rows), int(self.feature_group),
-            self.scope, float(self.random_groups), bool(self.strict), bool(self.save_report),
+            self.scope, self.cache_location, float(self.cache_budget_gb),
+            float(self.random_groups), bool(self.strict), bool(self.save_report),
             self.run_tag,
         )
