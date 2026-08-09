@@ -5,6 +5,7 @@ import math
 import time
 
 import torch
+from comfy.utils import model_trange as trange
 
 from .config import SamplerConfig
 from .diagnostics import RunDiagnostics, callback_metadata_scope
@@ -197,7 +198,6 @@ def _guard_reason(config, x, sigma, sigma_next, prediction, predictor):
 def sample_vector_accel(model, x, sigmas, extra_args=None, callback=None, disable=None,
                         config=None, diagnostics=None, latent_shapes=None):
     """Run native Euler or a fixed forecast mask over a nominal sigma grid."""
-    del disable  # kept for KSAMPLER compatibility
     extra_args = {} if extra_args is None else extra_args
     config = config if isinstance(config, SamplerConfig) else SamplerConfig(**(config or {}))
     sigma_values = torch.as_tensor(sigmas)
@@ -256,7 +256,7 @@ def sample_vector_accel(model, x, sigmas, extra_args=None, callback=None, disabl
     true_nfe = 0
     model_call_seconds = 0.0
     started = time.perf_counter()
-    for i in range(logical_steps):
+    for i in trange(logical_steps, disable=disable):
         sigma = sigma_values[i]
         sigma_next = sigma_values[i + 1]
         decision = policy.decide(

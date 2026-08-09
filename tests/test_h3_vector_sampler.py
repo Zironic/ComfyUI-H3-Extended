@@ -127,6 +127,21 @@ class SamplerTests(unittest.TestCase):
                 self.assertTrue(torch.equal(torch.as_tensor(expected[key]), torch.as_tensor(actual[key])))
             self.assertEqual(expected["i"], actual["i"])
 
+    def test_console_progress_uses_comfy_model_trange(self):
+        calls = []
+
+        def tracked_trange(count, disable=None):
+            calls.append((count, disable))
+            return range(count)
+
+        with mock.patch("h3_vector_accel.sampler.trange", side_effect=tracked_trange):
+            sample_vector_accel(
+                FakeModel(constant_velocity()), self.x.clone(), self.sigmas,
+                disable=False,
+                config=SamplerConfig(method="native"),
+            )
+        self.assertEqual(calls, [(20, False)])
+
     def test_node_constructs_fingerprinted_sampler(self):
         output = MiniMaxH3VectorAccelSampler.execute(
             "linear_velocity", "uniform_13", "summary", True, 1.5
