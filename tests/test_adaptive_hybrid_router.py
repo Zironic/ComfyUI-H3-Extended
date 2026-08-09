@@ -16,7 +16,13 @@ from h3_attention.hybrid.config import (  # noqa: E402
     DENSITY_FIXED,
     HybridSparseConfig,
 )
+from h3_attention.hybrid.report import render, summarize  # noqa: E402
 from h3_attention.hybrid.router import SparseTileRouter  # noqa: E402
+from h3_attention.hybrid.stats import (  # noqa: E402
+    ROUTE_HISTOGRAM_KEY,
+    build_route_histogram,
+    resolve_route_telemetry,
+)
 
 
 def check(value, message):
@@ -195,6 +201,52 @@ def test_full_budget_fast_path():
           "100% adaptive metadata reports a fully dense executable mask")
 
 
+def test_reporting_telemetry():
+    print("adaptive row-density reporting")
+    q, k = summaries()
+    router = SparseTileRouter(adaptive_config())
+    _lut, valid, metadata = router.build_lut_from_summaries(q, k, layout(), 0.5)
+    histogram = build_route_histogram(valid, metadata)
+    check(histogram is not None and int(histogram.sum()) == 4,
+          "deferred route histogram contains every head/query row")
+
+    record = metadata.as_dict()
+    record.update({
+        "step": 3,
+        "layer": 7,
+        "request_id": 1,
+        ROUTE_HISTOGRAM_KEY: histogram,
+    })
+    records, routing = resolve_route_telemetry([record])
+    check(ROUTE_HISTOGRAM_KEY not in records[0],
+          "private tensor telemetry is removed before JSON serialization")
+    check(routing["adaptive_reallocation_observed"],
+          "request summary explicitly says adaptive reallocation occurred")
+    check(routing["unique_video_kv_tile_counts"] > 1
+          and routing["min_video_kv_tiles"] < routing["max_video_kv_tiles"],
+          "request summary exposes actual variable row K values")
+    check(abs(routing["mean_video_kv_tiles"] - 2.0) < 1e-9,
+          "reported row-K mean preserves the exact 50% budget")
+    check(routing["rows_below_target"] > 0 and routing["rows_above_target"] > 0,
+          "report counts rows that donated and received attention blocks")
+    check(routing["per_step"][0]["step_index"] == 3
+          and routing["per_layer"][0]["layer"] == 7,
+          "report carries the row-K distribution into step and layer summaries")
+    check("actual_row_min_video_kv_tiles" in records[0]
+          and "actual_row_p50_video_kv_tiles" in records[0],
+          "per-call records contain resolved row-K statistics")
+
+    payload = {
+        "mode": "sage128",
+        "summary": summarize(records, route_summary=routing),
+    }
+    text = render(payload)
+    check("adaptive reallocation observed: yes" in text
+          and "actual row K:" in text
+          and "adaptive step 3:" in text,
+          "human report makes adaptive behavior directly visible")
+
+
 def test_configuration_guards():
     print("adaptive configuration guards")
     cases = (
@@ -220,6 +272,7 @@ def main():
     test_determinism()
     test_direct_and_summary_routes_match()
     test_full_budget_fast_path()
+    test_reporting_telemetry()
     test_configuration_guards()
     print("\nall adaptive hybrid router tests passed")
 

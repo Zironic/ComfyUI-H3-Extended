@@ -8,7 +8,7 @@ from .config import HybridSparseConfig, MODE_SAGE128_FUSED_QKV
 from .fused_qkv import FusedQKVProjector
 from .router import SparseRouterError, SparseTileRouter
 from .sparse_sage import SparseSageError, SparseSageExecutor, load_sparse_sage_api
-from .stats import DeferredCudaTiming
+from .stats import DeferredCudaTiming, ROUTE_HISTOGRAM_KEY, build_route_histogram
 
 try:
     from ...h3_runtime.context import get_runtime_snapshot
@@ -104,6 +104,12 @@ class HybridSparseBackend:
             ),
         )
 
+    @staticmethod
+    def _attach_route_telemetry(metadata, valid_block_num, mask_metadata):
+        histogram = build_route_histogram(valid_block_num, mask_metadata)
+        if histogram is not None:
+            metadata[ROUTE_HISTOGRAM_KEY] = histogram
+
     def prepare(self, q, k, v, *, layer_index, transformer_options):
         snapshot = get_runtime_snapshot(transformer_options)
         if snapshot is None:
@@ -157,6 +163,7 @@ class HybridSparseBackend:
                 int(mask_metadata.pure_video_q_tiles) * int(q.shape[1])
             ),
         })
+        self._attach_route_telemetry(metadata, valid_block_num, mask_metadata)
         try:
             sparse = self.executor.prepare(
                 q,
@@ -227,6 +234,7 @@ class HybridSparseBackend:
                 int(mask_metadata.pure_video_q_tiles) * heads
             ),
         })
+        self._attach_route_telemetry(metadata, valid_block_num, mask_metadata)
         try:
             sparse = self.executor.prepare_projected(
                 projected,
