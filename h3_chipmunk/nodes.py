@@ -41,6 +41,11 @@ class MiniMaxH3ChipmunkMLP(io.ComfyNode):
                 io.Combo.Input("cache_location", options=list(CACHE_LOCATIONS), default="cpu"),
                 io.Float.Input("cache_budget_gb", default=24.0, min=1.0, max=512.0, step=1.0),
                 io.Float.Input("random_groups", default=0.0, min=0.0, max=0.25, step=0.01),
+                io.Boolean.Input("strict", default=True),
+                io.Boolean.Input("save_report", default=True),
+                io.String.Input("run_tag", default="chipmunk"),
+                # Append new widgets after all original fields so saved Comfy
+                # workflows retain their positional widget values.
                 io.Int.Input(
                     "measure_layer_stride",
                     default=DEFAULT_MEASURE_LAYER_STRIDE,
@@ -52,9 +57,6 @@ class MiniMaxH3ChipmunkMLP(io.ComfyNode):
                         "5 is the low-overhead default; 1 measures all 50 blocks."
                     ),
                 ),
-                io.Boolean.Input("strict", default=True),
-                io.Boolean.Input("save_report", default=True),
-                io.String.Input("run_tag", default="chipmunk"),
             ],
             outputs=[io.Model.Output()],
         )
@@ -66,8 +68,8 @@ class MiniMaxH3ChipmunkMLP(io.ComfyNode):
         first_dense_layers=2, layer_start=0, layer_stop=50,
         chunk_rows=DEFAULT_CHUNK_ROWS, token_group_rows=128, scope="target_video",
         cache_location="cpu", cache_budget_gb=24.0, random_groups=0.0,
-        measure_layer_stride=DEFAULT_MEASURE_LAYER_STRIDE,
         strict=True, save_report=True, run_tag="chipmunk",
+        measure_layer_stride=DEFAULT_MEASURE_LAYER_STRIDE,
     ):
         if not enabled:
             return io.NodeOutput(model)
