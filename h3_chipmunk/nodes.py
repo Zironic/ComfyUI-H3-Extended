@@ -1,6 +1,6 @@
 from comfy_api.latest import ComfyExtension, io
 
-from .config import H3ChipmunkConfig, MODES, SCOPES
+from .config import H3ChipmunkConfig, MODES, SCOPES, CACHE_LOCATIONS
 from .patch import install
 
 
@@ -31,6 +31,8 @@ class MiniMaxH3ChipmunkMLP(io.ComfyNode):
                 io.Int.Input("chunk_rows", default=128, min=128, max=4096, step=128),
                 io.Int.Input("token_group_rows", default=128, min=32, max=1024, step=32),
                 io.Combo.Input("scope", options=list(SCOPES), default="target_video"),
+                io.Combo.Input("cache_location", options=list(CACHE_LOCATIONS), default="cpu"),
+                io.Float.Input("cache_budget_gb", default=24.0, min=1.0, max=512.0, step=1.0),
                 io.Float.Input("random_groups", default=0.0, min=0.0, max=0.25, step=0.01),
                 io.Boolean.Input("strict", default=True),
                 io.Boolean.Input("save_report", default=True),
@@ -45,7 +47,8 @@ class MiniMaxH3ChipmunkMLP(io.ComfyNode):
         refresh_every=6, first_dense_steps=2, last_dense_steps=2,
         first_dense_layers=2, layer_start=0, layer_stop=50,
         chunk_rows=128, token_group_rows=128, scope="target_video",
-        random_groups=0.0, strict=True, save_report=True, run_tag="chipmunk",
+        cache_location="cpu", cache_budget_gb=24.0, random_groups=0.0,
+        strict=True, save_report=True, run_tag="chipmunk",
     ):
         if not enabled:
             return io.NodeOutput(model)
@@ -62,6 +65,8 @@ class MiniMaxH3ChipmunkMLP(io.ComfyNode):
             token_group_rows=int(token_group_rows),
             feature_group=256,
             scope=scope,
+            cache_location=cache_location,
+            cache_budget_gb=float(cache_budget_gb),
             random_groups=float(random_groups),
             strict=bool(strict),
             save_report=bool(save_report),
