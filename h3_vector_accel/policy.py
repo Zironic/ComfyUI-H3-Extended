@@ -52,14 +52,16 @@ class AdaptiveRepairPolicy:
 
     def __init__(self, profile, tolerance, logical_steps, safety_factor=1.25,
                  recovery_actual_steps=2, max_consecutive_forecasts=1,
-                 warmup_steps=2, tail_actual_steps=3):
+                 protected_prefix_steps=6, audio_emergency_multiplier=4.0,
+                 tail_actual_steps=3):
         self.profile = profile
         self.tolerance = float(tolerance)
         self.logical_steps = int(logical_steps)
         self.safety_factor = float(safety_factor)
         self.recovery_actual_steps = int(recovery_actual_steps)
         self.max_consecutive_forecasts = int(max_consecutive_forecasts)
-        self.warmup_steps = int(warmup_steps)
+        self.protected_prefix_steps = int(protected_prefix_steps)
+        self.audio_emergency_multiplier = float(audio_emergency_multiplier)
         self.tail_actual_steps = int(tail_actual_steps)
         self.reset()
 
@@ -83,13 +85,13 @@ class AdaptiveRepairPolicy:
         return risks
 
     def decide(self, step, predictor_ready=False, **kwargs):
-        if step < self.warmup_steps:
-            return Decision(False, "adaptive_warmup")
-        if step >= self.logical_steps - self.tail_actual_steps:
-            return Decision(False, "adaptive_forced_tail")
         if self._recovery_remaining:
             self._recovery_remaining -= 1
             return Decision(False, "adaptive_recovery")
+        if step < self.protected_prefix_steps:
+            return Decision(False, "adaptive_protected_prefix")
+        if step >= self.logical_steps - self.tail_actual_steps:
+            return Decision(False, "adaptive_forced_tail")
         if not predictor_ready:
             return Decision(False, "adaptive_predictor_not_ready")
         if self._consecutive_forecasts >= self.max_consecutive_forecasts:
@@ -97,13 +99,22 @@ class AdaptiveRepairPolicy:
         risks = self._risk(self._progress(step))
         if risks is None:
             return Decision(False, "adaptive_insufficient_error_history")
-        risk = max(risks.values())
+        video_risk = risks["video"]
+        audio_risk = risks["audio"]
+        audio_emergency = self.tolerance * self.audio_emergency_multiplier
+        if video_risk > self.tolerance:
+            return Decision(
+                False, "adaptive_risk_actual", risk=video_risk,
+                video_risk=video_risk, audio_risk=audio_risk,
+            )
+        if audio_risk > audio_emergency:
+            return Decision(
+                False, "adaptive_audio_emergency", risk=video_risk,
+                video_risk=video_risk, audio_risk=audio_risk,
+            )
         return Decision(
-            risk <= self.tolerance,
-            "adaptive_risk_forecast" if risk <= self.tolerance else "adaptive_risk_actual",
-            risk=risk,
-            video_risk=risks["video"],
-            audio_risk=risks["audio"],
+            True, "adaptive_risk_forecast", risk=video_risk,
+            video_risk=video_risk, audio_risk=audio_risk,
         )
 
     def observe_actual(self, step, prediction_metrics=None, **kwargs):
@@ -119,7 +130,10 @@ class AdaptiveRepairPolicy:
             self._local_errors[modality].append(value)
             del self._local_errors[modality][:-2]
         risks = self._risk(self._progress(step))
-        if risks is not None and max(risks.values()) > self.tolerance:
+        if risks is not None and (
+            risks["video"] > self.tolerance or
+            risks["audio"] > self.tolerance * self.audio_emergency_multiplier
+        ):
             self._recovery_remaining = max(self._recovery_remaining, self.recovery_actual_steps)
             self._consecutive_forecasts = 0
 
@@ -143,5 +157,7 @@ def make_policy(config: SamplerConfig, profile=None, logical_steps=20):
             safety_factor=config.safety_factor,
             recovery_actual_steps=config.recovery_actual_steps,
             max_consecutive_forecasts=config.max_consecutive_forecasts,
+            protected_prefix_steps=config.protected_prefix_steps,
+            audio_emergency_multiplier=config.audio_emergency_multiplier,
         )
     return FixedMaskPolicy(config.mask)

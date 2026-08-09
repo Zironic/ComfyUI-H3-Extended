@@ -60,6 +60,8 @@ def configuration_payload(config: SamplerConfig, sigmas=None, model_identity=Non
         "safety_factor": config.safety_factor,
         "recovery_actual_steps": config.recovery_actual_steps,
         "max_consecutive_forecasts": config.max_consecutive_forecasts,
+        "protected_prefix_steps": config.protected_prefix_steps,
+        "audio_emergency_multiplier": config.audio_emergency_multiplier,
         "adaptive_profile_hash": config.adaptive_profile_hash,
     }
     if sigmas is not None:

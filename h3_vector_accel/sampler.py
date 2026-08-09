@@ -164,7 +164,9 @@ def _finite(value):
     return bool(torch.isfinite(value).all().item())
 
 
-def _guard_reason(config, x, sigma, sigma_next, prediction, predictor):
+def _guard_reason(config, x, sigma, sigma_next, prediction, predictor, metrics=None):
+    if metrics is None:
+        metrics = {}
     if not prediction.valid:
         return prediction.failure_reason or "invalid_prediction"
     if not _finite(prediction.derivative):
@@ -175,16 +177,26 @@ def _guard_reason(config, x, sigma, sigma_next, prediction, predictor):
     actual = history[-1][1]
     predicted = prediction.derivative.float()
     denominator = _rms(actual) + 1e-8
-    if _rms(predicted) / denominator > config.max_extrapolation_ratio:
-        return "extrapolation_ratio"
+    predicted_ratio = _rms(predicted) / denominator
+    metrics["predicted_derivative_ratio"] = predicted_ratio
     h = _scalar_sigma(sigma_next) - _scalar_sigma(sigma)
+    cosine = None
+    if predicted.numel() == actual.numel():
+        actual_flat = actual.float().reshape(-1)
+        predicted_flat = predicted.reshape(-1)
+        cosine = float(torch.dot(predicted_flat, actual_flat).item() /
+                       (torch.linalg.vector_norm(predicted_flat).item() *
+                        torch.linalg.vector_norm(actual_flat).item() + 1e-8))
+        metrics["anchor_direction_cosine"] = cosine
     if prediction.slope is not None:
         correction_ratio = _rms(0.5 * h * h * prediction.slope) / (_rms(h * predicted) + 1e-8)
+        metrics["curvature_correction_ratio"] = correction_ratio
+    if predicted_ratio > config.max_extrapolation_ratio:
+        return "extrapolation_ratio"
+    if prediction.slope is not None:
         if not math.isfinite(correction_ratio) or correction_ratio > config.curvature_ratio:
             return "curvature_ratio"
-        cosine = float(torch.dot(predicted.reshape(-1), actual.float().reshape(-1)).item() /
-                       (torch.linalg.vector_norm(predicted).item() * torch.linalg.vector_norm(actual).item() + 1e-8))
-        if not math.isfinite(cosine) or cosine < config.min_direction_cosine:
+        if cosine is None or not math.isfinite(cosine) or cosine < config.min_direction_cosine:
             return "direction_cosine"
     try:
         proposed = predictor.integrate(x, sigma, sigma_next, prediction)
@@ -266,6 +278,7 @@ def sample_vector_accel(model, x, sigmas, extra_args=None, callback=None, disabl
         )
         counterfactual = None
         fallback_reason = None
+        guard_metrics = {}
         use_forecast = False
         if predictor is not None and predictor.ready():
             counterfactual = predictor.predict(x, sigma)
@@ -276,7 +289,8 @@ def sample_vector_accel(model, x, sigmas, extra_args=None, callback=None, disabl
                 fallback_reason = "insufficient_history"
             else:
                 fallback_reason = _guard_reason(
-                    config, x, sigma, sigma_next, counterfactual, predictor
+                    config, x, sigma, sigma_next, counterfactual, predictor,
+                    metrics=guard_metrics,
                 )
             use_forecast = fallback_reason is None
             if not use_forecast and not config.fallback_on_guard:
@@ -326,6 +340,9 @@ def sample_vector_accel(model, x, sigmas, extra_args=None, callback=None, disabl
             "h3_vector_policy_reason": decision.reason,
             "h3_vector_policy_risk": decision.risk,
             "h3_vector_fallback_reason": fallback_reason,
+            "h3_vector_guard_predicted_derivative_ratio": guard_metrics.get("predicted_derivative_ratio"),
+            "h3_vector_guard_curvature_correction_ratio": guard_metrics.get("curvature_correction_ratio"),
+            "h3_vector_guard_anchor_direction_cosine": guard_metrics.get("anchor_direction_cosine"),
         }
         if callback is not None:
             context_metadata = {
@@ -341,7 +358,10 @@ def sample_vector_accel(model, x, sigmas, extra_args=None, callback=None, disabl
                                  policy=config.policy, policy_reason=decision.reason,
                                  policy_risk=decision.risk,
                                  video_risk=decision.video_risk,
-                                 audio_risk=decision.audio_risk)
+                                 audio_risk=decision.audio_risk,
+                                 guard_predicted_derivative_ratio=guard_metrics.get("predicted_derivative_ratio"),
+                                 guard_curvature_correction_ratio=guard_metrics.get("curvature_correction_ratio"),
+                                 guard_anchor_direction_cosine=guard_metrics.get("anchor_direction_cosine"))
         policy.observe_step(use_forecast)
         x = x_next
     wall_seconds = time.perf_counter() - started

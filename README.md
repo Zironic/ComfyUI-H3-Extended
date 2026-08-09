@@ -40,9 +40,15 @@ The named forecast profiles are exact 20-step masks; native mode remains the
 parity baseline and evaluates every step. Forecast guards fail closed to genuine
 H3 evaluations, and diagnostics report logical steps separately from true NFE.
 
-Adaptive repair-aware skipping and VDE are deliberately unavailable until the
-fixed-mask GPU and repairability studies in
-[`H3_VECTOR_ACCEL_PLAN.md`](H3_VECTOR_ACCEL_PLAN.md) justify them.
+`late_aggressive_13` is the current accelerated reference profile. The first
+controlled placement comparison found that the equal-NFE early profile severely
+corrupted video, so adaptive policies protect logical steps 0-5 and use video
+risk for normal decisions while retaining audio as an emergency veto.
+
+Adaptive repair-aware skipping is exposed only when a matching measured profile
+is installed. VDE remains experimental and should be characterized under fixed
+masks before adaptive use; see
+[`H3_VECTOR_ACCEL_PLAN.md`](H3_VECTOR_ACCEL_PLAN.md).
 
 ## MoBA 3D probe execution geometry
 

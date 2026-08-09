@@ -14,6 +14,8 @@ class FingerprintTests(unittest.TestCase):
             SamplerConfig(evaluation_profile="uniform_13"),
             SamplerConfig(max_extrapolation_ratio=1.25),
             SamplerConfig(fallback_on_guard=False),
+            SamplerConfig(protected_prefix_steps=7),
+            SamplerConfig(audio_emergency_multiplier=5.0),
         ]
         for config in variants:
             self.assertNotEqual(base, configuration_fingerprint(config, s))

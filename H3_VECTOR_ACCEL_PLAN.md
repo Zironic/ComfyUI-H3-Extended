@@ -16,7 +16,7 @@ The sampler therefore must distinguish three different properties:
 
 The eventual adaptive policy should forecast based on estimated **final surviving error**, not merely on velocity smoothness.
 
-Whether H3 actually exhibits this repairability pattern is currently unknown. The implementation must measure it before embedding it into an adaptive policy.
+The first controlled placement comparison falsified that hypothesis at the tested skip magnitude. With the same 13 true NFEs, `early_aggressive_13` produced severe video corruption while `late_aggressive_13` was visually acceptable and much closer to native. The working model is now an early trajectory-establishment phase followed by a more forecastable refinement phase. `late_aggressive_13` is the reference accelerated fixed profile; the exact protected-prefix boundary remains experimental.
 
 ---
 
@@ -206,10 +206,10 @@ method:
 
 evaluation_profile:
     native_20
+    late_aggressive_13  # reference accelerated profile
     conservative_12
     early_aggressive_13
     uniform_13
-    late_aggressive_13
 
 diagnostics:
     off
@@ -221,7 +221,7 @@ Initial advanced inputs:
 
 ```text
 fallback_on_guard: true
-max_extrapolation_ratio: conservative default
+max_extrapolation_ratio: conservative default  # hard veto, not a forecast scale
 ```
 
 Do not initially expose arbitrary thresholds, custom masks, error-controller gains, separate video/audio tolerances, or consecutive-forecast limits. Fixed named profiles make the first comparisons reproducible.
@@ -492,7 +492,7 @@ Reject the forecast when predicted derivative direction diverges too sharply fro
 \cos(\hat d,d_a)<c_{\min}.
 ]
 
-Initial thresholds should be conservative implementation constants rather than user-facing knobs. Diagnostics must record which guard caused every fallback.
+Initial thresholds should be conservative implementation constants rather than user-facing knobs. `max_extrapolation_ratio` is only a hard veto: accepted forecasts are neither clamped nor scaled. Diagnostics must record which guard caused every fallback and the actual derivative-growth ratio, curvature-correction ratio, and anchor-direction cosine used by the guards. Without these values, a permissive setting such as `3` cannot be interpreted after a run.
 
 On guard failure:
 
@@ -769,17 +769,7 @@ guard status
 
 Do not use one packed aggregate as the main policy signal. Video can numerically dominate because of tensor size, while audio can fail perceptually despite contributing little to global packed L2.
 
-For later policy decisions, use:
-
-[
-E_{\mathrm{modal}}
-==================
-
-\max(
-E_{\mathrm{video,norm}},
-E_{\mathrm{audio,norm}}
-).
-]
+For the next adaptive characterization, video error is the normal controller signal. Retain audio error as a separately reported emergency veto with a higher threshold. Do not collapse them into an unconditional modal maximum unless an audio-sensitive case justifies restoring that rule.
 
 ---
 
@@ -975,27 +965,37 @@ uniform_13
 late_aggressive_13
 ```
 
-This directly tests the hypothesis that early errors are more repairable than late errors.
+This test found that early forecasts can displace the video trajectory beyond later correction. `late_aggressive_13` is therefore the reference accelerated arm and `early_aggressive_13` is retained only as a failed characterization control.
 
 ### Phase D — one-step repairability sweep
 
-Run natural omissions and normalized perturbations at selected trajectory positions.
+Run natural omissions and normalized perturbations at selected trajectory positions. This is no longer a prerequisite for the practical fixed sampler; its main value is explaining the observed video/audio repairability split and supplying conservative priors for profile-gated adaptive mode.
 
 ### Phase E — multi-step forecast runs
 
-Only after the single-step results are understood:
+First sweep the protected-prefix boundary around the observed transition while holding true NFE and forecast clustering comparable:
 
 ```text
-maximum 1 consecutive forecast
-maximum 2 consecutive forecasts
-maximum 3 consecutive forecasts
+protect steps 0-4
+protect steps 0-5  # current reference boundary
+protect steps 0-6
+protect steps 0-7
 ```
 
-Each forecast-length comparison must retain equal true NFE where possible.
+Then keep steps 0-5 and 17-19 actual and increase only late-tail pace:
+
+```text
+late_cautious_14     14 NFE, 6 forecasts, maximum run 1
+late_aggressive_13   13 NFE, 7 forecasts, maximum run 2
+late_aggressive_12   12 NFE, 8 forecasts, maximum run 3
+late_max_11          11 NFE, 9 forecasts, maximum run 3
+```
+
+This ladder answers how fast the protected tail can run before video breaks. Placement conclusions come only from equal-NFE comparisons; pace conclusions must be reported as a quality-versus-NFE frontier because maximum-run-1 cannot reach 13 NFE while also preserving the protected prefix and three-step actual tail.
 
 ### Phase F — adaptive policy
 
-Build and test the adaptive controller only after the repairability profile exists.
+Build and test the profile-gated adaptive controller with a hard protected prefix. Fixed tail acceleration does not wait for this profile.
 
 ---
 
@@ -1003,7 +1003,9 @@ Build and test the adaptive controller only after the repairability profile exis
 
 A conventional adaptive ODE controller minimizes local error. That may allocate extra evaluations early if the early field is difficult, even when those errors are later repaired.
 
-The H3 policy should estimate final surviving risk.
+The H3 policy should estimate final surviving risk. It must always evaluate steps 0-5, permit at most one forecast before another actual anchor, and force two actual recovery steps after excessive measured risk.
+
+Video surviving risk drives normal forecast decisions. Audio risk remains visible in diagnostics and acts as a higher emergency veto rather than being combined with video through an unconditional modal maximum. This asymmetry is provisional until an audio-sensitive case is observed.
 
 ### 18.1 Online local-error estimate
 
@@ -1059,25 +1061,22 @@ q_{i+1}^{(m)}
 \hat e_{i+1}^{(m)}.
 ]
 
-Joint policy risk:
+Normal policy risk:
 
 [
-R_{i+1}
-=======
-
-\max(
-R_{i+1}^{\mathrm{video}},
-R_{i+1}^{\mathrm{audio}}
-).
+R_{i+1}=R_{i+1}^{\mathrm{video}}.
 ]
+
+Audio separately vetoes a forecast only when its surviving risk crosses the configured emergency multiple of the normal tolerance.
 
 Decision:
 
 ```text
 forecast next point:
-    R <= tolerance
+    video R <= tolerance
+    audio R <= emergency tolerance
     predictor guards pass
-    not in warmup
+    step >= 6
     not in forced tail
     consecutive-forecast limit not reached
 
@@ -1377,9 +1376,9 @@ AV synchronization observations
 
 Objective audio distances are useful diagnostics but not sufficient. Manual listening remains mandatory because a numerically small latent difference can still cause speech, transient, or synchronization artifacts.
 
-The first production-oriented success criterion should be:
+The first production-oriented success criterion is:
 
-> At equal true NFE, `linear_velocity` and early-aggressive anchor placement must outperform hold/sparse Euler without introducing audible degradation.
+> At equal true NFE, tail-only `linear_velocity` forecasting must remain visually acceptable against native video without introducing audible degradation. `late_aggressive_13` is the current reference accelerated profile.
 
 ---
 
@@ -1395,13 +1394,11 @@ Proceed only when `linear_velocity` consistently beats hold at identical anchors
 
 If it does not, retain hold as the baseline and investigate VDE or another predictor before adaptation.
 
-### Gate 3 — hypothesis test
+### Gate 3 — protected-prefix test
 
-Proceed to repair-aware adaptation only when the equal-NFE placement and perturbation experiments show that early errors generally have lower final survival than comparable late errors.
+The tested early-repairability hypothesis failed: early forecasts corrupted video while the equal-NFE late placement remained acceptable. Do not forecast during steps 0-5 in adaptive mode. Characterize neighboring protected-prefix boundaries at equal true NFE before claiming that step 6 is universal.
 
-If early and late survival are similar, the proposed theory is not supported.
-
-If repairability varies primarily by content rather than trajectory position, use a conservative fixed policy or develop an online verification method instead of a static survival prior.
+If the safe boundary varies primarily by content, retain a conservative fixed tail policy or require online verification instead of weakening the protected prefix from a static prior.
 
 ### Gate 4 — audio safety
 
@@ -1447,6 +1444,7 @@ Adaptive mode is useful only when it reduces median true NFE relative to the bes
 * Run early-aggressive, uniform, and late-aggressive masks.
 * Characterize audio failures separately.
 * Select candidate NFE/profile combinations.
+* Treat `late_aggressive_13` as the reference accelerated profile after the first controlled placement comparison.
 
 ### Milestone 5 — repairability study
 
@@ -1461,6 +1459,8 @@ Adaptive mode is useful only when it reduces median true NFE relative to the bes
 * Implement surviving-risk decisions.
 * Add recovery actual steps.
 * Keep maximum one forecast initially.
+* Force actual evaluations for steps 0-5.
+* Drive normal decisions from video risk and retain audio as an emergency veto.
 * Compare against the best fixed policy.
 
 ### Milestone 7 — VDE

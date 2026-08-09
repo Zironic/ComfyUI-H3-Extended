@@ -47,6 +47,9 @@ def fixed_policy_arms(include_vde=False):
         StudyArm("linear_early_aggressive_13", "placement", "linear_velocity", "early_aggressive_13", 13),
         StudyArm("linear_uniform_13", "placement", "linear_velocity", "uniform_13", 13),
         StudyArm("linear_late_aggressive_13", "placement", "linear_velocity", "late_aggressive_13", 13),
+        StudyArm("linear_late_cautious_14", "late_tail_pace", "linear_velocity", "late_cautious_14", 14),
+        StudyArm("linear_late_aggressive_12", "late_tail_pace", "linear_velocity", "late_aggressive_12", 12),
+        StudyArm("linear_late_max_11", "late_tail_pace", "linear_velocity", "late_max_11", 11),
     ]
     if include_vde:
         arms.append(StudyArm("vde_conservative_12", "vde_fixed", "vde", "conservative_12", 12))

@@ -24,6 +24,12 @@ class StudyTests(unittest.TestCase):
         self.assertEqual({arm.expected_true_nfe for arm in placement}, {13})
         self.assertEqual({arm.method for arm in placement}, {"linear_velocity"})
         self.assertEqual(by_label["vde_conservative_12"].evaluation_profile, "conservative_12")
+        late_tail = [arm for arm in arms if arm.phase == "late_tail_pace"]
+        self.assertEqual(
+            [(arm.evaluation_profile, arm.expected_true_nfe) for arm in late_tail],
+            [("late_cautious_14", 14), ("late_aggressive_12", 12),
+             ("late_max_11", 11)],
+        )
 
     def test_results_require_separate_av_metrics_and_explicit_quality_pass(self):
         def runner(arm):

@@ -169,7 +169,10 @@ class SamplerTests(unittest.TestCase):
             "conservative_12": 12,
             "early_aggressive_13": 13,
             "uniform_13": 13,
+            "late_cautious_14": 14,
             "late_aggressive_13": 13,
+            "late_aggressive_12": 12,
+            "late_max_11": 11,
         }
         expected = torch.full_like(self.x, -40.0)
         for method in ("hold", "linear_velocity"):
@@ -224,6 +227,8 @@ class SamplerTests(unittest.TestCase):
             key.startswith("h3_vector_")
             for context in contexts for key in context
         ))
+        self.assertIsNotNone(callbacks[2]["h3_vector_guard_predicted_derivative_ratio"])
+        self.assertIsNotNone(contexts[2]["h3_vector_guard_predicted_derivative_ratio"])
         synthetic = callbacks[2]["x"] - callbacks[2]["sigma"]
         self.assertTrue(torch.equal(callbacks[2]["denoised"], synthetic))
 
@@ -299,7 +304,7 @@ class SamplerTests(unittest.TestCase):
         ):
             out = sample_vector_accel(model, self.x.clone(), self.sigmas, config=config)
         self.assertTrue(torch.equal(out, torch.full_like(self.x, -40.0)))
-        self.assertEqual(model.calls, 13)
+        self.assertEqual(model.calls, 14)
 
 
 if __name__ == "__main__":

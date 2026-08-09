@@ -4,7 +4,11 @@ from dataclasses import dataclass, field
 import math
 
 METHODS = ("native", "hold", "linear_velocity", "vde")
-PROFILES = ("native_20", "conservative_12", "early_aggressive_13", "uniform_13", "late_aggressive_13")
+PROFILES = (
+    "native_20", "late_aggressive_13", "late_cautious_14",
+    "late_aggressive_12", "late_max_11", "conservative_12",
+    "early_aggressive_13", "uniform_13",
+)
 DIAGNOSTICS = ("off", "summary", "full")
 POLICIES = ("fixed", "adaptive_repair")
 QUALITY_PRESETS = ("conservative", "balanced", "aggressive")
@@ -15,13 +19,18 @@ CURVATURE_RATIO = 0.5
 MIN_DIRECTION_COSINE = 0.0
 DEFAULT_MAX_EXTRAPOLATION_RATIO = 1.5
 DEFAULT_SAFETY_FACTOR = 1.25
+DEFAULT_PROTECTED_PREFIX_STEPS = 6
+DEFAULT_AUDIO_EMERGENCY_MULTIPLIER = 4.0
 
 _MASKS = {
     "native_20": (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19),
     "conservative_12": (0, 1, 3, 5, 7, 9, 11, 13, 15, 17, 18, 19),
     "early_aggressive_13": (0, 1, 4, 7, 8, 10, 12, 14, 15, 16, 17, 18, 19),
     "uniform_13": (0, 1, 3, 5, 7, 9, 11, 13, 15, 16, 17, 18, 19),
+    "late_cautious_14": (0, 1, 2, 3, 4, 5, 7, 9, 11, 13, 15, 17, 18, 19),
     "late_aggressive_13": (0, 1, 2, 3, 4, 5, 7, 9, 12, 15, 17, 18, 19),
+    "late_aggressive_12": (0, 1, 2, 3, 4, 5, 9, 13, 16, 17, 18, 19),
+    "late_max_11": (0, 1, 2, 3, 4, 5, 9, 13, 17, 18, 19),
 }
 
 
@@ -60,6 +69,8 @@ class SamplerConfig:
     mask_version: str = MASK_VERSION
     predictor_version: str = PREDICTOR_VERSION
     adaptive_profile_hash: str | None = None
+    protected_prefix_steps: int = DEFAULT_PROTECTED_PREFIX_STEPS
+    audio_emergency_multiplier: float = DEFAULT_AUDIO_EMERGENCY_MULTIPLIER
     _mask: tuple[bool, ...] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self):
@@ -87,7 +98,8 @@ class SamplerConfig:
         for name, value in (("max_extrapolation_ratio", self.max_extrapolation_ratio),
                             ("curvature_ratio", self.curvature_ratio),
                             ("min_direction_cosine", self.min_direction_cosine),
-                            ("safety_factor", self.safety_factor)):
+                            ("safety_factor", self.safety_factor),
+                            ("audio_emergency_multiplier", self.audio_emergency_multiplier)):
             if not isinstance(value, (int, float)) or not math.isfinite(value):
                 raise ValueError(f"{name} must be finite")
         if self.max_extrapolation_ratio <= 0:
@@ -102,6 +114,10 @@ class SamplerConfig:
             raise ValueError("recovery_actual_steps must be a non-negative integer")
         if not isinstance(self.max_consecutive_forecasts, int) or self.max_consecutive_forecasts != 1:
             raise ValueError("the initial adaptive controller requires exactly one maximum consecutive forecast")
+        if not isinstance(self.protected_prefix_steps, int) or self.protected_prefix_steps < 0:
+            raise ValueError("protected_prefix_steps must be a non-negative integer")
+        if self.audio_emergency_multiplier <= 0:
+            raise ValueError("audio_emergency_multiplier must be positive")
         object.__setattr__(self, "_mask", profile_mask(self.evaluation_profile, 20))
 
     @property

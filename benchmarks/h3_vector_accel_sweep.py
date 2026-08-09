@@ -48,7 +48,7 @@ def main():
     parser.add_argument("--adaptive-method", choices=("hold", "linear_velocity", "vde"), default="linear_velocity")
     parser.add_argument("--conditioning-mode", default="default")
     parser.add_argument("--best-fixed-method", choices=("hold", "linear_velocity", "vde"), default="linear_velocity")
-    parser.add_argument("--best-fixed-profile", default="conservative_12")
+    parser.add_argument("--best-fixed-profile", default="late_aggressive_13")
     parser.add_argument("--authorize-gpu", action="store_true")
     args = parser.parse_args()
     if not args.authorize_gpu:
