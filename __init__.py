@@ -37,6 +37,7 @@ from .h3_masked_cache.nodes import MiniMaxH3MaskedCacheExtension
 from .h3_memory_optimizer.nodes import MiniMaxH3MemoryOptimizerExtension
 from .h3_probe.nodes import MiniMaxH3ProbeExtension
 from .h3_sparse_attention.nodes import MiniMaxH3HybridSparseAttentionExtension
+from .h3_vector_accel.nodes import MiniMaxH3VectorAccelExtension
 
 # Comfy serves JavaScript from this directory. The long-form nodes use it for
 # two independent live preview panes because the standard progress protocol
@@ -99,6 +100,7 @@ NODE_CATEGORIES = {
     "MiniMaxH3Ref2VExperimentHarnessZi": "H3-Extender/Experiments",
     "MiniMaxH3LongFormRef2VZi": "H3-Extender/Experiments",
     "MiniMaxH3BridgeExperimentZi": "H3-Extender/Experiments",
+    "MiniMaxH3VectorAccelSamplerZi": "H3-Extender/Experiments",
 }
 
 
@@ -153,6 +155,7 @@ class H3ExtendedExtension(ComfyExtension):
             MiniMaxH3ActivationMemoryExtension(),
             MiniMaxH3MemoryOptimizerExtension(),
             MiniMaxH3HybridSparseAttentionExtension(),
+            MiniMaxH3VectorAccelExtension(),
             MiniMaxH3DiagnosticsExtension(),
         ):
             nodes.extend(

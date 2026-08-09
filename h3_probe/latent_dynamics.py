@@ -357,16 +357,21 @@ class LatentDynamicsTracker:
         self.previous_sample = None
         self.previous_prediction = None
         self.previous_step = None
+        self.previous_prediction_step = None
         self.previous_prediction_activity = None
 
     def close(self):
         self.previous_sample = None
         self.previous_prediction = None
         self.previous_step = None
+        self.previous_prediction_step = None
         self.previous_prediction_activity = None
 
-    def capture(self, run, step, x0, x, total_steps, latent_shapes, queries):
+    def capture(self, run, step, x0, x, total_steps, latent_shapes, queries,
+                callback_metadata=None):
         step = int(step)
+        callback_metadata = dict(callback_metadata or {})
+        forecast = bool(callback_metadata.get("h3_vector_forecast", False))
         sample = _video_from_callback(x, latent_shapes)
         prediction = _video_from_callback(x0, latent_shapes)
         if sample is None:
@@ -380,11 +385,15 @@ class LatentDynamicsTracker:
         sample_now = sample.detach()
         prediction_now = prediction.detach() if prediction is not None else None
         sample_update = _stream_update(self.previous_sample, sample_now)
-        prediction_update = _stream_update(self.previous_prediction, prediction_now)
+        prediction_update = (
+            None
+            if forecast
+            else _stream_update(self.previous_prediction, prediction_now)
+        )
 
         current_activity = _activity_map(prediction_update)
         predictability = None
-        from_step = self.previous_step
+        from_step = self.previous_prediction_step
         if current_activity is not None:
             raw_index = len(getattr(run, "latent_activity_maps", []))
             if hasattr(run, "latent_activity_maps") and hasattr(run, "latent_energy_maps"):
@@ -410,14 +419,17 @@ class LatentDynamicsTracker:
                 predictability["to_step"] = int(step)
             self.previous_prediction_activity = current_activity.detach().to(torch.float32)
         else:
-            self.previous_prediction_activity = None
+            if not forecast:
+                self.previous_prediction_activity = None
 
         self.previous_sample = sample_now.to(dtype=torch.float16).clone()
-        self.previous_prediction = (
-            prediction_now.to(dtype=torch.float16).clone()
-            if prediction_now is not None
-            else None
-        )
+        if not forecast:
+            self.previous_prediction = (
+                prediction_now.to(dtype=torch.float16).clone()
+                if prediction_now is not None
+                else None
+            )
+            self.previous_prediction_step = step
         self.previous_step = step
 
         # First callback establishes the baseline, so there is no step-to-step
@@ -471,6 +483,8 @@ class LatentDynamicsTracker:
         result = {
             "step": step,
             "total_steps": int(total_steps),
+            "h3_vector_forecast": forecast,
+            "h3_vector": callback_metadata or None,
             "anchor_frames": anchors,
             "frames": frame_rows,
             "query_regions": region_rows,

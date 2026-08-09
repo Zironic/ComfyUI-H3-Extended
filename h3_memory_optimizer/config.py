@@ -53,6 +53,9 @@ class MemoryOptimizerConfig:
     block_cache_strict: bool = False
     block_cache_report_directory: str = ""
 
+    timing: bool = False
+    timing_report_directory: str = ""
+
     def __post_init__(self):
         if self.attention not in ATTENTION_MODES:
             raise ValueError("unknown attention mode %r" % self.attention)
@@ -68,6 +71,10 @@ class MemoryOptimizerConfig:
         self.sol_config()
         self.adaln_config()
         self.block_cache_config()
+        if self.timing and not str(self.timing_report_directory or "").strip():
+            raise ValueError(
+                "timing_report_directory is required when timing is enabled"
+            )
 
     def activation_config(self):
         if self.activation == ACTIVATION_OFF:

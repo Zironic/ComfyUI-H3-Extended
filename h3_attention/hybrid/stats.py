@@ -51,6 +51,8 @@ class DeferredCudaTiming:
         self._active = []
         self._last_event = None
         self._resolved = None
+        self._step_index = -1
+        self._branch = (0,)
 
     @property
     def active(self):
@@ -60,7 +62,7 @@ class DeferredCudaTiming:
     def _request_cuda(self):
         return bool(getattr(self, "_cuda", False))
 
-    def begin_request(self, request_id, *, cuda=False):
+    def begin_request(self, request_id, *, cuda=False, snapshot=None):
         request_id = int(request_id)
         if self._request_id != request_id:
             self._request_id = request_id
@@ -68,7 +70,17 @@ class DeferredCudaTiming:
             self._active = []
             self._last_event = None
             self._resolved = None
+            self._step_index = -1
+            self._branch = (0,)
         self._cuda = bool(cuda)
+        if snapshot is not None:
+            self.set_context(snapshot)
+
+    def set_context(self, snapshot):
+        """Set the authoritative request context used by subsequent events."""
+        self._step_index = int(getattr(snapshot, "step_index", -1))
+        branch = getattr(snapshot, "branch", (0,))
+        self._branch = tuple(int(value) for value in branch) or (0,)
 
     def on_request_reset(self, request_id):
         self.begin_request(request_id)
@@ -99,7 +111,7 @@ class DeferredCudaTiming:
         start = self._new_event()
         end = self._new_event()
         start.record()
-        token = (stage, start, end)
+        token = (stage, start, end, self._step_index, self._branch)
         self._active.append(token)
         return token
 
@@ -108,7 +120,7 @@ class DeferredCudaTiming:
             return
         if token is None or token not in self._active:
             return
-        stage, _start, end = token
+        stage, _start, end, _step_index, _branch = token
         end.record()
         self._active.remove(token)
         self._samples[stage].append(token)
@@ -138,7 +150,7 @@ class DeferredCudaTiming:
         total_block_ms = 0.0
         model_forward_ms = 0.0
         for stage in TIMING_STAGES:
-            values = [self._elapsed_ms(start, end) for _, start, end in self._samples[stage]]
+            values = [self._elapsed_ms(start, end) for _, start, end, _, _ in self._samples[stage]]
             stage_sum = sum(values)
             stages[stage] = {
                 "count": len(values),
@@ -151,14 +163,83 @@ class DeferredCudaTiming:
                 total_block_ms = stage_sum
             elif stage == "model_forward":
                 model_forward_ms = stage_sum
+        per_step = self._per_step_summary()
         self._resolved = self.summary(request_wall_seconds, stages=stages,
                                       measured_ms=total_ms,
                                       measured_block_ms=total_block_ms,
-                                      model_forward_ms=model_forward_ms)
+                                      model_forward_ms=model_forward_ms,
+                                      per_step=per_step)
         return self._resolved
 
+    @staticmethod
+    def _stage_stats(samples, elapsed):
+        values = [elapsed(start, end) for _, start, end, _, _ in samples]
+        total = sum(values)
+        return {
+            "count": len(values),
+            "sum_ms": total,
+            "mean_ms": total / len(values) if values else 0.0,
+        }
+
+    def _timing_bucket(self, samples):
+        if isinstance(samples, dict):
+            grouped = samples
+        else:
+            grouped = {stage: [] for stage in TIMING_STAGES}
+            for sample in samples:
+                grouped[sample[0]].append(sample)
+        stages = {
+            stage: self._stage_stats(grouped.get(stage, ()), self._elapsed_ms)
+            for stage in TIMING_STAGES
+        }
+        attention_ms = stages["total_hybrid_attention"]["sum_ms"]
+        block_ms = stages["total_dit_block"]["sum_ms"]
+        model_ms = stages["model_forward"]["sum_ms"]
+        return {
+            "stages": stages,
+            "total_measured_attention_cuda_seconds": attention_ms / 1000.0,
+            "total_measured_dit_block_cuda_seconds": block_ms / 1000.0,
+            "total_model_forward_cuda_seconds": model_ms / 1000.0,
+        }
+
+    def _per_step_summary(self):
+        grouped = {}
+        for stage_samples in self._samples.values():
+            for _stage, start, end, step_index, branch in stage_samples:
+                if step_index < 0:
+                    continue
+                grouped.setdefault((step_index, branch), []).append(
+                    (_stage, start, end, step_index, branch)
+                )
+        by_step = {}
+        for (step_index, branch), samples in grouped.items():
+            by_step.setdefault(step_index, {})[branch] = samples
+        result = []
+        for step_index in sorted(by_step):
+            branches = []
+            all_samples = []
+            for branch in sorted(by_step[step_index]):
+                bucket = self._timing_bucket(by_step[step_index][branch])
+                bucket.update({
+                    "step_index": int(step_index),
+                    "ordinal": int(step_index) + 1,
+                    "branch": list(branch),
+                })
+                branches.append(bucket)
+                all_samples.extend(by_step[step_index][branch])
+            rolled = self._timing_bucket(all_samples)
+            rolled.update({
+                "step_index": int(step_index),
+                "ordinal": int(step_index) + 1,
+                "branches": branches,
+            })
+            # Keep the stage data at the step level while retaining exact CFG
+            # branch identity in the list entries above.
+            result.append(rolled)
+        return result
+
     def summary(self, request_wall_seconds=None, *, stages=None, measured_ms=0.0,
-                measured_block_ms=0.0, model_forward_ms=0.0):
+                measured_block_ms=0.0, model_forward_ms=0.0, per_step=None):
         stages = stages or {
             stage: {"count": 0, "sum_ms": 0.0, "mean_ms": 0.0}
             for stage in TIMING_STAGES
@@ -174,6 +255,7 @@ class DeferredCudaTiming:
             "enabled": bool(self.enabled),
             "call_count": int(stages["total_hybrid_attention"]["count"]),
             "stages": stages,
+            "per_step": list(per_step or []),
             "total_measured_attention_cuda_seconds": cuda_seconds,
             "request_wall_seconds": wall,
             "attention_cuda_to_request_wall_ratio": ratio,
@@ -222,7 +304,7 @@ class HybridStatsCollector:
                 return
             device = getattr(snapshot, "device", None)
             cuda = getattr(device, "type", str(device).split(":", 1)[0]) == "cuda"
-            self._timing.begin_request(snapshot.request_id, cuda=cuda)
+            self._timing.begin_request(snapshot.request_id, cuda=cuda, snapshot=snapshot)
             publish_timing(transformer_options, self._timing)
 
     def record(self, metadata):

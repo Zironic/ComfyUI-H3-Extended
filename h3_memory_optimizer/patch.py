@@ -20,6 +20,7 @@ except ImportError:
 
 from .attention import ATTENTION_EXISTING, ATTENTION_SOL, resolve_attention
 from .config import MemoryOptimizerConfig
+from .timing import MemoryOptimizerTimingListener
 
 LOG_PREFIX = "[H3 memory optimizer]"
 STATUS_KEY = "minimax_h3_memory_optimizer"
@@ -68,6 +69,7 @@ def _record_status(
     adaln_provider=None,
     block_cache=None,
     attention_backend=None,
+    timing_listener=None,
 ):
     options = model_patcher.model_options["transformer_options"] = (
         model_patcher.model_options.get("transformer_options", {}).copy()
@@ -99,6 +101,7 @@ def _record_status(
         else None,
         "adaln": _component_status(adaln_provider),
         "first_block_cache": _component_status(block_cache),
+        "timing": _component_status(timing_listener),
     }
     if pool_policy is not None:
         status["cuda_async_pool_policy"] = pool_policy.as_status()
@@ -114,6 +117,8 @@ def _record_status(
         options["minimax_h3_first_block_cache"] = block_cache
     if result.attention_selected == ATTENTION_SOL:
         options["minimax_h3_sol_backend"] = attention_backend
+    if timing_listener is not None:
+        options["minimax_h3_memory_optimizer_timing"] = timing_listener
 
 
 def apply(
@@ -178,6 +183,14 @@ def apply(
         item for item in getattr(decision.backend, "runtime_listeners", ())
         if item is not None and item not in listeners
     )
+    timing_listener = None
+    if config.timing:
+        timing_listener = MemoryOptimizerTimingListener(
+            config.timing_report_directory,
+            decision.selected,
+            decision.reason,
+        )
+        listeners.append(timing_listener)
 
     configure_shared_block_inductor(
         model_patcher,
@@ -221,6 +234,7 @@ def apply(
         adaln_provider=adaln_provider,
         block_cache=cache_coordinator,
         attention_backend=decision.backend,
+        timing_listener=timing_listener,
     )
 
     level = logging.INFO if decision.selected != ATTENTION_EXISTING else logging.WARNING

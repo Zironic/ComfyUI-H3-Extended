@@ -128,6 +128,29 @@ def render(payload):
             timing.get("ratio_caveat", ""),
             "Stage times are nested/overlapping; do not sum stage totals.",
         ])
+        for step in timing.get("per_step", ()):
+            lines.append(
+                "step %d (ordinal %d): attention %.6f s, DiT block %.6f s, "
+                "model forward %.6f s"
+                % (
+                    int(step["step_index"]),
+                    int(step["ordinal"]),
+                    float(step.get("total_measured_attention_cuda_seconds", 0.0)),
+                    float(step.get("total_measured_dit_block_cuda_seconds", 0.0)),
+                    float(step.get("total_model_forward_cuda_seconds", 0.0)),
+                )
+            )
+            for branch in step.get("branches", ()):
+                lines.append(
+                    "  branch %s: attention %.6f s, DiT block %.6f s, "
+                    "model forward %.6f s"
+                    % (
+                        ",".join(str(value) for value in branch.get("branch", ())),
+                        float(branch.get("total_measured_attention_cuda_seconds", 0.0)),
+                        float(branch.get("total_measured_dit_block_cuda_seconds", 0.0)),
+                        float(branch.get("total_model_forward_cuda_seconds", 0.0)),
+                    )
+                )
     return "\n".join(lines) + "\n"
 
 

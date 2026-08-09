@@ -2,6 +2,7 @@
 
 import os
 import sys
+from unittest import mock
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(_HERE))
@@ -25,7 +26,9 @@ from h3_memory_optimizer.attention import (  # noqa: E402
 )
 from h3_activation_memory.config import MODE_NATIVE  # noqa: E402
 from h3_memory_optimizer.config import ACTIVATION_OFF, MemoryOptimizerConfig  # noqa: E402
+from h3_memory_optimizer.nodes import MiniMaxH3MemoryOptimizer  # noqa: E402
 from h3_memory_optimizer.patch import apply  # noqa: E402
+from h3_memory_optimizer.timing import MemoryOptimizerTimingListener  # noqa: E402
 
 
 def check(value, message):
@@ -157,6 +160,23 @@ def test_config():
     options = sol.attention_options()
     check(options["gate_heads"] == 3 and options["density_heads"] == 2, "Sol settings reach adapter options")
     check(sol.adaln_config().mode == "off" and sol.block_cache_config().mode == "off", "approximate/cache features remain off by default")
+    try:
+        MemoryOptimizerConfig(timing=True)
+    except ValueError as exc:
+        check("timing_report_directory" in str(exc),
+              "enabled timing requires an owned report directory")
+    else:
+        raise AssertionError("enabled timing without a report directory must raise")
+    timed = MemoryOptimizerConfig(timing=True, timing_report_directory="output")
+    check(timed.timing, "valid timing configuration is retained")
+
+
+def test_timing_schema():
+    print("timing schema")
+    schema = MiniMaxH3MemoryOptimizer.define_schema()
+    timing = next(item for item in schema.inputs if item.id == "timing")
+    check(schema.inputs[-1] is timing and timing.default is False,
+          "timing is appended and defaults off for saved-workflow compatibility")
 
 
 def test_apply_order_and_fallback():
@@ -317,12 +337,117 @@ def test_backend_runtime_capabilities():
           "backend capability and status replace Sol-specific checks")
 
 
+def test_dense_timing_runtime_and_report():
+    print("dense timing runtime")
+
+    class Decision:
+        requested = ATTENTION_EXISTING
+        selected = ATTENTION_EXISTING
+        backend = None
+        projector = None
+        reason = "existing attention requested"
+        environment = env()
+
+    seen = {}
+
+    def disabled(model, config):
+        return None, 0
+
+    def runtime(model, session):
+        seen["session"] = session
+        return session
+
+    patcher = FakePatcher()
+    result = apply(
+        patcher,
+        config=MemoryOptimizerConfig(
+            attention=ATTENTION_EXISTING,
+            activation=ACTIVATION_OFF,
+            timing=True,
+            timing_report_directory="output",
+        ),
+        decision=Decision(),
+        activation_installer=lambda model, config: 0,
+        adaln_installer=disabled,
+        block_cache_installer=disabled,
+        runtime_installer=runtime,
+    )
+    listener = next(
+        item for item in seen["session"].listeners
+        if isinstance(item, MemoryOptimizerTimingListener)
+    )
+    check(result.runtime_installed and listener.report_directory == "output",
+          "dense timing installs the request-scoped runtime listener")
+    status = patcher.model_options["transformer_options"]["minimax_h3_memory_optimizer"]
+    check(status["timing"]["enabled"] and status["timing"]["selected_attention"] == ATTENTION_EXISTING,
+          "optimizer status exposes the active timing owner")
+
+    timing = {
+        "request_wall_seconds": 2.0,
+        "total_measured_attention_cuda_seconds": 0.2,
+        "total_measured_dit_block_cuda_seconds": 0.4,
+        "total_model_forward_cuda_seconds": 0.5,
+        "model_forward_call_count": 2,
+        "stages": {
+            "total_dit_block": {"count": 2, "sum_ms": 400.0, "mean_ms": 200.0},
+        },
+        "per_step": [{
+            "step_index": 0,
+            "ordinal": 1,
+            "total_measured_attention_cuda_seconds": 0.2,
+            "total_measured_dit_block_cuda_seconds": 0.4,
+            "total_model_forward_cuda_seconds": 0.5,
+            "branches": [{
+                "branch": [0],
+                "total_measured_attention_cuda_seconds": 0.2,
+                "total_measured_dit_block_cuda_seconds": 0.4,
+                "total_model_forward_cuda_seconds": 0.5,
+            }],
+        }],
+    }
+    payload = {
+        "selected_attention": ATTENTION_EXISTING,
+        "attention_reason": "test",
+        "timing": timing,
+    }
+    text = listener._render(payload)
+    check("total_dit_block: count=2" in text and "step 0 (ordinal 1)" in text
+          and "branch 0:" in text,
+          "dense text report includes aggregate, step, and branch timing")
+
+    class ResolvedTiming:
+        def resolve(self, seconds):
+            check(seconds == 2.0, "dense report resolves timing with request wall time")
+            return timing
+
+    writer = MemoryOptimizerTimingListener(
+        "output",
+        ATTENTION_EXISTING,
+        "test",
+        timing=ResolvedTiming(),
+    )
+    writer._timestamp = "test"
+    opened = mock.mock_open()
+    with mock.patch("h3_memory_optimizer.timing.os.makedirs") as makedirs, \
+            mock.patch("h3_memory_optimizer.timing.open", opened):
+        directory = writer.on_request_end(9, 2.0)
+    check(directory == os.path.join("output", "timing_test")
+          and makedirs.call_args == mock.call(directory, exist_ok=False),
+          "dense timing owns one request report directory")
+    paths = [call.args[0] for call in opened.call_args_list]
+    check(paths == [os.path.join(directory, "report.json"),
+                    os.path.join(directory, "report.txt")],
+          "dense timing writes JSON and text reports")
+
+
 def main():
     test_architecture_probes()
     test_resolution()
     test_config()
+    test_timing_schema()
     test_apply_order_and_fallback()
     test_backend_runtime_capabilities()
+    test_dense_timing_runtime_and_report()
     print("\nall unified memory-optimizer tests passed")
 
 

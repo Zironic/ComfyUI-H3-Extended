@@ -313,7 +313,13 @@ def make_diffusion_wrapper(session):
         context = args[2] if len(args) > 2 else kwargs.get("context")
         payload = kwargs.get("minimax_payload") or {}
         snapshot = session.observe(x, timestep, context, transformer_options, payload)
-        result = executor(*args, **kwargs)
+        timing = get_timing(transformer_options)
+        token = timing.begin("model_forward") if timing is not None else None
+        try:
+            result = executor(*args, **kwargs)
+        finally:
+            if timing is not None:
+                timing.end(token)
         session.after_forward(snapshot, result, transformer_options)
         return result
     return wrapper

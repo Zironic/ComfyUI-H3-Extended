@@ -26,9 +26,23 @@ can be loaded at the same time:
 | `MiniMaxH3Ref2VExperimentHarnessZi` | MiniMax H3 Ref2V Experiment Harness (Zi) |
 | `MiniMaxH3MaskedRef2VCacheZi` | MiniMax H3 Masked Ref2V Cache (Zi) |
 | `MiniMaxH3HybridSparseAttentionZi` | MiniMax H3 Hybrid Sparse Attention (Zi) |
+| `MiniMaxH3VectorAccelSamplerZi` | MiniMax H3 Vector Accel Sampler (Zi) |
 
 Existing workflows still point at the stock ids; re-add the `(Zi)` nodes to use
 this copy.
+
+## Vector acceleration sampler
+
+`MiniMaxH3VectorAccelSamplerZi` is an experimental deterministic-flow sampler
+for H3's packed video/audio latent. It keeps the scheduler's full sigma grid but
+can replace selected H3 forwards with held or linearly extrapolated derivatives.
+The named forecast profiles are exact 20-step masks; native mode remains the
+parity baseline and evaluates every step. Forecast guards fail closed to genuine
+H3 evaluations, and diagnostics report logical steps separately from true NFE.
+
+Adaptive repair-aware skipping and VDE are deliberately unavailable until the
+fixed-mask GPU and repairability studies in
+[`H3_VECTOR_ACCEL_PLAN.md`](H3_VECTOR_ACCEL_PLAN.md) justify them.
 
 ## MoBA 3D probe execution geometry
 

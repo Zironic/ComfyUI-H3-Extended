@@ -12,6 +12,11 @@ try:
 except ImportError:
     from h3_attention.observer import observing
 
+try:
+    from ..h3_vector_accel.diagnostics import current_callback_metadata
+except ImportError:
+    from h3_vector_accel.diagnostics import current_callback_metadata
+
 
 class MobaProbeRun:
     def __init__(self, session, tag, out_dir):
@@ -233,6 +238,7 @@ def make_outer_wrapper(session):
                         total_steps,
                         latent_shapes,
                         run.dynamics_queries,
+                        callback_metadata=current_callback_metadata(),
                     )
                     if rec is not None:
                         run.latent_dynamics.append(rec)

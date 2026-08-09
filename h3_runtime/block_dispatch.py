@@ -11,13 +11,22 @@ import torch
 import comfy.ops
 from comfy.quant_ops import QuantizedTensor, TensorWiseINT8Layout
 
-from h3_activation_memory.chunks import iter_mod_chunks, validate_mod_segments
-from h3_activation_memory.config import MODE_CONVROT_2SLICE
-from h3_activation_memory.linear import acquire_linear
-from h3_activation_memory.observer import OBSERVER_KEY as ACTIVATION_OBSERVER_KEY
-from h3_activation_memory.stats import get_stats
-from h3_attention.hybrid.config import MODE_SAGE128_FUSED_QKV
-from h3_attention.observer import OBSERVER_KEY as ATTENTION_OBSERVER_KEY
+try:
+    from ..h3_activation_memory.chunks import iter_mod_chunks, validate_mod_segments
+    from ..h3_activation_memory.config import MODE_CONVROT_2SLICE
+    from ..h3_activation_memory.linear import acquire_linear
+    from ..h3_activation_memory.observer import OBSERVER_KEY as ACTIVATION_OBSERVER_KEY
+    from ..h3_activation_memory.stats import get_stats
+    from ..h3_attention.hybrid.config import MODE_SAGE128_FUSED_QKV
+    from ..h3_attention.observer import OBSERVER_KEY as ATTENTION_OBSERVER_KEY
+except ImportError:
+    from h3_activation_memory.chunks import iter_mod_chunks, validate_mod_segments
+    from h3_activation_memory.config import MODE_CONVROT_2SLICE
+    from h3_activation_memory.linear import acquire_linear
+    from h3_activation_memory.observer import OBSERVER_KEY as ACTIVATION_OBSERVER_KEY
+    from h3_activation_memory.stats import get_stats
+    from h3_attention.hybrid.config import MODE_SAGE128_FUSED_QKV
+    from h3_attention.observer import OBSERVER_KEY as ATTENTION_OBSERVER_KEY
 
 from .block_compile import (
     BlockCarriers,

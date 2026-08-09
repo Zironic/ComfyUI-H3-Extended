@@ -186,6 +186,55 @@ def test_deferred_timing():
           "disabled timing allocates no CUDA events")
 
 
+def test_per_step_timing():
+    print("per-step CUDA timing")
+    clock = [0.0]
+    events = []
+    timer = DeferredCudaTiming(
+        True,
+        event_factory=lambda **kwargs: FakeTimingEvent(clock, events),
+    )
+    timer.begin_request(4, cuda=False)
+
+    def record(stage, step_index, branch):
+        snapshot = options()[RUNTIME_KEY]
+        snapshot = RuntimeSnapshot(
+            request_id=4,
+            step_index=step_index,
+            total_steps=snapshot.total_steps,
+            sigma=snapshot.sigma,
+            branch=branch,
+            layout=snapshot.layout,
+            layout_signature=snapshot.layout_signature,
+            compute_dtype=snapshot.compute_dtype,
+            device=snapshot.device,
+        )
+        timer.set_context(snapshot)
+        token = timer.begin(stage)
+        timer.end(token)
+
+    record("total_dit_block", 0, (0,))
+    record("total_dit_block", 0, (1,))
+    record("model_forward", 0, (0,))
+    record("total_hybrid_attention", 1, (0,))
+    record("total_dit_block", -1, (0,))
+    summary = timer.resolve(5.0)
+
+    check(sum(item[0] == "synchronize" for item in events) == 1,
+          "per-step resolution synchronizes once")
+    check(summary["stages"]["total_dit_block"]["count"] == 3,
+          "request aggregate retains events without a known step")
+    check([step["step_index"] for step in summary["per_step"]] == [0, 1],
+          "per-step summary excludes unknown steps and keeps sampler order")
+    first = summary["per_step"][0]
+    check(first["stages"]["total_dit_block"]["count"] == 2,
+          "step summary rolls CFG branches together")
+    check([branch["branch"] for branch in first["branches"]] == [[0], [1]],
+          "step summary preserves exact CFG branch buckets")
+    check(first["stages"]["model_forward"]["count"] == 1,
+          "step summary includes model-forward timing")
+
+
 def backend(kernel=None, collector=None, budget=0.5):
     kernel = kernel or FakeSparseKernel()
     api = SparseSageAPI(version="0.1.test", low_level_f16=kernel,
@@ -374,6 +423,7 @@ def main():
     test_node_mode_schema()
     test_report_files()
     test_deferred_timing()
+    test_per_step_timing()
     optional_cuda_numerical()
     print("\nall hybrid attention tests passed")
 

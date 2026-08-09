@@ -15,19 +15,34 @@ from typing import NamedTuple
 import torch
 import torch.nn.functional as F
 
-from h3_activation_memory.config import ActivationMemoryConfig, MODE_CONVROT_2SLICE
-from h3_activation_memory.linear import (
-    _convrot_fc1_tiles_op,
-    _convrot_fc2_tiles_op,
-    _convrot_linear_op,
-)
-from h3_attention.hybrid.config import HybridSparseConfig, MODE_SAGE128_FUSED_QKV
-from h3_attention.hybrid.fused_qkv import fused_qkv_op
-from h3_attention.hybrid.router import SparseTileGeometry, sort_selected_indices
-from h3_attention.hybrid.sparse_sage import (
-    prepare_sparse_sage_v_op,
-    sparse_sage_attention_op,
-)
+try:
+    from ..h3_activation_memory.config import ActivationMemoryConfig, MODE_CONVROT_2SLICE
+    from ..h3_activation_memory.linear import (
+        _convrot_fc1_tiles_op,
+        _convrot_fc2_tiles_op,
+        _convrot_linear_op,
+    )
+    from ..h3_attention.hybrid.config import HybridSparseConfig, MODE_SAGE128_FUSED_QKV
+    from ..h3_attention.hybrid.fused_qkv import fused_qkv_op
+    from ..h3_attention.hybrid.router import SparseTileGeometry, sort_selected_indices
+    from ..h3_attention.hybrid.sparse_sage import (
+        prepare_sparse_sage_v_op,
+        sparse_sage_attention_op,
+    )
+except ImportError:
+    from h3_activation_memory.config import ActivationMemoryConfig, MODE_CONVROT_2SLICE
+    from h3_activation_memory.linear import (
+        _convrot_fc1_tiles_op,
+        _convrot_fc2_tiles_op,
+        _convrot_linear_op,
+    )
+    from h3_attention.hybrid.config import HybridSparseConfig, MODE_SAGE128_FUSED_QKV
+    from h3_attention.hybrid.fused_qkv import fused_qkv_op
+    from h3_attention.hybrid.router import SparseTileGeometry, sort_selected_indices
+    from h3_attention.hybrid.sparse_sage import (
+        prepare_sparse_sage_v_op,
+        sparse_sage_attention_op,
+    )
 
 
 class H3BlockError(ValueError):

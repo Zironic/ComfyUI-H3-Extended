@@ -379,6 +379,45 @@ def test_tracker_causal_staging():
           "closing a run clears predictor state")
 
 
+def test_tracker_excludes_forecast_predictions():
+    print("tracker forecast exclusion")
+    run = SimpleNamespace(
+        anchor_frames=[],
+        layout=SimpleNamespace(video_range=(0, 27)),
+        latent_activity_maps=[],
+        latent_energy_maps=[],
+    )
+    tracker = latent_dynamics.LatentDynamicsTracker()
+    baseline = torch.ones(1, 1, 3, 6, 6)
+    tracker.capture(run, 0, baseline, baseline, 3, None, ())
+
+    synthetic = baseline + 10.0
+    forecast = tracker.capture(
+        run, 1, synthetic, synthetic, 3, None, (),
+        callback_metadata={
+            "h3_vector_forecast": True,
+            "h3_vector_true_nfe": 1,
+        },
+    )
+    check(forecast["h3_vector_forecast"] is True
+          and forecast["global"]["prediction"] is None,
+          "forecast callback is labelled and excluded from prediction deltas")
+    check(tracker.previous_prediction_step == 0
+          and len(run.latent_activity_maps) == 0,
+          "synthetic x0 does not become an actual prediction anchor")
+
+    actual = baseline + 0.25
+    resumed = tracker.capture(
+        run, 2, actual, actual, 3, None, (),
+        callback_metadata={"h3_vector_forecast": False},
+    )
+    check(resumed["global"]["prediction"]["update_rms"] < 1.0,
+          "next genuine prediction compares with the prior genuine anchor")
+    check(tracker.previous_prediction_step == 2
+          and len(run.latent_activity_maps) == 1,
+          "genuine callback resumes the actual-only prediction stream")
+
+
 def test_attention_bypass_keeps_dynamics_layout(lay):
     print("attention bypass")
     session = moba_capture.MobaProbeSession(
@@ -700,6 +739,7 @@ def main():
         test_sage_sparse_execution_geometry(lay)
         test_active_mask_predictor()
         test_tracker_causal_staging()
+        test_tracker_excludes_forecast_predictions()
         test_attention_bypass_keeps_dynamics_layout(lay)
         test_latent_dynamics_math()
         test_latent_dynamics_summary()

@@ -1,5 +1,8 @@
 """User-facing H3 memory and experimental acceleration patches."""
 
+import os
+
+import folder_paths
 from comfy_api.latest import ComfyExtension, io
 
 try:
@@ -17,6 +20,10 @@ from .attention import ATTENTION_SOL, FALLBACK_MODES, resolve_attention
 from .config import ACTIVATION_MODES, MemoryOptimizerConfig
 from .cuda_pool import configure_cuda_async_soft_gc
 from .patch import apply
+
+
+def _timing_report_root():
+    return os.path.join(folder_paths.get_output_directory(), "h3_memory_optimizer")
 
 
 class MiniMaxH3MemoryOptimizer(io.ComfyNode):
@@ -63,6 +70,7 @@ class MiniMaxH3MemoryOptimizer(io.ComfyNode):
                     step=256,
                 ),
                 io.Boolean.Input("prefer_held_weights", default=True),
+                io.Boolean.Input("timing", default=False),
             ],
             outputs=[io.Model.Output()],
         )
@@ -76,6 +84,7 @@ class MiniMaxH3MemoryOptimizer(io.ComfyNode):
         activation=DEFAULT_MODE,
         chunk_rows=DEFAULT_CHUNK_ROWS,
         prefer_held_weights=True,
+        timing=False,
     ):
         if not enabled:
             return io.NodeOutput(model)
@@ -91,6 +100,8 @@ class MiniMaxH3MemoryOptimizer(io.ComfyNode):
             adaln_precompute="off",
             block_cache="off",
             cuda_async_soft_gc=False,
+            timing=bool(timing),
+            timing_report_directory=_timing_report_root() if timing else "",
         )
         decision = resolve_attention(
             config.attention,
