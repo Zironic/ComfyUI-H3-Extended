@@ -8,14 +8,22 @@ try:
     from ..h3_adaln.patch import install as install_adaln
     from ..h3_attention.config import configure_backend
     from ..h3_block_cache.patch import install as install_block_cache
-    from ..h3_runtime.context import H3RuntimeSession, install_runtime_wrapper
+    from ..h3_runtime.context import (
+        H3RuntimeSession,
+        RUNTIME_SESSION_KEY,
+        install_runtime_wrapper,
+    )
     from ..h3_runtime.compile_compat import configure_shared_block_inductor
 except ImportError:
     from h3_activation_memory.patch import install as install_activation
     from h3_adaln.patch import install as install_adaln
     from h3_attention.config import configure_backend
     from h3_block_cache.patch import install as install_block_cache
-    from h3_runtime.context import H3RuntimeSession, install_runtime_wrapper
+    from h3_runtime.context import (
+        H3RuntimeSession,
+        RUNTIME_SESSION_KEY,
+        install_runtime_wrapper,
+    )
     from h3_runtime.compile_compat import configure_shared_block_inductor
 
 from .attention import ATTENTION_EXISTING, ATTENTION_SOL, resolve_attention
@@ -110,7 +118,7 @@ def _record_status(
     # Keep the live objects available to diagnostics without serializing them
     # into the human-readable status dictionary.
     if runtime_session is not None:
-        options["minimax_h3_runtime_session"] = runtime_session
+        options[RUNTIME_SESSION_KEY] = runtime_session
     if adaln_provider is not None:
         options["minimax_h3_adaln_provider"] = adaln_provider
     if block_cache is not None:
@@ -119,6 +127,34 @@ def _record_status(
         options["minimax_h3_sol_backend"] = attention_backend
     if timing_listener is not None:
         options["minimax_h3_memory_optimizer_timing"] = timing_listener
+
+
+def _reuse_or_install_runtime(model_patcher, listeners, strict_layout, runtime_installer):
+    """Return one shared H3 runtime session for every acceleration feature.
+
+    Model-patch nodes may be ordered either before or after the memory optimizer.
+    Reusing an already-published session avoids duplicate OUTER_SAMPLE and
+    DIFFUSION_MODEL/APPLY_MODEL wrappers and keeps request ids authoritative.
+    """
+    options = model_patcher.model_options.get("transformer_options", {})
+    existing = options.get(RUNTIME_SESSION_KEY)
+    if existing is not None:
+        if not hasattr(existing, "add_listener"):
+            raise TypeError(
+                "%s is not an H3 runtime session" % RUNTIME_SESSION_KEY
+            )
+        if strict_layout:
+            existing.strict_layout = True
+        for listener in listeners:
+            existing.add_listener(listener)
+        return existing, False
+
+    session = H3RuntimeSession(
+        strict_layout=bool(strict_layout),
+        listeners=listeners,
+    )
+    runtime_installer(model_patcher, session)
+    return session, True
 
 
 def apply(
@@ -203,12 +239,14 @@ def apply(
         listeners or _backend_flag(decision.backend, "requires_runtime_context")
     )
     runtime_session = None
+    runtime_created = False
     if runtime_needed:
-        runtime_session = H3RuntimeSession(
-            strict_layout=_backend_flag(decision.backend, "strict_runtime_layout"),
-            listeners=listeners,
+        runtime_session, runtime_created = _reuse_or_install_runtime(
+            model_patcher,
+            listeners,
+            _backend_flag(decision.backend, "strict_runtime_layout"),
+            runtime_installer,
         )
-        runtime_installer(model_patcher, runtime_session)
 
     result = ApplyResult(
         attention_requested=decision.requested,
@@ -241,7 +279,7 @@ def apply(
     logging.log(
         level,
         "%s armed: attention=%s requested=%s blocks=%d activation=%s blocks=%d "
-        "adaln=%s blocks=%d first_block_cache=%s blocks=%d runtime=%s "
+        "adaln=%s blocks=%d first_block_cache=%s blocks=%d runtime=%s created=%s "
         "device=%s arch=%s",
         LOG_PREFIX,
         result.attention_selected,
@@ -254,6 +292,7 @@ def apply(
         result.block_cache_mode,
         result.block_cache_blocks,
         result.runtime_installed,
+        runtime_created,
         result.device_name,
         result.architecture,
     )
