@@ -59,7 +59,6 @@ def _dynamic_rows(snapshot, scope):
 
 
 def estimated_cache_bytes(snapshot, config, hidden: int, ffn: int):
-    """Estimate persistent BF16 output + selected-activation cache bytes."""
     rows = _dynamic_rows(snapshot, config.scope)
     layer_start = max(int(config.layer_start), int(config.first_dense_layers))
     layers = max(0, int(config.layer_stop) - layer_start)
@@ -84,51 +83,48 @@ def _check_gpu_budget(snapshot, config, hidden, ffn):
         )
 
 
-class ConvRotGroupWeights:
-    """Acquire H3 ConvRot INT8 MLP carriers for one block invocation."""
+class ConvRotFC1:
+    """Short-lived fc1 lease. Never overlaps an fc2 lease."""
 
     def __init__(self, mlp, sample):
         self.mlp = mlp
         self.sample = sample
-        self.fc1 = None
-        self.fc2 = None
-        self.fc1_q = self.fc1_s = self.fc2_q = self.fc2_s = None
+        self.lease = None
+        self.q = self.scale = None
 
     def __enter__(self):
-        self.fc1 = acquire_linear(self.mlp.fc1, self.sample)
-        self.fc2 = acquire_linear(self.mlp.fc2, self.sample)
-        if self.fc1.bias is not None or self.fc2.bias is not None:
-            raise ChipmunkExecutionError("H3 Chipmunk requires bias-free fc1/fc2")
-        self.fc1_q, self.fc1_s = _convrot_parts(self.fc1.weight, "chipmunk.fc1")
-        self.fc2_q, self.fc2_s = _convrot_parts(self.fc2.weight, "chipmunk.fc2")
-        if self.fc1_q.shape[0] != 2 * self.fc2_q.shape[1]:
-            raise ChipmunkExecutionError("fc1/fc2 are not a SwiGLU pair")
-        if self.ffn % 256:
-            raise ChipmunkExecutionError("H3 Chipmunk requires a ConvRot-256-aligned FFN")
+        self.lease = acquire_linear(self.mlp.fc1, self.sample)
+        if self.lease.bias is not None:
+            raise ChipmunkExecutionError("H3 Chipmunk requires bias-free fc1")
+        self.q, self.scale = _convrot_parts(self.lease.weight, "chipmunk.fc1")
+        if self.q.shape[0] % 2:
+            raise ChipmunkExecutionError("fc1 output must split into a SwiGLU pair")
+        if self.ffn % 256 or self.hidden % 256:
+            raise ChipmunkExecutionError("H3 Chipmunk requires ConvRot-256 alignment")
         return self
 
     @property
     def ffn(self):
-        return int(self.fc2_q.shape[1])
+        return int(self.q.shape[0]) // 2
 
     @property
     def hidden(self):
-        return int(self.fc2_q.shape[0])
+        return int(self.q.shape[1])
 
-    def full_fc1(self, x):
+    def full(self, x):
         return comfy.quant_ops.ck.int8_linear(
-            x, self.fc1_q, self.fc1_s, None, x.dtype,
+            x, self.q, self.scale, None, x.dtype,
             convrot=True, convrot_groupsize=256,
         )
 
     def selected_activation(self, x, logical_indices):
         logical_indices = logical_indices.long()
         rows = torch.cat((logical_indices, logical_indices + self.ffn), dim=0)
-        q = self.fc1_q.index_select(0, rows).contiguous()
+        q = self.q.index_select(0, rows).contiguous()
         scale = (
-            self.fc1_s
-            if self.fc1_s.numel() == 1
-            else self.fc1_s.index_select(0, rows).contiguous()
+            self.scale
+            if self.scale.numel() == 1
+            else self.scale.index_select(0, rows).contiguous()
         )
         expanded = comfy.quant_ops.ck.int8_linear(
             x, q, scale, None, x.dtype,
@@ -136,23 +132,52 @@ class ConvRotGroupWeights:
         )
         return logical_swiglu(expanded)
 
-    def selected_fc2(self, activation, logical_indices):
-        q = self.fc2_q.index_select(1, logical_indices.long()).contiguous()
+    def __exit__(self, exc_type, exc, tb):
+        if self.lease is not None:
+            self.lease.release()
+            self.lease = None
+        self.q = self.scale = None
+        return False
+
+
+class ConvRotFC2:
+    """Short-lived fc2 lease. Acquired only after fc1 has been released."""
+
+    def __init__(self, mlp, sample):
+        self.mlp = mlp
+        self.sample = sample
+        self.lease = None
+        self.q = self.scale = None
+
+    def __enter__(self):
+        self.lease = acquire_linear(self.mlp.fc2, self.sample)
+        if self.lease.bias is not None:
+            raise ChipmunkExecutionError("H3 Chipmunk requires bias-free fc2")
+        self.q, self.scale = _convrot_parts(self.lease.weight, "chipmunk.fc2")
+        if self.ffn % 256:
+            raise ChipmunkExecutionError("fc2 input must be ConvRot-256 aligned")
+        return self
+
+    @property
+    def ffn(self):
+        return int(self.q.shape[1])
+
+    @property
+    def hidden(self):
+        return int(self.q.shape[0])
+
+    def selected(self, activation, logical_indices):
+        q = self.q.index_select(1, logical_indices.long()).contiguous()
         return comfy.quant_ops.ck.int8_linear(
-            activation, q, self.fc2_s, None, activation.dtype,
+            activation, q, self.scale, None, activation.dtype,
             convrot=True, convrot_groupsize=256,
         )
 
-    def release(self):
-        if self.fc2 is not None:
-            self.fc2.release()
-            self.fc2 = None
-        if self.fc1 is not None:
-            self.fc1.release()
-            self.fc1 = None
-
     def __exit__(self, exc_type, exc, tb):
-        self.release()
+        if self.lease is not None:
+            self.lease.release()
+            self.lease = None
+        self.q = self.scale = None
         return False
 
 
@@ -162,13 +187,13 @@ def _logical_indices(groups: torch.Tensor, count: int, feature_group: int):
     return (groups[:, None] * feature_group + offsets[None]).reshape(-1)
 
 
-def _selector(weights, h, cache, config):
+def _selector(fc1, h, cache, config):
     tg = int(config.token_group_rows)
     means = torch.stack([
         h[a:min(h.shape[0], a + tg)].mean(dim=0)
         for a in range(0, h.shape[0], tg)
     ], dim=0)
-    act = logical_swiglu(weights.full_fc1(means))
+    act = logical_swiglu(fc1.full(means))
     fg = int(config.feature_group)
     if act.shape[-1] % fg:
         raise ChipmunkExecutionError("H3 FFN is not feature-group aligned")
@@ -182,7 +207,7 @@ def _selector(weights, h, cache, config):
     return indices, counts, scores
 
 
-def _selected_activation_all_groups(weights, h, indices, counts, config):
+def _selected_activation_all_groups(fc1, h, indices, counts, config):
     indices = _load_tensor(indices, h.device)
     counts = _load_tensor(counts, h.device)
     tg = int(config.token_group_rows)
@@ -191,11 +216,11 @@ def _selected_activation_all_groups(weights, h, indices, counts, config):
     for gi, a in enumerate(range(0, h.shape[0], tg)):
         b = min(h.shape[0], a + tg)
         logical = _logical_indices(indices[gi], int(counts[gi].item()), fg)
-        pieces.append(weights.selected_activation(h[a:b], logical))
+        pieces.append(fc1.selected_activation(h[a:b], logical))
     return torch.cat(pieces, dim=0)
 
 
-def _delta_update(weights, h, cache, config):
+def _delta_update(block, h, cache, config):
     if (
         cache.selected_groups is None or cache.selected_counts is None
         or cache.activation is None or cache.output is None
@@ -203,22 +228,38 @@ def _delta_update(weights, h, cache, config):
         raise ChipmunkExecutionError("sparse update requested without a dense cache")
     indices = _load_tensor(cache.selected_groups, h.device)
     counts = _load_tensor(cache.selected_counts, h.device)
-    activation = _load_tensor(cache.activation, h.device)
+    old_activation = _load_tensor(cache.activation, h.device)
     out = _load_tensor(cache.output, h.device)
+
+    with ConvRotFC1(block.mlp, h[:1]) as fc1:
+        current_activation = _selected_activation_all_groups(
+            fc1, h, indices, counts, config
+        )
+
     tg = int(config.token_group_rows)
     fg = int(config.feature_group)
-    for gi, a in enumerate(range(0, h.shape[0], tg)):
-        b = min(h.shape[0], a + tg)
-        logical = _logical_indices(indices[gi], int(counts[gi].item()), fg)
-        current = weights.selected_activation(h[a:b], logical)
-        old = activation[a:b]
-        old_part = weights.selected_fc2(old, logical)
-        new_part = weights.selected_fc2(current, logical)
-        out[a:b].sub_(old_part).add_(new_part)
-        activation[a:b].copy_(current)
-    cache.activation = _store_tensor(activation, config)
+    with ConvRotFC2(block.mlp, current_activation[:1]) as fc2:
+        for gi, a in enumerate(range(0, h.shape[0], tg)):
+            b = min(h.shape[0], a + tg)
+            logical = _logical_indices(indices[gi], int(counts[gi].item()), fg)
+            old_part = fc2.selected(old_activation[a:b], logical)
+            new_part = fc2.selected(current_activation[a:b], logical)
+            out[a:b].sub_(old_part).add_(new_part)
+
+    cache.activation = _store_tensor(current_activation, config)
     cache.output = _store_tensor(out, config)
     return out
+
+
+def _refresh_cache(block, h, out, cache, config, snapshot):
+    with ConvRotFC1(block.mlp, h[:1]) as fc1:
+        _check_gpu_budget(snapshot, config, fc1.hidden, fc1.ffn)
+        indices, counts, scores = _selector(fc1, h, cache, config)
+        selected = _selected_activation_all_groups(fc1, h, indices, counts, config)
+        active = float(indices.shape[1] * config.feature_group / fc1.ffn)
+    cache.activation = _store_tensor(selected, config)
+    cache.output = _store_tensor(out, config) if config.mode == "reference_delta" else None
+    return active, scores
 
 
 def run_chipmunk_chunk(
@@ -232,8 +273,10 @@ def run_chipmunk_chunk(
     kind = _segment_kind(snapshot, chunk_start, chunk_stop)
     eligible = (
         max(config.layer_start, config.first_dense_layers) <= layer_index < config.layer_stop
-        and (config.scope == "all_dynamic" and kind in ("audio", "video")
-             or config.scope == "target_video" and kind == "video")
+        and (
+            (config.scope == "all_dynamic" and kind in ("audio", "video"))
+            or (config.scope == "target_video" and kind == "video")
+        )
     )
     step = int(getattr(snapshot, "step_index", -1))
 
@@ -242,19 +285,9 @@ def run_chipmunk_chunk(
         cache.dense_calls += 1
         if eligible:
             try:
-                with ConvRotGroupWeights(block.mlp, h[:1]) as weights:
-                    _check_gpu_budget(snapshot, config, weights.hidden, weights.ffn)
-                    indices, counts, scores = _selector(weights, h, cache, config)
-                    selected = _selected_activation_all_groups(weights, h, indices, counts, config)
-                    cache.activation = _store_tensor(selected, config)
-                    cache.output = (
-                        _store_tensor(out, config)
-                        if config.mode == "reference_delta"
-                        else None
-                    )
-                    cache.refresh_step = step
-                    cache.update_step = step
-                    active = float(indices.shape[1] * config.feature_group / weights.ffn)
+                active, scores = _refresh_cache(block, h, out, cache, config, snapshot)
+                cache.refresh_step = step
+                cache.update_step = step
                 session.record(
                     step=step, layer=layer_index, chunk=chunk_index, kind=kind,
                     path="dense_refresh", active_fraction=active,
@@ -276,14 +309,14 @@ def run_chipmunk_chunk(
         out = dense_runner(h)
         cache.dense_calls += 1
         try:
-            with ConvRotGroupWeights(block.mlp, h[:1]) as weights:
-                previous_indices = cache.selected_groups
-                previous_counts = cache.selected_counts
-                previous_activation = cache.activation
-                delta_rms = float("nan")
+            previous_indices = cache.selected_groups
+            previous_counts = cache.selected_counts
+            previous_activation = cache.activation
+            delta_rms = float("nan")
+            with ConvRotFC1(block.mlp, h[:1]) as fc1:
                 if previous_indices is not None and previous_activation is not None:
                     current_previous = _selected_activation_all_groups(
-                        weights, h, previous_indices, previous_counts, config
+                        fc1, h, previous_indices, previous_counts, config
                     )
                     previous_gpu = _load_tensor(previous_activation, current_previous.device)
                     if current_previous.shape == previous_gpu.shape:
@@ -291,11 +324,11 @@ def run_chipmunk_chunk(
                             (current_previous.float() - previous_gpu.float())
                             .square().mean().sqrt().item()
                         )
-                indices, counts, scores = _selector(weights, h, cache, config)
-                selected = _selected_activation_all_groups(weights, h, indices, counts, config)
-                cache.activation = _store_tensor(selected, config)
-                cache.output = None
-                active = float(indices.shape[1] * config.feature_group / weights.ffn)
+                indices, counts, scores = _selector(fc1, h, cache, config)
+                selected = _selected_activation_all_groups(fc1, h, indices, counts, config)
+                active = float(indices.shape[1] * config.feature_group / fc1.ffn)
+            cache.activation = _store_tensor(selected, config)
+            cache.output = None
             session.record(
                 step=step, layer=layer_index, chunk=chunk_index, kind=kind,
                 path="measure", active_fraction=active,
@@ -312,12 +345,13 @@ def run_chipmunk_chunk(
         return out, "chipmunk_measure"
 
     try:
-        with ConvRotGroupWeights(block.mlp, h[:1]) as weights:
-            _check_gpu_budget(snapshot, config, weights.hidden, weights.ffn)
-            out = _delta_update(weights, h, cache, config)
-            active = float(
-                cache.selected_groups.shape[1] * config.feature_group / weights.ffn
-            )
+        hidden = int(block.mlp.fc2.out_features)
+        ffn = int(block.mlp.fc2.in_features)
+        _check_gpu_budget(snapshot, config, hidden, ffn)
+        out = _delta_update(block, h, cache, config)
+        active = float(
+            cache.selected_groups.shape[1] * config.feature_group / ffn
+        )
         cache.sparse_calls += 1
         cache.update_step = step
         session.record(
