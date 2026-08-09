@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import math
 import torch
 
+from .offload import CacheSpec
 from .selector import select_top_groups
 
 
@@ -29,7 +29,7 @@ def _kind_eligible(config, kind):
 def _must_dense(config, snapshot, layer_index: int):
     step = int(getattr(snapshot, "step_index", -1))
     total = int(getattr(snapshot, "total_steps", 0))
-    if step < 0 or layer_index < int(config.first_dense_layers):
+    if step < 0:
         return True
     if step < int(config.first_dense_steps):
         return True
@@ -38,77 +38,16 @@ def _must_dense(config, snapshot, layer_index: int):
     return step % int(config.refresh_every) == 0
 
 
-def _store_gpu(value):
-    value = value.detach()
-    if value.device.type != "cuda":
-        raise ChipmunkExecutionError(
-            "production Chipmunk cache must remain on CUDA; refusing host-backed state"
-        )
-    return value.clone()
-
-
-def _load_gpu(value, device):
-    if value is None:
-        return None
-    if value.device != device or value.device.type != "cuda":
-        raise ChipmunkExecutionError(
-            "production Chipmunk state moved off the active CUDA device"
-        )
-    return value
-
-
-def _dynamic_rows(snapshot, scope):
-    layout = getattr(snapshot, "layout", None)
-    segments = getattr(layout, "segments", ()) if layout is not None else ()
-    kinds = {"video"} if scope == "target_video" else {"audio", "video"}
-    return sum(int(b) - int(a) for a, b, kind in segments if str(kind) in kinds)
-
-
-def _selected_feature_count(config, ffn: int):
-    """Static selected width for the balanced two-tile selector."""
-    fg = int(config.feature_group)
-    groups = int(ffn) // fg
-    if groups % 2:
-        raise ChipmunkExecutionError("H3 FFN group count must split into two ConvRot tiles")
-    half_groups = groups // 2
-    keep = max(
-        1,
-        min(
-            half_groups,
-            int(math.ceil(half_groups * float(config.top_fraction))),
-        ),
-    )
-    if float(config.random_groups) > 0.0 and keep < half_groups:
-        keep += min(
-            half_groups - keep,
-            max(1, int(math.ceil(half_groups * float(config.random_groups)))),
-        )
-    return int(2 * keep * fg)
-
-
-def estimated_cache_bytes(snapshot, config, hidden: int, ffn: int):
-    rows = _dynamic_rows(snapshot, config.scope)
-    layer_start = max(int(config.layer_start), int(config.first_dense_layers))
-    layers = max(0, int(config.layer_stop) - layer_start)
-    selected = _selected_feature_count(config, ffn)
-    return int(rows) * int(layers) * (int(hidden) + int(selected)) * 2
-
-
-def _check_gpu_budget(snapshot, config, hidden, ffn):
-    if config.mode != "reference_delta":
-        return
-    if config.cache_location != "gpu":
-        raise ChipmunkExecutionError(
-            "reference_delta requires cache_location=gpu; synchronous CPU cache is disabled"
-        )
-    need = estimated_cache_bytes(snapshot, config, hidden, ffn)
-    limit = int(float(config.cache_budget_gb) * (1024 ** 3))
-    if need > limit:
-        raise ChipmunkExecutionError(
-            "estimated GPU Chipmunk cache %.2f GiB exceeds cache_budget_gb %.2f; "
-            "reduce layer range/top_fraction or raise the budget"
-            % (need / (1024 ** 3), float(config.cache_budget_gb))
-        )
+def _should_build_cache(config, snapshot):
+    step = int(getattr(snapshot, "step_index", -1))
+    total = int(getattr(snapshot, "total_steps", 0))
+    if step < 0:
+        return False
+    if step < max(0, int(config.first_dense_steps) - 1):
+        return False
+    if total and step >= max(0, total - int(config.last_dense_steps)):
+        return False
+    return True
 
 
 def _logical_indices(groups: torch.Tensor, feature_group: int):
@@ -129,19 +68,32 @@ def _token_means(h, token_group_rows: int):
     return pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=0)
 
 
-def _balanced_selector(full_activation, cache, config):
-    """Select a fixed number of groups from each prepacked ConvRot half.
+def _cache_spec(config, layer_index: int, rows: int, hidden: int, ffn: int):
+    selected = int(config.selected_features_for_layer(layer_index, ffn))
+    selector_rows = (
+        int(rows) + int(config.token_group_rows) - 1
+    ) // int(config.token_group_rows)
+    return CacheSpec(
+        rows=int(rows),
+        selected_features=selected,
+        selector_rows=selector_rows,
+        selected_groups=selected // int(config.feature_group),
+        hidden=int(hidden),
+        ffn=int(ffn),
+    )
 
-    Equal per-half counts make the selected fc1/fc2 tensors rectangular without
-    host reads or CUDA-value-dependent Python branches. At top_fraction=0.30,
-    H3's 56 groups become 9+9 selected groups (32.14% actual density).
-    """
+
+def _balanced_selector(
+    full_activation,
+    previous_summary,
+    config,
+    layer_index: int,
+):
     act = full_activation.float()
     fg = int(config.feature_group)
     if act.shape[-1] % fg:
         raise ChipmunkExecutionError("H3 FFN is not feature-group aligned")
-    previous = _load_gpu(cache.selector_summary, act.device)
-    delta = act if previous is None else act - previous.float()
+    delta = act if previous_summary is None else act - previous_summary.float()
     scores = (
         delta.reshape(delta.shape[0], delta.shape[1] // fg, fg)
         .square()
@@ -152,22 +104,14 @@ def _balanced_selector(full_activation, cache, config):
     if groups % 2:
         raise ChipmunkExecutionError("selector group count must split into two tiles")
     half = groups // 2
+    fraction = float(config.fraction_for_layer(layer_index))
     first, _ = select_top_groups(
-        scores[:, :half],
-        config.top_fraction,
-        config.random_groups,
+        scores[:, :half], fraction, config.random_groups
     )
     second, _ = select_top_groups(
-        scores[:, half:],
-        config.top_fraction,
-        config.random_groups,
+        scores[:, half:], fraction, config.random_groups
     )
-    second = second + half
-    indices = torch.cat((first, second), dim=1).contiguous()
-    cache.selector_summary = _store_gpu(act.to(torch.bfloat16))
-    cache.selected_groups = _store_gpu(indices)
-    cache.selected_counts = None
-    return indices
+    return torch.cat((first, second + half), dim=1).contiguous()
 
 
 def _selected_activation_all_groups(
@@ -176,7 +120,6 @@ def _selected_activation_all_groups(
     config,
     selected_activation_runner,
 ):
-    indices = _load_gpu(indices, h.device)
     tg = int(config.token_group_rows)
     fg = int(config.feature_group)
     pieces = []
@@ -187,68 +130,204 @@ def _selected_activation_all_groups(
     return torch.cat(pieces, dim=0)
 
 
+def _refresh_cache(
+    *,
+    h,
+    out,
+    cache,
+    key,
+    spec,
+    session,
+    config,
+    layer_index,
+    full_activation_runner,
+    selected_activation_runner,
+):
+    previous = None
+    lease = None
+    if cache.valid:
+        lease = session.offload.load(
+            cache,
+            key,
+            spec,
+            ("selector_summary",),
+            h.device,
+        )
+        if lease is None:
+            return False
+        previous = lease.selector_summary
+
+    try:
+        full_activation = full_activation_runner(
+            _token_means(h, config.token_group_rows)
+        )
+        indices = _balanced_selector(
+            full_activation,
+            previous,
+            config,
+            layer_index,
+        )
+        selected = _selected_activation_all_groups(
+            h,
+            indices,
+            config,
+            selected_activation_runner,
+        )
+        stored = session.offload.store(
+            cache,
+            key,
+            spec,
+            activation=selected,
+            output=out,
+            selector_summary=full_activation.to(torch.bfloat16),
+            selected_groups=indices,
+            lease=lease,
+        )
+        if not stored:
+            cache.clear()
+            return False
+        return True
+    except Exception:
+        session.offload.release_lease(lease)
+        raise
+
+
 def _delta_update(
+    *,
     h,
     cache,
+    key,
+    spec,
+    session,
     config,
     selected_activation_runner,
     selected_fc2_runner,
 ):
-    if (
-        cache.selected_groups is None
-        or cache.activation is None
-        or cache.output is None
-    ):
-        raise ChipmunkExecutionError("sparse update requested without a dense cache")
-
-    indices = _load_gpu(cache.selected_groups, h.device)
-    old_activation = _load_gpu(cache.activation, h.device)
-    out = _load_gpu(cache.output, h.device)
-    current_activation = _selected_activation_all_groups(
-        h,
-        indices,
-        config,
-        selected_activation_runner,
+    lease = session.offload.load(
+        cache,
+        key,
+        spec,
+        ("activation", "output", "selected_groups"),
+        h.device,
     )
+    if lease is None:
+        return None
 
-    tg = int(config.token_group_rows)
-    fg = int(config.feature_group)
-    for gi, a in enumerate(range(0, h.shape[0], tg)):
-        b = min(h.shape[0], a + tg)
-        logical = _logical_indices(indices[gi], fg)
-        old_part = selected_fc2_runner(old_activation[a:b], logical)
-        new_part = selected_fc2_runner(current_activation[a:b], logical)
-        out[a:b].sub_(old_part).add_(new_part)
+    try:
+        indices = lease.selected_groups
+        old_activation = lease.activation
+        out = lease.output
+        current_activation = _selected_activation_all_groups(
+            h,
+            indices,
+            config,
+            selected_activation_runner,
+        )
 
-    cache.activation = _store_gpu(current_activation)
-    cache.output = out.detach()
-    return out
+        tg = int(config.token_group_rows)
+        fg = int(config.feature_group)
+        for gi, a in enumerate(range(0, h.shape[0], tg)):
+            b = min(h.shape[0], a + tg)
+            logical = _logical_indices(indices[gi], fg)
+            old_part = selected_fc2_runner(old_activation[a:b], logical)
+            new_part = selected_fc2_runner(current_activation[a:b], logical)
+            out[a:b].sub_(old_part).add_(new_part)
+
+        # The staging slot is released as soon as its D2H write is queued. The
+        # block residual gate executes afterwards on the main stream, so return a
+        # normal CUDA tensor rather than a slot view that could be recycled by H2D.
+        result = out.clone()
+        stored = session.offload.store(
+            cache,
+            key,
+            spec,
+            activation=current_activation,
+            output=out,
+            lease=lease,
+        )
+        if not stored:
+            cache.clear()
+        return result
+    except Exception:
+        session.offload.release_lease(lease)
+        raise
 
 
-def _refresh_cache(
-    h,
-    out,
-    cache,
-    config,
+def _entry_context(
+    *,
+    block,
+    layer_index,
+    chunk_index,
+    chunk_start,
+    chunk_stop,
     snapshot,
-    hidden,
-    ffn,
-    full_activation_runner,
-    selected_activation_runner,
+    session,
+    config,
 ):
-    _check_gpu_budget(snapshot, config, hidden, ffn)
-    means = _token_means(h, config.token_group_rows)
-    full_activation = full_activation_runner(means)
-    indices = _balanced_selector(full_activation, cache, config)
-    selected = _selected_activation_all_groups(
-        h,
-        indices,
+    session.ensure_request(snapshot)
+    branch = tuple(getattr(snapshot, "branch", (0,)))
+    kind = _segment_kind(snapshot, chunk_start, chunk_stop)
+    eligible = config.layer_eligible(layer_index) and _kind_eligible(config, kind)
+    hidden = int(block.mlp.fc2.out_features)
+    ffn = int(block.mlp.fc2.in_features)
+    spec = _cache_spec(
         config,
-        selected_activation_runner,
+        layer_index,
+        int(chunk_stop) - int(chunk_start),
+        hidden,
+        ffn,
     )
-    cache.activation = _store_gpu(selected)
-    cache.output = _store_gpu(out)
-    return float(selected.shape[-1] / int(ffn))
+    cache = session.cache(branch, layer_index, chunk_index)
+    key = session.host_key(branch, layer_index, chunk_index, spec)
+    return branch, kind, eligible, cache, key, spec, hidden, ffn
+
+
+def prefetch_chipmunk_chunk(
+    *,
+    block,
+    layer_index: int,
+    chunk_index: int,
+    chunk_start: int,
+    chunk_stop: int,
+    snapshot,
+    session,
+    config,
+    device,
+):
+    if config.mode != "reference_delta":
+        return False
+    (
+        _branch,
+        _kind,
+        eligible,
+        cache,
+        key,
+        spec,
+        _hidden,
+        _ffn,
+    ) = _entry_context(
+        block=block,
+        layer_index=layer_index,
+        chunk_index=chunk_index,
+        chunk_start=chunk_start,
+        chunk_stop=chunk_stop,
+        snapshot=snapshot,
+        session=session,
+        config=config,
+    )
+    if not eligible:
+        return False
+
+    session.offload.request_host(key, spec)
+    if not cache.valid:
+        return False
+
+    fields = (
+        ("selector_summary",)
+        if _must_dense(config, snapshot, layer_index)
+        else ("activation", "output", "selected_groups")
+    )
+    return session.offload.prefetch(cache, key, spec, fields, device)
 
 
 def run_chipmunk_chunk(
@@ -270,24 +349,32 @@ def run_chipmunk_chunk(
 ):
     """Return raw MLP output before H3's current-step residual gate.
 
-    Production invariant: this function never materializes CUDA data on the CPU
-    and never reacquires MLP weights for the sparse path.
+    All MLP math runs on CUDA. Persistent state is pinned host backing accessed
+    only through non-blocking DMA and CUDA event dependencies.
     """
-    session.ensure_request(snapshot)
-    branch = tuple(getattr(snapshot, "branch", (0,)))
-    kind = _segment_kind(snapshot, chunk_start, chunk_stop)
-    step = int(getattr(snapshot, "step_index", -1))
-
     if config.mode == "measure":
         return dense_runner(h), "chipmunk_measure_dense"
 
-    cache = session.cache(branch, layer_index, chunk_index)
-    eligible = (
-        max(int(config.layer_start), int(config.first_dense_layers))
-        <= layer_index
-        < int(config.layer_stop)
-        and _kind_eligible(config, kind)
+    (
+        _branch,
+        kind,
+        eligible,
+        cache,
+        key,
+        spec,
+        _hidden,
+        ffn,
+    ) = _entry_context(
+        block=block,
+        layer_index=layer_index,
+        chunk_index=chunk_index,
+        chunk_start=chunk_start,
+        chunk_stop=chunk_stop,
+        snapshot=snapshot,
+        session=session,
+        config=config,
     )
+    step = int(getattr(snapshot, "step_index", -1))
 
     if eligible and (
         full_activation_runner is None
@@ -298,59 +385,102 @@ def run_chipmunk_chunk(
             "reference_delta requires held ConvRot fc1/fc2 runners"
         )
 
-    hidden = int(block.mlp.fc2.out_features)
-    ffn = int(block.mlp.fc2.in_features)
+    if not eligible:
+        return dense_runner(h), "chipmunk_dense_ineligible"
 
-    if not eligible or _must_dense(config, snapshot, layer_index):
+    session.offload.request_host(key, spec)
+
+    dense_required = _must_dense(config, snapshot, layer_index) or not cache.valid
+    if dense_required:
         out = dense_runner(h)
         cache.dense_calls += 1
-        if eligible:
+        if _should_build_cache(config, snapshot):
             try:
-                active = _refresh_cache(
-                    h,
-                    out,
-                    cache,
-                    config,
-                    snapshot,
-                    hidden,
-                    ffn,
-                    full_activation_runner,
-                    selected_activation_runner,
+                stored = _refresh_cache(
+                    h=h,
+                    out=out,
+                    cache=cache,
+                    key=key,
+                    spec=spec,
+                    session=session,
+                    config=config,
+                    layer_index=layer_index,
+                    full_activation_runner=full_activation_runner,
+                    selected_activation_runner=selected_activation_runner,
                 )
-                cache.refresh_step = step
-                cache.update_step = step
-                session.record(
-                    step=step,
-                    layer=layer_index,
-                    chunk=chunk_index,
-                    kind=kind,
-                    path="dense_refresh",
-                    active_fraction=active,
-                )
+                if stored:
+                    cache.refresh_step = step
+                    cache.update_step = step
+                    session.record(
+                        step=step,
+                        layer=layer_index,
+                        chunk=chunk_index,
+                        kind=kind,
+                        path="dense_refresh_async",
+                        active_fraction=float(spec.selected_features / ffn),
+                    )
+                else:
+                    session.record(
+                        step=step,
+                        layer=layer_index,
+                        chunk=chunk_index,
+                        kind=kind,
+                        path="dense_cache_not_ready",
+                    )
             except Exception as exc:
+                session.offload.release_prefetch(cache)
                 cache.clear()
                 cache.fallback_calls += 1
+                if config.strict:
+                    raise
                 session.record(
                     step=step,
                     layer=layer_index,
                     chunk=chunk_index,
                     kind=kind,
-                    path="dense_refresh_no_cache",
+                    path="dense_refresh_fallback",
                     reason=f"{type(exc).__name__}: {exc}",
                 )
-                if config.strict:
-                    raise
         return out, "chipmunk_dense"
 
     try:
         out = _delta_update(
-            h,
-            cache,
-            config,
-            selected_activation_runner,
-            selected_fc2_runner,
+            h=h,
+            cache=cache,
+            key=key,
+            spec=spec,
+            session=session,
+            config=config,
+            selected_activation_runner=selected_activation_runner,
+            selected_fc2_runner=selected_fc2_runner,
         )
-        active = float(cache.activation.shape[-1] / ffn)
+        if out is None:
+            cache.clear()
+            dense = dense_runner(h)
+            stored = _refresh_cache(
+                h=h,
+                out=dense,
+                cache=cache,
+                key=key,
+                spec=spec,
+                session=session,
+                config=config,
+                layer_index=layer_index,
+                full_activation_runner=full_activation_runner,
+                selected_activation_runner=selected_activation_runner,
+            )
+            if stored:
+                cache.refresh_step = step
+                cache.update_step = step
+            session.record(
+                step=step,
+                layer=layer_index,
+                chunk=chunk_index,
+                kind=kind,
+                path="dense_dma_miss",
+            )
+            return dense, "chipmunk_dense_dma_miss"
+
         cache.sparse_calls += 1
         cache.update_step = step
         session.record(
@@ -358,11 +488,12 @@ def run_chipmunk_chunk(
             layer=layer_index,
             chunk=chunk_index,
             kind=kind,
-            path="sparse_delta",
-            active_fraction=active,
+            path="sparse_delta_async",
+            active_fraction=float(spec.selected_features / ffn),
         )
         return out, "chipmunk_sparse_delta"
     except Exception as exc:
+        session.offload.release_prefetch(cache)
         cache.clear()
         cache.fallback_calls += 1
         if config.strict:

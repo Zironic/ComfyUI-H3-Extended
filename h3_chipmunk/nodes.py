@@ -5,8 +5,10 @@ from .config import (
     MODES,
     SCOPES,
     CACHE_LOCATIONS,
+    DENSITY_PROFILES,
     DEFAULT_CHUNK_ROWS,
     DEFAULT_MEASURE_LAYER_STRIDE,
+    DEFAULT_GPU_STAGING_BUDGET_GB,
 )
 from .patch import install
 
@@ -19,10 +21,9 @@ class MiniMaxH3ChipmunkMLP(io.ComfyNode):
             display_name="MiniMax H3 Chipmunk MLP (Zi)",
             category="model/patch/minimax",
             description=(
-                "Experimental H3 SwiGLU MLP delta acceleration. The production node never "
-                "materializes CUDA diagnostics on the host. measure is an output-exact "
-                "dense dry-run; reference_delta is the approximate path and currently "
-                "requires GPU-resident cache state. Use instead of Activation Memory/shared compile."
+                "Experimental H3 SwiGLU MLP delta acceleration. MLP math stays on CUDA; "
+                "persistent cache state is JIT-offloaded to pinned host RAM through "
+                "non-blocking CUDA streams with a bounded VRAM staging pool."
             ),
             inputs=[
                 io.Model.Input("model"),
@@ -32,7 +33,7 @@ class MiniMaxH3ChipmunkMLP(io.ComfyNode):
                 io.Int.Input("refresh_every", default=6, min=1, max=50, step=1),
                 io.Int.Input("first_dense_steps", default=2, min=0, max=20, step=1),
                 io.Int.Input("last_dense_steps", default=2, min=0, max=20, step=1),
-                io.Int.Input("first_dense_layers", default=2, min=0, max=50, step=1),
+                io.Int.Input("first_dense_layers", default=0, min=0, max=50, step=1),
                 io.Int.Input("layer_start", default=0, min=0, max=49, step=1),
                 io.Int.Input("layer_stop", default=50, min=1, max=50, step=1),
                 io.Int.Input("chunk_rows", default=DEFAULT_CHUNK_ROWS, min=128, max=4096, step=128),
@@ -41,13 +42,23 @@ class MiniMaxH3ChipmunkMLP(io.ComfyNode):
                 io.Combo.Input(
                     "cache_location",
                     options=list(CACHE_LOCATIONS),
-                    default="gpu",
+                    default="async_pinned",
                     tooltip=(
-                        "Production reference_delta cache is GPU-only. The old synchronous CPU "
-                        "cache path was removed rather than allowed to stall model execution."
+                        "Persistent state is pinned host backing. H2D/D2H use dedicated CUDA "
+                        "streams and events; the model thread never waits on a CPU/device sync."
                     ),
                 ),
-                io.Float.Input("cache_budget_gb", default=24.0, min=1.0, max=512.0, step=1.0),
+                io.Float.Input(
+                    "cache_budget_gb",
+                    default=DEFAULT_GPU_STAGING_BUDGET_GB,
+                    min=0.25,
+                    max=8.0,
+                    step=0.25,
+                    tooltip=(
+                        "Hard VRAM cap for Chipmunk staging buffers only. Persistent cache is "
+                        "offloaded; 1 GiB is intentionally enough for the normal two-slot pipeline."
+                    ),
+                ),
                 io.Float.Input("random_groups", default=0.0, min=0.0, max=0.25, step=0.01),
                 io.Boolean.Input("strict", default=True),
                 io.Boolean.Input(
@@ -63,8 +74,18 @@ class MiniMaxH3ChipmunkMLP(io.ComfyNode):
                     max=50,
                     step=1,
                     tooltip=(
-                        "Retained for saved-workflow compatibility. Production measure is now a "
+                        "Retained for saved-workflow compatibility. Production measure is a "
                         "dense no-sync dry-run and does not collect CUDA-valued diagnostics."
+                    ),
+                ),
+                # New fields are appended so old saved widget positions do not shift.
+                io.Combo.Input(
+                    "density_profile",
+                    options=list(DENSITY_PROFILES),
+                    default="depth_safe_v1",
+                    tooltip=(
+                        "depth_safe_v1 keeps blocks 0-10 dense, then uses 40%/50%/60% "
+                        "requested density across progressively later depth bands. uniform uses top_fraction."
                     ),
                 ),
             ],
@@ -75,11 +96,12 @@ class MiniMaxH3ChipmunkMLP(io.ComfyNode):
     def execute(
         cls, model, enabled=True, mode="measure", top_fraction=0.25,
         refresh_every=6, first_dense_steps=2, last_dense_steps=2,
-        first_dense_layers=2, layer_start=0, layer_stop=50,
+        first_dense_layers=0, layer_start=0, layer_stop=50,
         chunk_rows=DEFAULT_CHUNK_ROWS, token_group_rows=128, scope="target_video",
-        cache_location="gpu", cache_budget_gb=24.0, random_groups=0.0,
-        strict=True, save_report=False, run_tag="chipmunk",
+        cache_location="async_pinned", cache_budget_gb=DEFAULT_GPU_STAGING_BUDGET_GB,
+        random_groups=0.0, strict=True, save_report=False, run_tag="chipmunk",
         measure_layer_stride=DEFAULT_MEASURE_LAYER_STRIDE,
+        density_profile="depth_safe_v1",
     ):
         if not enabled:
             return io.NodeOutput(model)
@@ -103,6 +125,7 @@ class MiniMaxH3ChipmunkMLP(io.ComfyNode):
             strict=bool(strict),
             save_report=bool(save_report),
             run_tag=str(run_tag),
+            density_profile=str(density_profile),
         )
         patched = model.clone()
         install(patched, config)

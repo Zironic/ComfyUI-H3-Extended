@@ -1,18 +1,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Any
 
 import torch
+
+from .offload import AsyncPinnedOffload
 
 
 @dataclass
 class ChunkCache:
-    activation: torch.Tensor | None = None
-    output: torch.Tensor | None = None
-    selector_summary: torch.Tensor | None = None
-    selected_groups: torch.Tensor | None = None
-    selected_counts: torch.Tensor | None = None
+    # Persistent tensor state lives in AsyncPinnedOffload host backing. The
+    # per-request cache stores only validity/scheduling metadata and optional
+    # staging leases.
+    valid: bool = False
+    prefetch: Any | None = None
     refresh_step: int = -1
     update_step: int = -1
     dense_calls: int = 0
@@ -20,26 +22,40 @@ class ChunkCache:
     fallback_calls: int = 0
 
     def clear(self):
-        self.activation = None
-        self.output = None
-        self.selector_summary = None
-        self.selected_groups = None
-        self.selected_counts = None
+        self.valid = False
+        self.prefetch = None
         self.refresh_step = -1
         self.update_step = -1
 
 
 @dataclass
 class H3ChipmunkSession:
+    config: object
     request_id: int = -1
     layout_signature: tuple | None = None
     caches: Dict[Tuple[tuple, int, int], ChunkCache] = field(default_factory=dict)
     records: list[dict] = field(default_factory=list)
+    offload: AsyncPinnedOffload = field(init=False)
+
+    def __post_init__(self):
+        self.offload = AsyncPinnedOffload(self.config)
+
+    def _release_request_state(self):
+        for cache in self.caches.values():
+            self.offload.release_prefetch(cache)
+        self.caches.clear()
 
     def reset(self, request_id: int, layout_signature=None):
+        # Drop request validity but keep AsyncPinnedOffload's allocated host
+        # buffers. Subsequent generations with the same geometry reuse the pinned
+        # allocation without paying the initialization cost again.
+        self._release_request_state()
         self.request_id = int(request_id)
         self.layout_signature = layout_signature
-        self.caches.clear()
+        self.records.clear()
+
+    def finish_request(self):
+        self._release_request_state()
         self.records.clear()
 
     def ensure_request(self, snapshot):
@@ -55,6 +71,20 @@ class H3ChipmunkSession:
             value = ChunkCache()
             self.caches[key] = value
         return value
+
+    @staticmethod
+    def host_key(branch, layer_index: int, chunk_index: int, spec) -> tuple:
+        # Shape is part of the persistent key so a changed sequence/chunk layout
+        # cannot accidentally reuse incompatible backing storage.
+        return (
+            tuple(int(x) for x in branch),
+            int(layer_index),
+            int(chunk_index),
+            int(spec.rows),
+            int(spec.selected_features),
+            int(spec.selector_rows),
+            int(spec.selected_groups),
+        )
 
     @staticmethod
     def _assert_host_metadata(value):
@@ -79,4 +109,5 @@ class H3ChipmunkSession:
         branch = tuple(int(x) for x in branch)
         for key, value in tuple(self.caches.items()):
             if key[0] == branch:
+                self.offload.release_prefetch(value)
                 value.clear()

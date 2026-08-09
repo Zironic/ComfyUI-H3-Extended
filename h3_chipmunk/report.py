@@ -8,9 +8,9 @@ import time
 class H3ChipmunkReportListener:
     """Optional host-metadata report writer.
 
-    The production node never transfers CUDA diagnostics to the host. Records
-    therefore contain only Python metadata that was already available without a
-    device synchronization (step/layer/chunk/path/static active fraction).
+    Records contain only Python metadata already known without reading CUDA
+    tensors. Persistent cache data stays in pinned host backing and is never
+    serialized by this reporter.
     """
 
     def __init__(self, session, config):
@@ -49,17 +49,25 @@ class H3ChipmunkReportListener:
                 "seconds": seconds,
                 "config": list(self.config.signature),
                 "records": len(records),
-                "dense_refresh": sum(
-                    row.get("path") == "dense_refresh" for row in records
+                "dense_refresh_async": sum(
+                    row.get("path") == "dense_refresh_async" for row in records
                 ),
-                "sparse_delta": sum(
-                    row.get("path") == "sparse_delta" for row in records
+                "sparse_delta_async": sum(
+                    row.get("path") == "sparse_delta_async" for row in records
+                ),
+                "dma_miss": sum(
+                    row.get("path") in ("dense_dma_miss", "dense_cache_not_ready")
+                    for row in records
                 ),
                 "fallback": sum(
                     "fallback" in str(row.get("path", "")) for row in records
                 ),
-                "gpu_only": True,
+                "compute_device": "cuda",
+                "cache_backing": "pinned_host_async",
                 "cuda_metrics_materialized": False,
+                "gpu_staging_budget_gb": float(self.config.cache_budget_gb),
+                "density_profile": self.config.density_profile,
+                "profile": [list(item) for item in self.config.profile],
             }
             with open(
                 os.path.join(directory, base + ".summary.json"),
@@ -68,7 +76,6 @@ class H3ChipmunkReportListener:
             ) as handle:
                 json.dump(summary, handle, indent=2, sort_keys=True)
         finally:
-            # Release GPU cache references after the request. This is ordinary
-            # Python reference cleanup and performs no CUDA-to-host transfer.
-            self.session.caches.clear()
-            self.session.records.clear()
+            # Release only per-request staging leases/validity. Allocated pinned
+            # host buffers remain warm and reusable for the next generation.
+            self.session.finish_request()
