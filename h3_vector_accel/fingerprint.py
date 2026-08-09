@@ -57,6 +57,7 @@ def configuration_payload(config: SamplerConfig, sigmas=None, model_identity=Non
             "curvature_ratio": config.curvature_ratio,
             "min_direction_cosine": config.min_direction_cosine,
         },
+        "max_adaptive_step_scale": config.max_adaptive_step_scale,
         "fallback_on_guard": config.fallback_on_guard,
         "policy": config.policy,
         "quality_preset": config.quality_preset,
@@ -70,7 +71,9 @@ def configuration_payload(config: SamplerConfig, sigmas=None, model_identity=Non
         "adaptive_profile_hash": config.adaptive_profile_hash,
     }
     if config.evaluation_profile in ADAPTIVE_PROFILES:
-        payload["adaptive_controller"] = controller_identity(config.evaluation_profile)
+        payload["adaptive_controller"] = controller_identity(
+            config.evaluation_profile, config.max_adaptive_step_scale
+        )
     if sigmas is not None:
         payload["sigma_hash"] = sigma_hash(sigmas)
         if effective_sigmas is not None or actual_indices is not None:

@@ -22,6 +22,7 @@ PREDICTOR_VERSION = "v2"
 CURVATURE_RATIO = 0.5
 MIN_DIRECTION_COSINE = 0.0
 DEFAULT_MAX_EXTRAPOLATION_RATIO = 1.5
+DEFAULT_MAX_ADAPTIVE_STEP_SCALE = 3.0
 DEFAULT_SAFETY_FACTOR = 1.25
 DEFAULT_PROTECTED_PREFIX_STEPS = 6
 DEFAULT_AUDIO_EMERGENCY_MULTIPLIER = 4.0
@@ -79,6 +80,7 @@ class SamplerConfig:
     adaptive_profile_hash: str | None = None
     protected_prefix_steps: int = DEFAULT_PROTECTED_PREFIX_STEPS
     audio_emergency_multiplier: float = DEFAULT_AUDIO_EMERGENCY_MULTIPLIER
+    max_adaptive_step_scale: float = DEFAULT_MAX_ADAPTIVE_STEP_SCALE
     _mask: tuple[bool, ...] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self):
@@ -119,6 +121,7 @@ class SamplerConfig:
             if not isinstance(self.repairability_profile, str) or not self.repairability_profile.strip():
                 raise ValueError("repairability_profile must be a non-empty profile filename")
         for name, value in (("max_extrapolation_ratio", self.max_extrapolation_ratio),
+                            ("max_adaptive_step_scale", self.max_adaptive_step_scale),
                             ("curvature_ratio", self.curvature_ratio),
                             ("min_direction_cosine", self.min_direction_cosine),
                             ("safety_factor", self.safety_factor),
@@ -127,6 +130,8 @@ class SamplerConfig:
                 raise ValueError(f"{name} must be finite")
         if self.max_extrapolation_ratio <= 0:
             raise ValueError("max_extrapolation_ratio must be positive")
+        if self.max_adaptive_step_scale < 1:
+            raise ValueError("max_adaptive_step_scale must be at least one")
         if self.curvature_ratio < 0:
             raise ValueError("curvature_ratio must be non-negative")
         if not -1 <= self.min_direction_cosine <= 1:

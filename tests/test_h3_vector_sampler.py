@@ -180,6 +180,7 @@ class SamplerTests(unittest.TestCase):
                 "method", "evaluation_profile", "diagnostics", "policy",
                 "quality_preset", "repairability_profile", "conditioning_mode",
                 "fallback_on_guard", "max_extrapolation_ratio",
+                "max_adaptive_step_scale",
             ],
         )
         self.assertEqual(inputs["method"].options, [
@@ -191,6 +192,8 @@ class SamplerTests(unittest.TestCase):
         self.assertIn("adaptive_history_v2", inputs["evaluation_profile"].options)
         self.assertEqual(inputs["method"].display_name, "solver / forecast mode")
         self.assertEqual(inputs["evaluation_profile"].display_name, "actual-evaluation schedule")
+        self.assertEqual(inputs["max_adaptive_step_scale"].default, 3.0)
+        self.assertEqual(inputs["max_adaptive_step_scale"].min, 1.0)
         output = MiniMaxH3VectorAccelSampler.execute(
             "res_multistep", "late_aggressive_13", "off"
         )
@@ -210,12 +213,14 @@ class SamplerTests(unittest.TestCase):
             MiniMaxH3VectorAccelSampler.validate_inputs("euler", "adaptive_history_v1"),
         )
         output = MiniMaxH3VectorAccelSampler.execute(
-            "res_multistep", "adaptive_history_v2", "off"
+            "res_multistep", "adaptive_history_v2", "off",
+            max_adaptive_step_scale=5.0,
         )
         self.assertEqual(
             output.result[0].h3_vector_config.evaluation_profile,
             "adaptive_history_v2",
         )
+        self.assertEqual(output.result[0].h3_vector_config.max_adaptive_step_scale, 5.0)
         self.assertIn(
             "requires the res_multistep method",
             MiniMaxH3VectorAccelSampler.validate_inputs("euler", "adaptive_history_v2"),
@@ -229,7 +234,8 @@ class SamplerTests(unittest.TestCase):
         for name in ("policy", "quality_preset", "repairability_profile", "conditioning_mode"):
             self.assertTrue(inputs[name].extra_dict["hidden"])
         self.assertEqual(inputs["quality_preset"].display_name, "adaptive quality tolerance")
-        self.assertIn("does not scale", inputs["max_extrapolation_ratio"].tooltip)
+        self.assertIn("Forecast-only", inputs["max_extrapolation_ratio"].tooltip)
+        self.assertIn("Adaptive RES only", inputs["max_adaptive_step_scale"].tooltip)
 
     def test_node_reveals_adaptive_controls_when_a_profile_exists(self):
         with mock.patch("h3_vector_accel.nodes._profile_names", return_value=["measured.json"]):
@@ -436,16 +442,24 @@ class SamplerTests(unittest.TestCase):
         model = ResModel(lambda x, sigma: torch.full_like(
             x, 1.0 + 100.0 * max(sigma - 0.98, 0.0)
         ))
-        sample_vector_accel(
-            model, torch.zeros(1, 1, 6), sigmas, disable=True, config=config,
-            diagnostics=diagnostics, callback=callbacks.append,
-        )
+        with self.assertLogs(level="INFO") as captured_logs:
+            sample_vector_accel(
+                model, torch.zeros(1, 1, 6), sigmas, disable=True, config=config,
+                diagnostics=diagnostics, callback=callbacks.append,
+            )
         effective = diagnostics._run_metadata["effective_sigma_sequence"]
         decisions = diagnostics._run_metadata["adaptive_decisions"]
-        self.assertEqual(effective[:4], sigmas[:4].tolist())
+        self.assertEqual(effective[:3], sigmas[:3].tolist())
         self.assertEqual(effective[-3:], sigmas[18:20].tolist() + [0.0])
-        self.assertEqual([row["reason"] for row in decisions[:3]], ["bootstrap"] * 3)
-        self.assertEqual([row["protected_region"] for row in decisions[:4]], ["bootstrap"] * 4)
+        self.assertEqual([row["reason"] for row in decisions[:2]], ["bootstrap"] * 2)
+        self.assertEqual([row["protected_region"] for row in decisions[:3]], ["bootstrap"] * 3)
+        self.assertNotEqual(decisions[2]["reason"], "bootstrap")
+        first_growth = next(
+            index for index, row in enumerate(decisions)
+            if row["reason"] == "low_video_change_grow"
+        )
+        self.assertGreaterEqual(first_growth, 3)
+        self.assertEqual(decisions[first_growth - 1]["reason"], "low_video_change_wait")
         self.assertTrue(all(row["reason"] != "protected_prefix" for row in decisions))
         self.assertTrue(all(a > b for a, b in zip(effective, effective[1:])))
         self.assertLessEqual(model.calls, 20)
@@ -457,6 +471,18 @@ class SamplerTests(unittest.TestCase):
             diagnostics._run_metadata["configuration"]["adaptive_controller"]["version"],
             "adaptive_history_v2",
         )
+        progress = [line for line in captured_logs.output if "[H3 Adaptive RES v2]" in line]
+        self.assertEqual(len(progress), model.calls)
+        self.assertIn("NFE 1/~", progress[0])
+        self.assertIn("est. compute", progress[0])
+        self.assertIn("schedule 0.00/20", progress[0])
+        self.assertIn("scale 1.00x", progress[0])
+        self.assertIn("video rate v=", progress[0])
+        self.assertIn("x0=", progress[0])
+        self.assertIn("combined=", progress[0])
+        self.assertIn("ref=", progress[0])
+        self.assertIn("ratio=", progress[0])
+        self.assertIn("-> 20.00", progress[-1])
 
     def test_core_solvers_reject_adaptive_and_invalid_source_schedule(self):
         with self.assertRaisesRegex(ValueError, "core solver methods require the fixed policy"):

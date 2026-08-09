@@ -5,6 +5,7 @@ from comfy_api.latest import ComfyExtension, io
 
 from .config import (
     DEFAULT_MAX_EXTRAPOLATION_RATIO,
+    DEFAULT_MAX_ADAPTIVE_STEP_SCALE,
     CONDITIONING_MODES,
     DIAGNOSTICS,
     EVALUATION_PROFILES,
@@ -100,7 +101,19 @@ class MiniMaxH3VectorAccelSampler(io.ComfyNode):
                     max=10.0,
                     step=0.05,
                     round=False,
-                    tooltip="Hard ceiling for forecast derivative RMS versus the last actual derivative. It does not scale forecasts.",
+                    display_name="forecast max extrapolation ratio",
+                    tooltip="Forecast-only safety ceiling; it does not control adaptive RES spacing.",
+                    advanced=True,
+                ),
+                io.Float.Input(
+                    "max_adaptive_step_scale",
+                    default=DEFAULT_MAX_ADAPTIVE_STEP_SCALE,
+                    min=1.0,
+                    max=10.0,
+                    step=0.1,
+                    round=False,
+                    display_name="adaptive RES maximum step scale",
+                    tooltip="Adaptive RES only. Caps causal low-change spacing growth.",
                     advanced=True,
                 ),
             ],
@@ -112,13 +125,15 @@ class MiniMaxH3VectorAccelSampler(io.ComfyNode):
                 fallback_on_guard=True,
                 max_extrapolation_ratio=DEFAULT_MAX_EXTRAPOLATION_RATIO,
                 policy="fixed", quality_preset="balanced",
-                repairability_profile="", conditioning_mode="default"):
+                repairability_profile="", conditioning_mode="default",
+                max_adaptive_step_scale=DEFAULT_MAX_ADAPTIVE_STEP_SCALE):
         config = SamplerConfig(
             method=method,
             evaluation_profile=evaluation_profile,
             diagnostics=diagnostics,
             fallback_on_guard=fallback_on_guard,
             max_extrapolation_ratio=max_extrapolation_ratio,
+            max_adaptive_step_scale=max_adaptive_step_scale,
             policy=policy,
             quality_preset=quality_preset,
             repairability_profile=repairability_profile or None,

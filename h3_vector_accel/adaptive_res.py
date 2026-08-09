@@ -27,14 +27,18 @@ V2_CONTROLLER_VERSION = "adaptive_history_v2"
 V2_CONTROLLER_CONSTANTS = dict(
     CONTROLLER_CONSTANTS,
     protected_prefix=0,
-    bootstrap_anchors=4,
+    bootstrap_anchors=3,
+    reference_anchors=2,
+    reference_intervals=1,
     protected_tail=(18, 19),
     low_change_streak=2,
 )
 
 
-def controller_identity(version=CONTROLLER_VERSION):
+def controller_identity(version=CONTROLLER_VERSION, max_step_scale=None):
     constants = V2_CONTROLLER_CONSTANTS if version == V2_CONTROLLER_VERSION else CONTROLLER_CONSTANTS
+    if max_step_scale is not None:
+        constants = dict(constants, step_scale_max=float(max_step_scale))
     return {"version": version, "constants": dict(constants)}
 
 
@@ -114,6 +118,8 @@ class AnchorObservation:
     audio_rate: float | None
     video_x0_change: float | None = None
     audio_x0_change: float | None = None
+    video_velocity_rate: float | None = None
+    video_x0_rate: float | None = None
 
     @property
     def video_score(self):
@@ -132,7 +138,7 @@ class AdaptiveHistoryController:
     version = CONTROLLER_VERSION
     constants = CONTROLLER_CONSTANTS
 
-    def __init__(self, source_sigmas, latent_shapes=None, max_nfe=20):
+    def __init__(self, source_sigmas, latent_shapes=None, max_nfe=20, max_step_scale=None):
         self.source = tuple(_scalar(v) for v in source_sigmas)
         if len(self.source) != 21:
             raise ValueError(f"{self.version} requires 20 source intervals")
@@ -142,6 +148,12 @@ class AdaptiveHistoryController:
             raise ValueError("source sigma schedule must be strictly descending")
         self.latent_shapes = latent_shapes
         self.max_nfe = min(int(max_nfe), self.constants["max_nfe"])
+        self.max_step_scale = float(
+            self.constants["step_scale_max"] if max_step_scale is None else max_step_scale
+        )
+        if self.max_step_scale < 1.0 or not math.isfinite(self.max_step_scale):
+            raise ValueError("max_step_scale must be finite and at least one")
+        self.constants = dict(self.constants, step_scale_max=self.max_step_scale)
         self.step_scale = self.constants["initial_step_scale"]
         self.anchors = []
         self.decisions = []
@@ -177,6 +189,7 @@ class AdaptiveHistoryController:
         video_change = audio_change = video_cosine = audio_cosine = None
         video_x0_change = audio_x0_change = None
         video_rate = audio_rate = None
+        video_velocity_rate = video_x0_rate = None
         delta_t = (
             abs(_t(sigma) - _t(previous_sigma))
             if previous_sigma is not None and sigma > 0 else None
@@ -194,6 +207,10 @@ class AdaptiveHistoryController:
             if len(old_parts) >= 2 and len(new_parts) >= 2:
                 audio_x0_change = _relative(old_parts[1], new_parts[1])
         if delta_t is not None:
+            if video_change is not None:
+                video_velocity_rate = video_change / max(delta_t, 1e-8)
+            if video_x0_change is not None:
+                video_x0_rate = video_x0_change / max(delta_t, 1e-8)
             video_values = [value for value in (video_change, video_x0_change) if value is not None]
             audio_values = [value for value in (audio_change, audio_x0_change) if value is not None]
             if video_values:
@@ -202,10 +219,12 @@ class AdaptiveHistoryController:
                 audio_rate = (sum(audio_values) / len(audio_values)) / max(delta_t, 1e-8)
         observation = AnchorObservation(_scalar(sigma), self._source_index(_scalar(sigma)),
                                         video_change, audio_change, video_cosine, audio_cosine,
-                                        video_rate, audio_rate, video_x0_change, audio_x0_change)
+                                        video_rate, audio_rate, video_x0_change, audio_x0_change,
+                                        video_velocity_rate, video_x0_rate)
         self.anchors.append(observation)
         reference_anchors = self.constants.get(
-            "bootstrap_anchors", self.constants["protected_prefix"]
+            "reference_anchors",
+            self.constants.get("bootstrap_anchors", self.constants["protected_prefix"]),
         )
         if len(self.anchors) == reference_anchors:
             window = self.constants["reference_intervals"]
@@ -239,7 +258,7 @@ class AdaptiveHistoryController:
                 ratio = observation.video_rate / max(self.reference_video_rate, 1e-8)
                 if ratio <= self.constants["low_change_ratio"]:
                     self.step_scale = min(
-                        self.constants["step_scale_max"],
+                        self.max_step_scale,
                         self.step_scale * self.constants["low_change_multiplier"],
                     )
                     reason = "low_video_change_grow"
@@ -294,8 +313,9 @@ class AdaptiveHistoryControllerV2(AdaptiveHistoryController):
     version = V2_CONTROLLER_VERSION
     constants = V2_CONTROLLER_CONSTANTS
 
-    def __init__(self, source_sigmas, latent_shapes=None, max_nfe=20):
-        super().__init__(source_sigmas, latent_shapes=latent_shapes, max_nfe=max_nfe)
+    def __init__(self, source_sigmas, latent_shapes=None, max_nfe=20, max_step_scale=None):
+        super().__init__(source_sigmas, latent_shapes=latent_shapes, max_nfe=max_nfe,
+                         max_step_scale=max_step_scale)
         self.low_change_streak = 0
         self.reference_video_rate = None
         self.reference_audio_rate = None
@@ -318,11 +338,13 @@ class AdaptiveHistoryControllerV2(AdaptiveHistoryController):
                 if ratio <= self.constants["low_change_ratio"]:
                     self.low_change_streak += 1
                     if self.low_change_streak >= self.constants["low_change_streak"]:
-                        self.step_scale = min(
-                            self.constants["step_scale_max"],
-                            self.step_scale * self.constants["low_change_multiplier"],
+                        requested_scale = self.step_scale * self.constants["low_change_multiplier"]
+                        self.step_scale = min(self.max_step_scale, requested_scale)
+                        reason = (
+                            "low_video_change_capped"
+                            if requested_scale > self.max_step_scale else
+                            "low_video_change_grow"
                         )
-                        reason = "low_video_change_grow"
                     else:
                         reason = "low_video_change_wait"
                 elif ratio >= self.constants["high_change_ratio"]:

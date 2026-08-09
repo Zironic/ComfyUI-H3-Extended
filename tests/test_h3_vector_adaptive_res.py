@@ -114,25 +114,39 @@ class AdaptiveResTests(unittest.TestCase):
         self.assertEqual(observation.video_change, 0.0)
         self.assertGreater(observation.video_x0_change, 0.0)
         self.assertGreater(observation.video_rate, 0.0)
+        self.assertEqual(observation.video_velocity_rate, 0.0)
+        self.assertGreater(observation.video_x0_rate, 0.0)
 
     def test_v2_bootstrap_gate_and_tail(self):
         source = torch.linspace(20.0, 0.0, 21)
         controller = _MOD.AdaptiveHistoryControllerV2(source)
         self.assertEqual(controller.constants["protected_prefix"], 0)
-        self.assertEqual(controller.constants["bootstrap_anchors"], 4)
-        for i in range(3):
+        self.assertEqual(controller.constants["bootstrap_anchors"], 3)
+        self.assertEqual(controller.constants["reference_anchors"], 2)
+        for i in range(2):
             nxt, decision = controller.propose(float(source[i]))
             self.assertEqual(nxt, float(source[i + 1]))
             self.assertEqual(decision["reason"], "bootstrap")
             self.assertEqual(decision["protected_region"], "bootstrap")
             self.assertNotEqual(decision["reason"], "protected_prefix")
+        controller.observe(float(source[0]), torch.ones(1), torch.ones(1))
+        controller.observe(
+            float(source[1]), torch.full((1,), 2.0), torch.full((1,), 2.0),
+            torch.ones(1), torch.ones(1), float(source[0]),
+        )
+        self.assertIsNotNone(controller.reference_video_rate)
         controller.reference_video_rate = 1.0
         controller.reference_audio_rate = 1.0
-        low = _MOD.AnchorObservation(8.0, 8, 0.1, 0.1, 1.0, 1.0, 0.1, 0.1)
-        _, decision = controller.propose(8.0, low)
+        low = _MOD.AnchorObservation(
+            float(source[2]), 2, 0.1, 0.1, 1.0, 1.0, 0.1, 0.1,
+        )
+        _, decision = controller.propose(float(source[2]), low)
         self.assertEqual(controller.step_scale, 1.0)
         self.assertEqual(decision["reason"], "low_video_change_wait")
-        _, decision = controller.propose(7.0, low)
+        low = _MOD.AnchorObservation(
+            float(source[3]), 3, 0.1, 0.1, 1.0, 1.0, 0.1, 0.1,
+        )
+        _, decision = controller.propose(float(source[3]), low)
         self.assertEqual(controller.step_scale, 1.5)
         self.assertEqual(decision["reason"], "low_video_change_grow")
         high = _MOD.AnchorObservation(6.0, 6, 2.0, 0.1, 1.0, 1.0, 2.0, 0.1)
@@ -150,9 +164,30 @@ class AdaptiveResTests(unittest.TestCase):
         next_sigma, decision = controller.propose(float(source[18]))
         self.assertEqual(next_sigma, float(source[19]))
         self.assertEqual(decision["protected_region"], "tail")
+
+    def test_v2_run_owned_max_step_scale(self):
+        source = torch.linspace(20.0, 0.0, 21)
+        controller = _MOD.AdaptiveHistoryControllerV2(source, max_step_scale=5.0)
+        self.assertEqual(controller.max_step_scale, 5.0)
+        self.assertEqual(controller.constants["step_scale_max"], 5.0)
+        controller.reference_video_rate = 1.0
+        controller.reference_audio_rate = 1.0
+        controller.low_change_streak = 1
+        controller.step_scale = 4.0
+        low = _MOD.AnchorObservation(8.0, 12, 0.1, 0.1, 1.0, 1.0, 0.1, 0.1)
+        _, decision = controller.propose(8.0, low)
+        self.assertEqual(controller.step_scale, 5.0)
+        self.assertEqual(decision["reason"], "low_video_change_capped")
         next_sigma, decision = controller.propose(float(source[19]))
         self.assertEqual(next_sigma, 0.0)
         self.assertEqual(decision["protected_region"], "tail")
+
+    def test_max_step_scale_must_be_finite_and_at_least_one(self):
+        source = torch.linspace(20.0, 0.0, 21)
+        for value in (0.99, float("inf"), float("nan")):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                    ValueError, "max_step_scale must be finite and at least one"):
+                _MOD.AdaptiveHistoryControllerV2(source, max_step_scale=value)
 
 
 if __name__ == "__main__":

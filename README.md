@@ -52,9 +52,14 @@ log-sigma coordinates from observed video trajectory changes, and shrinks only
 for an audio emergency. Every accepted anchor is a genuine H3 call (at most
 20 NFE); no forecast, probe, or rollback is used.
 
-`adaptive_history_v2` bootstraps with source anchors 0-3, then adapts without a
+`adaptive_history_v2` bootstraps with source anchors 0-2, then adapts without a
 protected quality head while retaining tail anchors 18/19 and terminal zero.
-It requires two consecutive low-change observations before widening.
+Its first measured interval establishes the reference, allowing anchor 2 to
+count as the first of two consecutive low-change observations. Each
+genuine anchor logs its scheduler-equivalent position, estimated compute
+completion, proposed next position, step scale, and decision reason.
+The `adaptive RES maximum step scale` control defaults to `3.0`; higher values
+let low-change decisions test wider intervals and are recorded in diagnostics.
 
 `late_aggressive_13` is the current accelerated reference profile. The first
 controlled placement comparison found that the equal-NFE early profile severely

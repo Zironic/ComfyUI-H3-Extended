@@ -21,7 +21,7 @@ import urllib.request
 DEFAULT_DIAGNOSTICS = Path(r"D:\AI\ComfyUI\Output\h3_vector_accel")
 ADAPTIVE_PROFILE_ANCHORS = {
     "adaptive_history_v1": (tuple(range(6)), (17, 18, 19)),
-    "adaptive_history_v2": (tuple(range(4)), (18, 19)),
+    "adaptive_history_v2": (tuple(range(3)), (18, 19)),
 }
 
 
@@ -164,7 +164,9 @@ def _decision_rows(data: dict) -> tuple[list[dict], dict]:
     for index, decision in enumerate(decisions):
         anchor = anchors[index] if index < len(anchors) else {}
         metrics = anchor.get("trajectory_metrics") or anchor.get("metrics") or {}
-        video_rate = _first(metrics, "video_rate", "video_velocity_rate")
+        video_rate = _first(metrics, "video_rate")
+        video_velocity_rate = _first(metrics, "video_velocity_rate")
+        video_x0_rate = _first(metrics, "video_x0_rate")
         audio_rate = _first(metrics, "audio_rate", "audio_velocity_rate")
         video_x0 = _first(metrics, "video_x0_change", "video_x0")
         audio_x0 = _first(metrics, "audio_x0_change", "audio_x0")
@@ -186,6 +188,10 @@ def _decision_rows(data: dict) -> tuple[list[dict], dict]:
             "video_x0_change": video_x0,
             "audio_x0_change": audio_x0,
             "video_rate": video_rate,
+            "video_velocity_rate": video_velocity_rate,
+            "video_x0_rate": video_x0_rate,
+            "reference_video_rate": _first(metrics, "reference_video_rate"),
+            "video_rate_ratio": _first(metrics, "video_rate_ratio"),
             "audio_rate": audio_rate,
             "video_score": video_score,
             "audio_score": audio_score,
@@ -194,7 +200,9 @@ def _decision_rows(data: dict) -> tuple[list[dict], dict]:
             "protected_region": decision.get("protected_region", anchor.get("protected_region")),
         })
     constants = data.get("controller_constants") or data.get("configuration", {}).get("adaptive_controller", {}).get("constants", {})
-    reference_anchors = int(constants.get("bootstrap_anchors", constants.get("protected_prefix", 6)) or 0)
+    reference_anchors = int(constants.get(
+        "reference_anchors", constants.get("bootstrap_anchors", constants.get("protected_prefix", 6))
+    ) or 0)
     rates = [row["video_rate"] for row in rows[:reference_anchors] if row["video_rate"] is not None]
     audio_rates = [row["audio_rate"] for row in rows[:reference_anchors] if row["audio_rate"] is not None]
     window = int(constants.get("reference_intervals", 3) or 3)

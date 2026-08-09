@@ -24,6 +24,7 @@ class FingerprintTests(unittest.TestCase):
             SamplerConfig(fallback_on_guard=False),
             SamplerConfig(protected_prefix_steps=7),
             SamplerConfig(audio_emergency_multiplier=5.0),
+            SamplerConfig(max_adaptive_step_scale=5.0),
         ]
         for config in variants:
             self.assertNotEqual(base, configuration_fingerprint(config, s))
@@ -68,8 +69,17 @@ class FingerprintTests(unittest.TestCase):
         self.assertEqual(v1_payload["adaptive_controller"]["version"], "adaptive_history_v1")
         self.assertEqual(v2_payload["adaptive_controller"]["version"], "adaptive_history_v2")
         self.assertEqual(v1_payload["adaptive_controller"]["constants"]["high_change_ratio"], 1.5)
-        self.assertEqual(v2_payload["adaptive_controller"]["constants"]["bootstrap_anchors"], 4)
+        self.assertEqual(v2_payload["adaptive_controller"]["constants"]["bootstrap_anchors"], 3)
+        self.assertEqual(v2_payload["adaptive_controller"]["constants"]["reference_anchors"], 2)
         self.assertEqual(v2_payload["adaptive_controller"]["constants"]["protected_prefix"], 0)
+        v2_5x = SamplerConfig(
+            method="res_multistep", evaluation_profile="adaptive_history_v2",
+            max_adaptive_step_scale=5.0,
+        )
+        v2_5x_payload = configuration_payload(v2_5x, sigmas)
+        self.assertEqual(v2_5x_payload["adaptive_controller"]["constants"]["step_scale_max"], 5.0)
+        self.assertNotEqual(configuration_fingerprint(v2, sigmas),
+                            configuration_fingerprint(v2_5x, sigmas))
         self.assertNotEqual(configuration_fingerprint(v1, sigmas),
                             configuration_fingerprint(v2, sigmas))
         self.assertNotEqual(

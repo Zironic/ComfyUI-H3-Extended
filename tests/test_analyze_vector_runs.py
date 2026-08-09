@@ -79,22 +79,31 @@ class AnalyzeVectorRunsTests(unittest.TestCase):
                 effective_sigma_sequence=[1, .8, .4, 0],
                 adaptive_decisions=[{"sigma": 1, "next_sigma": .8, "reason": "bootstrap", "step_scale": 1}],
                 anchors=[{"actual": True, "source_index": 0, "step": 0, "sigma": 1,
-                          "trajectory_metrics": {"video_rate": 2, "audio_rate": 4}}],
-                controller_constants={"bootstrap_anchors": 4, "reference_intervals": 1, "low_change_ratio": .75,
+                          "trajectory_metrics": {
+                              "video_rate": 2, "video_velocity_rate": 3,
+                              "video_x0_rate": 1, "reference_video_rate": 4,
+                              "video_rate_ratio": .5, "audio_rate": 4,
+                          }}],
+                controller_constants={"bootstrap_anchors": 3, "reference_anchors": 2,
+                                     "reference_intervals": 1, "low_change_ratio": .75,
                                      "high_change_ratio": 1.5, "audio_emergency_multiplier": 4},
             )
             summary = summarize(path)
             self.assertEqual(summary["profile"], "adaptive_history_v2")
             self.assertEqual(summary["decisions"][0]["video_rate"], 2)
+            self.assertEqual(summary["decisions"][0]["video_velocity_rate"], 3)
+            self.assertEqual(summary["decisions"][0]["video_x0_rate"], 1)
+            self.assertEqual(summary["decisions"][0]["reference_video_rate"], 4)
+            self.assertEqual(summary["decisions"][0]["video_rate_ratio"], .5)
             self.assertEqual(summary["decisions"][0]["audio_rate"], 4)
             self.assertEqual(summary["decision_reference"]["low_video_threshold"], 1.5)
 
     def test_v2_invariants_require_bootstrap_and_two_anchor_tail(self):
         source = [1.0 - index * 0.04 for index in range(20)] + [0.0]
-        effective = source[:4] + [0.7, source[18], source[19], 0.0]
+        effective = source[:3] + [0.7, source[18], source[19], 0.0]
         anchors = [
             {"actual": True, "source_index": index}
-            for index in (0, 1, 2, 3)
+            for index in (0, 1, 2)
         ] + [
             {"actual": True, "source_index": None},
             {"actual": True, "source_index": 18},

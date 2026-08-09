@@ -54,9 +54,10 @@ stock `sample_res_multistep` before it is used by the adaptive controller.
 - Protect source indices 17, 18, and 19 and the terminal-zero transition.
 - Between those regions, propose continuous off-grid `t` coordinates using the
   local spacing of the original 20-step scheduler as the baseline.
-- Maintain a dimensionless step scale in `[1, 3]`, initially 1. Each low-change
-  observation grows it by 1.5, each high-change or audio-emergency observation
-  shrinks it by 0.7, and a moderate observation keeps it unchanged.
+- Maintain a dimensionless step scale from 1 to the configured maximum, which
+  defaults to 3. Each low-change observation grows it by 1.5, each high-change
+  or audio-emergency observation shrinks it by 0.7, and a moderate observation
+  keeps it unchanged.
 - Establish the reference trajectory-change rate from the last three
   protected-prefix intervals. Low and high bands compare later per-unit-t
   rates against that fixed, versioned reference so widening source intervals
@@ -73,8 +74,10 @@ stock `sample_res_multistep` before it is used by the adaptive controller.
 Every callback and full diagnostic anchor records the actual sigma, true NFE,
 step scale, local base interval, proposed interval, video/audio trajectory
 metrics, decision reason, and whether the anchor belongs to the protected
-prefix or tail. Run metadata records the source schedule, selected effective
-schedule, controller version/constants, and hashes of both schedules.
+prefix or tail. V2 console and full diagnostics also expose separate video
+velocity/x0 rates, their combined rate, the fixed reference, and their ratio.
+Run metadata records the source schedule, selected effective schedule,
+controller version/constants, and hashes of both schedules.
 
 The configuration fingerprint includes the adaptive controller identity and
 constants. The final effective-schedule hash is a run result because it is not
@@ -83,15 +86,18 @@ known when the sampler object is constructed.
 ## Version-two contract
 
 `adaptive_history_v2` removes the hand-authored protected head while preserving
-the same RES integration and controller limits. It uses source anchors 0-3 only
-as the minimum bootstrap needed to measure three trajectory-change intervals.
-After that, no head coordinate is forced. Two consecutive low-video-change
-observations are required before widening; moderate or high change clears the
-streak, and high change or an audio emergency shrinks immediately. Only tail
-anchors 18/19 and terminal zero remain protected.
+the same RES integration and controller limits. It forces only source anchors
+0-2. The first measured interval establishes the fixed reference, so the second
+interval at anchor 2 can count as the first low-change observation rather than
+starting a separate calibration phase. After that, no head coordinate is
+forced. Two consecutive low-video-change observations are required before
+widening; moderate or high change clears the streak, and high change or an
+audio emergency shrinks immediately. Only tail anchors 18/19 and terminal zero
+remain protected.
 
-The v2 identity fingerprints the four-anchor bootstrap, zero protected-prefix
-length, two-observation growth gate, and shortened tail separately from v1.
+The v2 identity fingerprints the three-anchor bootstrap, one-interval reference,
+zero protected-prefix length, two-observation growth gate, and shortened tail
+separately from v1.
 
 ## Acceptance evidence
 

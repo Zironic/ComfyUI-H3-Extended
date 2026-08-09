@@ -80,6 +80,9 @@ class PolicyTests(unittest.TestCase):
         for value in (float("nan"), float("inf"), 0.0):
             with self.assertRaises(ValueError):
                 SamplerConfig(max_extrapolation_ratio=value)
+        for value in (float("nan"), float("inf"), 0.99):
+            with self.assertRaises(ValueError):
+                SamplerConfig(max_adaptive_step_scale=value)
 
     def test_adaptive_uses_video_surviving_risk_and_one_forecast_limit(self):
         policy = AdaptiveRepairPolicy(

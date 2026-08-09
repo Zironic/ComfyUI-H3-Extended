@@ -1,6 +1,7 @@
 """Deterministic Euler-compatible H3 vector acceleration loop."""
 
 from dataclasses import dataclass, replace
+import logging
 import math
 import time
 
@@ -229,6 +230,68 @@ class _TimedModel:
         return getattr(self._model, name)
 
 
+def _adaptive_source_coordinate(controller, sigma):
+    """Map an adaptive sigma to a fractional coordinate on the source grid."""
+    sigma = _scalar_sigma(sigma)
+    if sigma <= 0.0:
+        return float(len(controller.source) - 1)
+    source_index = controller._source_index(sigma)
+    if source_index is not None:
+        return float(source_index)
+    left = controller._containing_index(sigma)
+    right_sigma = controller.source[left + 1]
+    if right_sigma <= 0.0:
+        return float(left)
+    left_t = -math.log(controller.source[left])
+    right_t = -math.log(right_sigma)
+    fraction = (-math.log(sigma) - left_t) / (right_t - left_t)
+    return left + min(1.0, max(0.0, fraction))
+
+
+def _adaptive_estimated_total_nfe(controller, current_nfe, next_sigma):
+    """Estimate total genuine calls from the current scale and protected tail."""
+    if next_sigma <= 0.0:
+        return current_nfe
+    next_coordinate = _adaptive_source_coordinate(controller, next_sigma)
+    tail = controller.constants["protected_tail"]
+    tail_start = tail[0]
+    if next_coordinate < tail_start:
+        scale = max(controller.constants["step_scale_min"], controller.step_scale)
+        intermediate = max(1, math.ceil((tail_start - next_coordinate) / scale))
+        remaining = intermediate + len(tail)
+    else:
+        remaining = sum(index + 1e-6 >= next_coordinate for index in tail)
+    return min(controller.max_nfe, current_nfe + remaining)
+
+
+def _adaptive_metric(value):
+    return "n/a" if value is None or not math.isfinite(value) else f"{value:.4f}"
+
+
+def _log_adaptive_v2_progress(controller, current_nfe, sigma, next_sigma, decision, observation):
+    current_coordinate = _adaptive_source_coordinate(controller, sigma)
+    next_coordinate = _adaptive_source_coordinate(controller, next_sigma)
+    estimated_total = _adaptive_estimated_total_nfe(controller, current_nfe, next_sigma)
+    schedule_steps = len(controller.source) - 1
+    reference = controller.reference_video_rate
+    ratio = (
+        None if observation.video_rate is None or reference is None else
+        observation.video_rate / max(reference, 1e-8)
+    )
+    logging.info(
+        "[H3 Adaptive RES v2] NFE %d/~%d (est. compute %.0f%%) | "
+        "schedule %.2f/%d (%.0f%%) -> %.2f | scale %.2fx | %s | "
+        "video rate v=%s x0=%s combined=%s ref=%s ratio=%s",
+        current_nfe, estimated_total, current_nfe / max(1, estimated_total) * 100.0,
+        current_coordinate, schedule_steps, current_coordinate / schedule_steps * 100.0,
+        next_coordinate, decision["step_scale"], decision["reason"],
+        _adaptive_metric(observation.video_velocity_rate),
+        _adaptive_metric(observation.video_x0_rate),
+        _adaptive_metric(observation.video_rate),
+        _adaptive_metric(reference), _adaptive_metric(ratio),
+    )
+
+
 def _sample_adaptive_res(model, x, source_sigmas, extra_args, callback, disable, config,
                          diagnostics, context):
     """Run causal adaptive RES with one genuine model call per accepted anchor."""
@@ -237,7 +300,8 @@ def _sample_adaptive_res(model, x, source_sigmas, extra_args, callback, disable,
     controller_class = (AdaptiveHistoryControllerV2
                         if config.evaluation_profile == "adaptive_history_v2"
                         else AdaptiveHistoryController)
-    controller = controller_class(source, latent_shapes=context.latent_shapes)
+    controller = controller_class(source, latent_shapes=context.latent_shapes,
+                                  max_step_scale=config.max_adaptive_step_scale)
     stepper = IncrementalRES()
     timed_model = _TimedModel(model)
     diagnostics = diagnostics or RunDiagnostics(config=config, latent_shapes=context.latent_shapes,
@@ -284,6 +348,10 @@ def _sample_adaptive_res(model, x, source_sigmas, extra_args, callback, disable,
             decisions[-1] = decision
         if not math.isfinite(sigma_next_value) or not 0.0 <= sigma_next_value < _scalar_sigma(sigma):
             raise RuntimeError("adaptive RES proposed an invalid sigma")
+        if config.evaluation_profile == "adaptive_history_v2":
+            _log_adaptive_v2_progress(
+                controller, len(effective), sigma, sigma_next_value, decision, observation
+            )
         sigma_next = sigma.new_tensor(sigma_next_value)
         source_index = controller._source_index(_scalar_sigma(sigma))
         logical_step = controller._containing_index(_scalar_sigma(sigma)) if source_index is None else min(source_index, 19)
@@ -306,6 +374,13 @@ def _sample_adaptive_res(model, x, source_sigmas, extra_args, callback, disable,
             "h3_vector_video_direction_cosine": observation.video_cosine,
             "h3_vector_audio_direction_cosine": observation.audio_cosine,
             "h3_vector_video_rate": observation.video_rate,
+            "h3_vector_video_velocity_rate": observation.video_velocity_rate,
+            "h3_vector_video_x0_rate": observation.video_x0_rate,
+            "h3_vector_reference_video_rate": controller.reference_video_rate,
+            "h3_vector_video_rate_ratio": (
+                None if observation.video_rate is None or controller.reference_video_rate is None
+                else observation.video_rate / max(controller.reference_video_rate, 1e-8)
+            ),
             "h3_vector_audio_rate": observation.audio_rate,
             "h3_vector_video_x0_change": observation.video_x0_change,
             "h3_vector_audio_x0_change": observation.audio_x0_change,
@@ -329,6 +404,13 @@ def _sample_adaptive_res(model, x, source_sigmas, extra_args, callback, disable,
                 "video_direction_cosine": observation.video_cosine,
                 "audio_direction_cosine": observation.audio_cosine,
                 "video_rate": observation.video_rate, "audio_rate": observation.audio_rate,
+                "video_velocity_rate": observation.video_velocity_rate,
+                "video_x0_rate": observation.video_x0_rate,
+                "reference_video_rate": controller.reference_video_rate,
+                "video_rate_ratio": (
+                    None if observation.video_rate is None or controller.reference_video_rate is None
+                    else observation.video_rate / max(controller.reference_video_rate, 1e-8)
+                ),
                 "video_score": observation.video_score, "audio_score": observation.audio_score,
             },
         )
