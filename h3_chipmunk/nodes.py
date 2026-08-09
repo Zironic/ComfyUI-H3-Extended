@@ -7,8 +7,6 @@ from .config import (
     CACHE_LOCATIONS,
     DEFAULT_CHUNK_ROWS,
     DEFAULT_MEASURE_LAYER_STRIDE,
-    DEFAULT_SHADOW_LAYER_STRIDE,
-    DEFAULT_SHADOW_SAMPLE_ROWS,
 )
 from .patch import install
 
@@ -21,11 +19,10 @@ class MiniMaxH3ChipmunkMLP(io.ComfyNode):
             display_name="MiniMax H3 Chipmunk MLP (Zi)",
             category="model/patch/minimax",
             description=(
-                "Experimental training-free H3 SwiGLU MLP delta acceleration. "
-                "measure records lightweight group dynamics; shadow_validate keeps "
-                "dense output exact while measuring real delta-approximation error; "
-                "reference_delta feeds the approximate cached delta into H3. "
-                "Use after the H3 attention patch and instead of Activation Memory/shared block compile."
+                "Experimental H3 SwiGLU MLP delta acceleration. The production node never "
+                "materializes CUDA diagnostics on the host. measure is an output-exact "
+                "dense dry-run; reference_delta is the approximate path and currently "
+                "requires GPU-resident cache state. Use instead of Activation Memory/shared compile."
             ),
             inputs=[
                 io.Model.Input("model"),
@@ -41,14 +38,24 @@ class MiniMaxH3ChipmunkMLP(io.ComfyNode):
                 io.Int.Input("chunk_rows", default=DEFAULT_CHUNK_ROWS, min=128, max=4096, step=128),
                 io.Int.Input("token_group_rows", default=128, min=32, max=1024, step=32),
                 io.Combo.Input("scope", options=list(SCOPES), default="target_video"),
-                io.Combo.Input("cache_location", options=list(CACHE_LOCATIONS), default="cpu"),
+                io.Combo.Input(
+                    "cache_location",
+                    options=list(CACHE_LOCATIONS),
+                    default="gpu",
+                    tooltip=(
+                        "Production reference_delta cache is GPU-only. The old synchronous CPU "
+                        "cache path was removed rather than allowed to stall model execution."
+                    ),
+                ),
                 io.Float.Input("cache_budget_gb", default=24.0, min=1.0, max=512.0, step=1.0),
                 io.Float.Input("random_groups", default=0.0, min=0.0, max=0.25, step=0.01),
                 io.Boolean.Input("strict", default=True),
-                io.Boolean.Input("save_report", default=True),
+                io.Boolean.Input(
+                    "save_report",
+                    default=False,
+                    tooltip="Writes host-native path/count metadata only; never reads CUDA tensors.",
+                ),
                 io.String.Input("run_tag", default="chipmunk"),
-                # Append new widgets after all original fields so saved Comfy
-                # workflows retain their positional widget values.
                 io.Int.Input(
                     "measure_layer_stride",
                     default=DEFAULT_MEASURE_LAYER_STRIDE,
@@ -56,32 +63,8 @@ class MiniMaxH3ChipmunkMLP(io.ComfyNode):
                     max=50,
                     step=1,
                     tooltip=(
-                        "measure mode observes every Nth main block plus the last block. "
-                        "5 is the low-overhead default; 1 measures all 50 blocks."
-                    ),
-                ),
-                io.Int.Input(
-                    "shadow_layer_stride",
-                    default=DEFAULT_SHADOW_LAYER_STRIDE,
-                    min=1,
-                    max=30,
-                    step=1,
-                    tooltip=(
-                        "shadow_validate tests every Nth sparse-profile layer plus layer 29, "
-                        "and always tests layer 30 at 100% as the numerical control. "
-                        "The default validates 0,5,10,15,20,25,29,30."
-                    ),
-                ),
-                io.Int.Input(
-                    "shadow_sample_rows",
-                    default=DEFAULT_SHADOW_SAMPLE_ROWS,
-                    min=32,
-                    max=1024,
-                    step=32,
-                    tooltip=(
-                        "Rows per eligible video chunk used by shadow_validate. The exact dense "
-                        "MLP still runs for every row; only this sampled window gets a parallel "
-                        "approximate delta path and error measurement."
+                        "Retained for saved-workflow compatibility. Production measure is now a "
+                        "dense no-sync dry-run and does not collect CUDA-valued diagnostics."
                     ),
                 ),
             ],
@@ -94,11 +77,9 @@ class MiniMaxH3ChipmunkMLP(io.ComfyNode):
         refresh_every=6, first_dense_steps=2, last_dense_steps=2,
         first_dense_layers=2, layer_start=0, layer_stop=50,
         chunk_rows=DEFAULT_CHUNK_ROWS, token_group_rows=128, scope="target_video",
-        cache_location="cpu", cache_budget_gb=24.0, random_groups=0.0,
-        strict=True, save_report=True, run_tag="chipmunk",
+        cache_location="gpu", cache_budget_gb=24.0, random_groups=0.0,
+        strict=True, save_report=False, run_tag="chipmunk",
         measure_layer_stride=DEFAULT_MEASURE_LAYER_STRIDE,
-        shadow_layer_stride=DEFAULT_SHADOW_LAYER_STRIDE,
-        shadow_sample_rows=DEFAULT_SHADOW_SAMPLE_ROWS,
     ):
         if not enabled:
             return io.NodeOutput(model)
@@ -122,8 +103,6 @@ class MiniMaxH3ChipmunkMLP(io.ComfyNode):
             strict=bool(strict),
             save_report=bool(save_report),
             run_tag=str(run_tag),
-            shadow_layer_stride=int(shadow_layer_stride),
-            shadow_sample_rows=int(shadow_sample_rows),
         )
         patched = model.clone()
         install(patched, config)
