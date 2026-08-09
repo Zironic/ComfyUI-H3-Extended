@@ -67,8 +67,9 @@ class MiniMaxH3ChipmunkMLP(io.ComfyNode):
                     max=30,
                     step=1,
                     tooltip=(
-                        "shadow_validate tests every Nth sparse-profile layer plus layer 29. "
-                        "The default validates layers 0,5,10,15,20,25,29."
+                        "shadow_validate tests every Nth sparse-profile layer plus layer 29, "
+                        "and always tests layer 30 at 100% as the numerical control. "
+                        "The default validates 0,5,10,15,20,25,29,30."
                     ),
                 ),
                 io.Int.Input(
