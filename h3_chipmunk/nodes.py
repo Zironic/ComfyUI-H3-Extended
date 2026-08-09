@@ -7,6 +7,8 @@ from .config import (
     CACHE_LOCATIONS,
     DEFAULT_CHUNK_ROWS,
     DEFAULT_MEASURE_LAYER_STRIDE,
+    DEFAULT_SHADOW_LAYER_STRIDE,
+    DEFAULT_SHADOW_SAMPLE_ROWS,
 )
 from .patch import install
 
@@ -20,8 +22,9 @@ class MiniMaxH3ChipmunkMLP(io.ComfyNode):
             category="model/patch/minimax",
             description=(
                 "Experimental training-free H3 SwiGLU MLP delta acceleration. "
-                "measure is output-exact and records lightweight ConvRot group dynamics; "
-                "reference_delta enables approximate cached sparse-delta execution. "
+                "measure records lightweight group dynamics; shadow_validate keeps "
+                "dense output exact while measuring real delta-approximation error; "
+                "reference_delta feeds the approximate cached delta into H3. "
                 "Use after the H3 attention patch and instead of Activation Memory/shared block compile."
             ),
             inputs=[
@@ -57,6 +60,29 @@ class MiniMaxH3ChipmunkMLP(io.ComfyNode):
                         "5 is the low-overhead default; 1 measures all 50 blocks."
                     ),
                 ),
+                io.Int.Input(
+                    "shadow_layer_stride",
+                    default=DEFAULT_SHADOW_LAYER_STRIDE,
+                    min=1,
+                    max=30,
+                    step=1,
+                    tooltip=(
+                        "shadow_validate tests every Nth sparse-profile layer plus layer 29. "
+                        "The default validates layers 0,5,10,15,20,25,29."
+                    ),
+                ),
+                io.Int.Input(
+                    "shadow_sample_rows",
+                    default=DEFAULT_SHADOW_SAMPLE_ROWS,
+                    min=32,
+                    max=1024,
+                    step=32,
+                    tooltip=(
+                        "Rows per eligible video chunk used by shadow_validate. The exact dense "
+                        "MLP still runs for every row; only this sampled window gets a parallel "
+                        "approximate delta path and error measurement."
+                    ),
+                ),
             ],
             outputs=[io.Model.Output()],
         )
@@ -70,6 +96,8 @@ class MiniMaxH3ChipmunkMLP(io.ComfyNode):
         cache_location="cpu", cache_budget_gb=24.0, random_groups=0.0,
         strict=True, save_report=True, run_tag="chipmunk",
         measure_layer_stride=DEFAULT_MEASURE_LAYER_STRIDE,
+        shadow_layer_stride=DEFAULT_SHADOW_LAYER_STRIDE,
+        shadow_sample_rows=DEFAULT_SHADOW_SAMPLE_ROWS,
     ):
         if not enabled:
             return io.NodeOutput(model)
@@ -93,6 +121,8 @@ class MiniMaxH3ChipmunkMLP(io.ComfyNode):
             strict=bool(strict),
             save_report=bool(save_report),
             run_tag=str(run_tag),
+            shadow_layer_stride=int(shadow_layer_stride),
+            shadow_sample_rows=int(shadow_sample_rows),
         )
         patched = model.clone()
         install(patched, config)
