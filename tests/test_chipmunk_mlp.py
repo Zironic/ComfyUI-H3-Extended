@@ -34,11 +34,8 @@ def test_config_contract():
     assert cfg.measure_layer_stride == 5
     assert cfg.shadow_layer_stride == 5
     assert cfg.shadow_sample_rows == 128
-    # Old saved workflows with the prototype 128-row setting are automatically
-    # lifted to the efficient exact diagnostic slab size.
     assert H3ChipmunkConfig(chunk_rows=128).effective_chunk_rows == 2048
     assert H3ChipmunkConfig(mode="shadow_validate", chunk_rows=128).effective_chunk_rows == 2048
-    # Approximate execution still honors the explicit slab size.
     assert H3ChipmunkConfig(mode="reference_delta", chunk_rows=128).effective_chunk_rows == 128
     for kwargs in (
         {"top_fraction": 0.0},
@@ -68,7 +65,7 @@ def test_shadow_depth_profile_and_sampling():
     assert cfg.shadow_fraction_for_layer(30) == 1.0
     assert cfg.shadow_fraction_for_layer(49) == 1.0
     enabled = [layer for layer in range(50) if cfg.shadow_layer_enabled(layer)]
-    assert enabled == [0, 5, 10, 15, 20, 25, 29]
+    assert enabled == [0, 5, 10, 15, 20, 25, 29, 30]
 
 
 def test_signature_tracks_cache_measure_and_shadow_policy():
