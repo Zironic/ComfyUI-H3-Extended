@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import torch
 import comfy.model_management
 
 from ..h3_activation_memory.chunks import iter_mod_chunks, validate_mod_segments
@@ -7,6 +8,7 @@ from ..h3_activation_memory.linear import ConvRotTwoSliceMLP
 from ..h3_runtime.context import get_runtime_snapshot
 from ..h3_runtime.timing import timed_stage
 from .executor import run_chipmunk_chunk
+from .selector import logical_swiglu
 
 
 def _scale_shift(h, shift, scale):
@@ -66,6 +68,79 @@ def make_forward(block, layer_index, config, session, original_forward=None):
         held = ConvRotTwoSliceMLP(block.mlp, x[:1])
         held.__enter__()
         try:
+            if held.tiles is None or len(held.tiles) != 2:
+                raise RuntimeError("Chipmunk requires exactly two held ConvRot MLP tiles")
+            tile_ffn = int(held.tiles[0]["fc2_weight"].shape[1])
+            if any(int(tile["fc2_weight"].shape[1]) != tile_ffn for tile in held.tiles):
+                raise RuntimeError("Chipmunk requires equal-width ConvRot fc2 tiles")
+
+            def full_activation_runner(value):
+                pieces = []
+                for tile in held.tiles:
+                    expanded = held.convrot_linear(
+                        value,
+                        tile["fc1_weight"],
+                        tile["fc1_scale"],
+                        input_act=None,
+                    )
+                    pieces.append(logical_swiglu(expanded))
+                return torch.cat(pieces, dim=-1)
+
+            def selected_activation_runner(value, logical_indices):
+                # The balanced selector always emits equal group counts from the
+                # two 7168-wide logical feature tiles. Split by static tensor
+                # shape, never by a CUDA value.
+                half = int(logical_indices.shape[0]) // 2
+                local_indices = (
+                    logical_indices[:half].long(),
+                    logical_indices[half:].long() - tile_ffn,
+                )
+                pieces = []
+                for tile, local in zip(held.tiles, local_indices):
+                    rows = torch.cat((local, local + tile_ffn), dim=0)
+                    q = tile["fc1_weight"].index_select(0, rows).contiguous()
+                    scale = tile["fc1_scale"]
+                    if scale.numel() != 1:
+                        scale = scale.index_select(0, rows).contiguous()
+                    expanded = held.convrot_linear(
+                        value,
+                        q,
+                        scale,
+                        input_act=None,
+                    )
+                    pieces.append(logical_swiglu(expanded))
+                return torch.cat(pieces, dim=-1)
+
+            def selected_fc2_runner(selected_activation, logical_indices):
+                half_indices = int(logical_indices.shape[0]) // 2
+                half_activation = int(selected_activation.shape[-1]) // 2
+                local_indices = (
+                    logical_indices[:half_indices].long(),
+                    logical_indices[half_indices:].long() - tile_ffn,
+                )
+                activations = (
+                    selected_activation[:, :half_activation],
+                    selected_activation[:, half_activation:],
+                )
+                result = None
+                for tile, activation, local in zip(
+                    held.tiles,
+                    activations,
+                    local_indices,
+                ):
+                    q = tile["fc2_weight"].index_select(1, local).contiguous()
+                    partial = held.convrot_linear(
+                        activation,
+                        q,
+                        tile["fc2_scale"],
+                        input_act=None,
+                    )
+                    if result is None:
+                        result = partial
+                    else:
+                        result.add_(partial)
+                return result
+
             for chunk_index, chunk in enumerate(chunks):
                 with timed_stage(transformer_options, "norm2_modulation"):
                     h = block.norm2(x[chunk.start:chunk.stop])
@@ -96,6 +171,9 @@ def make_forward(block, layer_index, config, session, original_forward=None):
                     session=session,
                     config=config,
                     dense_runner=dense_runner,
+                    full_activation_runner=full_activation_runner,
+                    selected_activation_runner=selected_activation_runner,
+                    selected_fc2_runner=selected_fc2_runner,
                 )
                 with timed_stage(transformer_options, "final_mlp_gate"):
                     _gate_add(
