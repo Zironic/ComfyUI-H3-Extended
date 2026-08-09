@@ -25,12 +25,28 @@ def test_config_contract():
     assert cfg.mode == "measure"
     assert cfg.feature_group == 256
     assert cfg.scope == "target_video"
-    try:
-        H3ChipmunkConfig(top_fraction=0.0)
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("zero top_fraction accepted")
+    assert cfg.cache_location == "cpu"
+    assert cfg.cache_budget_gb == 24.0
+    for kwargs in (
+        {"top_fraction": 0.0},
+        {"cache_location": "disk"},
+        {"cache_budget_gb": 0.0},
+        {"layer_start": 10, "layer_stop": 10},
+    ):
+        try:
+            H3ChipmunkConfig(**kwargs)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"invalid config accepted: {kwargs}")
+
+
+def test_signature_tracks_cache_policy():
+    cpu = H3ChipmunkConfig(cache_location="cpu", cache_budget_gb=24.0)
+    gpu = H3ChipmunkConfig(cache_location="gpu", cache_budget_gb=24.0)
+    larger = H3ChipmunkConfig(cache_location="cpu", cache_budget_gb=48.0)
+    assert cpu.signature != gpu.signature
+    assert cpu.signature != larger.signature
 
 
 def test_swiglu_pairing():
@@ -76,7 +92,7 @@ def test_session_isolates_branch_layer_chunk():
     a.output = torch.ones(1)
     session.invalidate_branch((0,))
     assert a.output is None
-    assert b.output is None  # never initialized
+    assert b.output is None
 
 
 def test_request_change_resets_cache_and_records():
@@ -100,6 +116,7 @@ def test_request_change_resets_cache_and_records():
 
 if __name__ == "__main__":
     test_config_contract()
+    test_signature_tracks_cache_policy()
     test_swiglu_pairing()
     test_group_selector_shapes()
     test_session_isolates_branch_layer_chunk()
