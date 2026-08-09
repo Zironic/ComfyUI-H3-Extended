@@ -13,6 +13,8 @@ try:
         MODE_CONVROT_2SLICE,
     )
     from ..h3_attention.hybrid import (
+        DENSITY_FIXED,
+        DENSITY_MODES,
         HybridSparseBackend,
         HybridSparseConfig,
         HybridStatsCollector,
@@ -36,6 +38,8 @@ except ImportError:
         MODE_CONVROT_2SLICE,
     )
     from h3_attention.hybrid import (
+        DENSITY_FIXED,
+        DENSITY_MODES,
         HybridSparseBackend,
         HybridSparseConfig,
         HybridStatsCollector,
@@ -67,10 +71,11 @@ class MiniMaxH3HybridSparseAttention(io.ComfyNode):
             display_name="MiniMax H3 Hybrid Sparse Attention (Zi)",
             category="model/patch/minimax",
             description=(
-                "Phase A experimental SM89 path: route H3 directly at Sparse "
-                "Sage's 128Q x 64KV geometry, retaining the requested fraction "
-                "of pure target-video KV tiles. Flex, Sol head dispatch, and "
-                "automatic planning are not enabled yet."
+                "Experimental SM89 path: route H3 directly at Sparse Sage's "
+                "128Q x 64KV geometry. Fixed density retains the same fraction "
+                "for every pure target-video row. Adaptive budget density keeps "
+                "the same aggregate block budget while moving blocks toward "
+                "head/query rows with larger omitted coarse attention mass."
             ),
             inputs=[
                 io.Model.Input("model"),
@@ -78,6 +83,11 @@ class MiniMaxH3HybridSparseAttention(io.ComfyNode):
                 io.Combo.Input("mode", options=list(IMPLEMENTED_MODES), default="sage128"),
                 io.Float.Input(
                     "video_budget", default=0.5, min=0.01, max=1.0, step=0.01,
+                    tooltip=(
+                        "Fixed: fraction retained by every pure-video row. "
+                        "Adaptive budget: target mean fraction across all "
+                        "pure-video head/query rows."
+                    ),
                 ),
                 io.Boolean.Input("strict", default=True),
                 io.Combo.Input(
@@ -94,7 +104,39 @@ class MiniMaxH3HybridSparseAttention(io.ComfyNode):
                     "compile_backend", options=["off", "inductor"], default="off",
                     tooltip=(
                         "Compile one shared tensor program for all 50 main H3 blocks. "
+                        "The current shared program supports fixed density only. "
                         "Do not combine this with TorchCompileModel."
+                    ),
+                ),
+                # Append adaptive controls after every established widget so old
+                # serialized workflow widget positions retain their meaning.
+                io.Combo.Input(
+                    "density_mode", options=list(DENSITY_MODES), default=DENSITY_FIXED,
+                    tooltip=(
+                        "adaptive_budget preserves the fixed route's total block "
+                        "count but redistributes blocks between head/query rows."
+                    ),
+                ),
+                io.Float.Input(
+                    "min_video_density", default=0.05, min=0.01, max=1.0, step=0.01,
+                    tooltip="Minimum pure-video KV density per adaptive row.",
+                ),
+                io.Float.Input(
+                    "max_video_density", default=0.50, min=0.01, max=1.0, step=0.01,
+                    tooltip="Maximum pure-video KV density per adaptive row.",
+                ),
+                io.Float.Input(
+                    "adaptive_temperature", default=1.0, min=0.05, max=20.0, step=0.05,
+                    tooltip=(
+                        "Temperature applied to pooled QK scores before adaptive "
+                        "cumulative-mass estimation."
+                    ),
+                ),
+                io.Float.Input(
+                    "adaptive_target_mass", default=0.80, min=0.05, max=1.0, step=0.01,
+                    tooltip=(
+                        "Coarse video-attention mass used to estimate each row's "
+                        "unconstrained block demand before exact budget balancing."
                     ),
                 ),
             ],
@@ -105,7 +147,9 @@ class MiniMaxH3HybridSparseAttention(io.ComfyNode):
     def execute(cls, model, enabled=True, mode="sage128", video_budget=0.5,
                 strict=True, activation=DEFAULT_MODE,
                 chunk_rows=DEFAULT_CHUNK_ROWS, run_tag="hybrid50", timing=True,
-                compile_backend="off") -> io.NodeOutput:
+                compile_backend="off", density_mode=DENSITY_FIXED,
+                min_video_density=0.05, max_video_density=0.50,
+                adaptive_temperature=1.0, adaptive_target_mass=0.80) -> io.NodeOutput:
         if not enabled:
             return io.NodeOutput(model)
         if compile_backend not in ("off", "inductor"):
@@ -114,6 +158,11 @@ class MiniMaxH3HybridSparseAttention(io.ComfyNode):
         hybrid_config = HybridSparseConfig(
             mode=mode,
             video_budget=float(video_budget),
+            density_mode=str(density_mode),
+            min_video_density=float(min_video_density),
+            max_video_density=float(max_video_density),
+            adaptive_temperature=float(adaptive_temperature),
+            adaptive_target_mass=float(adaptive_target_mass),
             strict=bool(strict),
             run_tag=run_tag,
             timing=bool(timing),
@@ -125,6 +174,11 @@ class MiniMaxH3HybridSparseAttention(io.ComfyNode):
             activation_strict=bool(strict),
         )
         if compile_backend == "inductor":
+            if hybrid_config.density_mode != DENSITY_FIXED:
+                raise ValueError(
+                    "Inductor shared-block compilation currently requires fixed "
+                    "density_mode; adaptive_budget is available in eager mode"
+                )
             if hybrid_config.mode != MODE_SAGE128_FUSED_QKV:
                 raise ValueError(
                     "Inductor requires the sage128_fused_qkv attention mode"
@@ -149,7 +203,10 @@ class MiniMaxH3HybridSparseAttention(io.ComfyNode):
             selected=ATTENTION_HYBRID,
             backend=backend,
             adapter=ATTENTION_HYBRID,
-            reason="explicit Phase A direct 128Q x 64KV Sparse Sage experiment",
+            reason=(
+                "explicit direct 128Q x 64KV Sparse Sage experiment (%s)"
+                % hybrid_config.density_mode
+            ),
             environment=environment,
             projector=backend.projector,
         )
@@ -163,3 +220,4 @@ class MiniMaxH3HybridSparseAttention(io.ComfyNode):
 class MiniMaxH3HybridSparseAttentionExtension(ComfyExtension):
     async def get_node_list(self):
         return [MiniMaxH3HybridSparseAttention]
+

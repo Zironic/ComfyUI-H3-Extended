@@ -35,7 +35,9 @@ class HybridSparseBackend:
         self.config = config or HybridSparseConfig()
         if not isinstance(self.config, HybridSparseConfig):
             raise TypeError("config must be HybridSparseConfig")
-        self.router = router if router is not None else SparseTileRouter()
+        self.router = (
+            router if router is not None else SparseTileRouter(self.config)
+        )
         self.collector = collector
         self.runtime_listeners = () if collector is None else (collector,)
         self.timing = DeferredCudaTiming(
@@ -252,6 +254,11 @@ class HybridSparseBackend:
             "phase": "A",
             "mode": self.config.mode,
             "video_budget": float(self.config.video_budget),
+            "density_mode": self.config.density_mode,
+            "min_video_density": float(self.config.min_video_density),
+            "max_video_density": float(self.config.max_video_density),
+            "adaptive_temperature": float(self.config.adaptive_temperature),
+            "adaptive_target_mass": float(self.config.adaptive_target_mass),
             "sparge_attention": self.executor.api.version,
             "approximate": True,
             "timing": bool(self.config.timing),
