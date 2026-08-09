@@ -1,11 +1,33 @@
-"""CLI and packed-layout helpers for the activation-memory VRAM A/B/C probe."""
+"""CLI and packed-layout helpers for the MiniMax H3 arm-matrix probe."""
 
 import argparse
 
 import _minimax_vram_probe_base as base
 
-MODE_BF16 = "mlp_chunked_bf16"
-MODE_NATIVE = "mlp_chunked_native"
+QKV_MODES = ("sage128", "sage128_fused_qkv")
+MLP_MODES = ("untiled", "convrot2", "convrot4")
+
+
+def parse_selector(value, choices, name):
+    """Parse a concise comma-list selector, rejecting unknown/duplicate values."""
+    values = [item.strip() for item in str(value).split(",") if item.strip()]
+    if not values:
+        raise ValueError("--%s must select at least one value" % name)
+    unknown = [item for item in values if item not in choices]
+    if unknown:
+        raise ValueError("invalid %s %r (choose from %s)" %
+                         (name, unknown[0], ", ".join(choices)))
+    duplicates = sorted({item for item in values if values.count(item) > 1})
+    if duplicates:
+        raise ValueError("duplicate %s value %r" % (name, duplicates[0]))
+    return tuple(values)
+
+
+def selected_arms(args):
+    qkv = parse_selector(args.ab_qkv, QKV_MODES, "ab-qkv")
+    mlp = parse_selector(args.ab_mlp, MLP_MODES, "ab-mlp")
+    return tuple("%s/%s" % (qkv_mode, mlp_mode)
+                 for qkv_mode in qkv for mlp_mode in mlp)
 
 
 def build_parser(description):
@@ -17,8 +39,7 @@ def build_parser(description):
         "--ab-activation-memory",
         action="store_true",
         help=(
-            "run A/B/C: A=plain Sage, B=efficient Sage, "
-            "C=efficient Sage + chunked MLP"
+            "run a selectable QKV x MLP arm matrix (all six arms by default)"
         ),
     )
     p.add_argument("--ab-frames", default="73,90",
@@ -26,16 +47,12 @@ def build_parser(description):
     p.add_argument("--ab-warmup", type=int, default=1)
     p.add_argument("--ab-iterations", type=int, default=3)
     p.add_argument("--activation-chunk-rows", type=int, default=4096)
-    p.add_argument("--activation-alignment", type=int, default=256)
-    p.add_argument("--activation-mode", choices=(MODE_BF16, MODE_NATIVE), default=MODE_BF16)
-    p.add_argument("--no-held-weights", action="store_true")
-    p.add_argument("--activation-nonstrict", action="store_true")
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument(
         "--physical-warning-mb",
         type=int,
         default=800,
-        help="mark a measured variant LOW below this much physical free VRAM",
+        help="retire a measured arm below this much physical free VRAM",
     )
     p.add_argument(
         "--physical-poll-ms",
@@ -52,11 +69,17 @@ def build_parser(description):
     p.add_argument("--text-len", type=int, default=256)
     p.add_argument("--max-frames", type=int, default=396)
     p.add_argument("--ckpt", default=None,
-                   help="safetensors checkpoint; only its header is read")
+                   help="safetensors checkpoint supplying one real block")
     p.add_argument("--analytic", action="store_true",
-                   help="unsupported for A/B/C; retained for copied-command diagnostics")
+                   help="unsupported for the arm matrix; retained for copied-command diagnostics")
     p.add_argument("--sage", action="store_true",
-                   help="accepted for compatibility; A/B/C always selects ordinary Sage for A")
+                   help="accepted for compatibility; arm selection controls QKV")
+    p.add_argument("--ab-qkv", "--ab-qkv-modes", dest="ab_qkv",
+                   default=",".join(QKV_MODES),
+                   help="comma-separated QKV modes: sage128,sage128_fused_qkv")
+    p.add_argument("--ab-mlp", "--ab-mlp-modes", dest="ab_mlp",
+                   default=",".join(MLP_MODES),
+                   help="comma-separated MLP modes: untiled,convrot2,convrot4")
 
     g = p.add_argument_group("ref2v")
     g.add_argument("--mode", choices=["t2va", "ref2v"], default="t2va")
@@ -72,10 +95,16 @@ def build_parser(description):
         type=int,
         default=None,
         metavar="FRAMES",
-        help="calibrate reserve from variant B (efficient Sage)",
+        help="calibrate reserve from selected arm (default: first arm)",
     )
+    g.add_argument("--calibrate-arm", default=None,
+                   help="arm label used by --calibrate-to, e.g. sage128/untiled")
     g.add_argument("--spill-ratio", type=float, default=1.35)
-    g.add_argument("--past-spill", action="store_true")
+    g.add_argument(
+        "--past-spill",
+        action="store_true",
+        help="accepted for command compatibility; retired arms are never resumed",
+    )
 
     for key in base.DEFAULT_ARCH:
         p.add_argument("--" + key.replace("_", "-"), type=int, default=None)
@@ -104,23 +133,30 @@ def parse_profiles(spec, max_frames):
             out.append(aligned)
     if not out:
         raise ValueError("--ab-frames selected no profiles at or below --max-frames")
-    return out, adjusted
+    return sorted(out), adjusted
 
 
 def layout_for(args, frames):
     if args.mode == "t2va":
-        return base.build_layout(frames, args.width, args.height, args.text_len)
-    ref = frames if args.ref_frames == "matched" else int(args.ref_frames)
-    return base.build_layout(
-        frames,
-        args.width,
-        args.height,
-        args.text_len,
-        ref_frames=ref,
-        ref_width=args.ref_width,
-        ref_height=args.ref_height,
-        ref_audio=args.ref_audio,
-        anchor=args.anchor,
-        static_refs=args.static_refs,
-        static_ref_pixels=args.static_ref_pixels,
-    )
+        layout = base.build_layout(frames, args.width, args.height, args.text_len)
+    else:
+        ref = frames if args.ref_frames == "matched" else int(args.ref_frames)
+        layout = base.build_layout(
+            frames,
+            args.width,
+            args.height,
+            args.text_len,
+            ref_frames=ref,
+            ref_width=args.ref_width,
+            ref_height=args.ref_height,
+            ref_audio=args.ref_audio,
+            anchor=args.anchor,
+            static_refs=args.static_refs,
+            static_ref_pixels=args.static_ref_pixels,
+        )
+    layout["width"] = args.width
+    layout["height"] = args.height
+    layout["audio_t"] = sum(
+        stop - start for start, stop, kind in layout["segments"] if kind == "audio"
+    ) // 2
+    return layout

@@ -1,17 +1,28 @@
-"""Calibration, measured-residency tables, and budget projections for A/B/C."""
+"""Calibration, measured-residency tables, and budget projections for arm matrices."""
+
+from pathlib import Path
 
 import _minimax_vram_probe_base as base
-from _minimax_vram_probe_ab_cli import layout_for, parse_profiles
+from _minimax_vram_probe_ab_cli import layout_for, parse_profiles, selected_arms
 from _minimax_vram_probe_ab_runtime import (
     MIB,
     fmt_gib,
-    fmt_mib,
     fmt_ms,
     safe_measure,
     update_resident_fit,
 )
 
-VARIANTS = ("A", "B", "C")
+def resolve_checkpoint(value):
+    candidate = Path(value)
+    if candidate.is_absolute():
+        if candidate.suffix.lower() != ".safetensors" or not candidate.is_file():
+            raise FileNotFoundError(str(candidate))
+        return str(candidate.resolve())
+    import folder_paths
+    resolved = Path(folder_paths.get_full_path_or_raise("diffusion_models", value))
+    if resolved.suffix.lower() != ".safetensors" or not resolved.is_file():
+        raise FileNotFoundError(str(resolved))
+    return str(resolved.resolve())
 
 
 def _variant_state(measurement, spill, threshold_bytes):
@@ -29,16 +40,6 @@ def _profile_text(value):
     return "none" if value is None else str(value)
 
 
-def _pct(new, old):
-    if new is None or old is None:
-        return None
-    return (new / old - 1.0) * 100.0
-
-
-def _fmt_pct(value):
-    return "    n/a" if value is None else f"{value:>+6.1f}%"
-
-
 def _budget_state(total, budget):
     if total is None:
         return "OOM"
@@ -53,16 +54,13 @@ def run(
     device,
     reserve_gb,
     streamed,
-    plain_forward,
-    efficient_forward,
-    activation_forward,
+    forwards,
 ):
     threshold_bytes = int(args.physical_warning_mb) * MIB
-    forwards = {
-        "A": plain_forward,
-        "B": efficient_forward,
-        "C": activation_forward,
-    }
+    variants = selected_arms(args)
+    variants = tuple(label for label in variants if label in forwards)
+    if not variants:
+        raise ValueError("arm selector produced no forwards")
 
     def shared_cost(frames):
         layout = layout_for(args, frames)
@@ -86,10 +84,13 @@ def run(
     if args.calibrate_to is not None:
         frames = base.align_frame_count(max(5, args.calibrate_to))
         layout, latent, condition = shared_cost(frames)
-        measured, _ = measure_variant(efficient_forward, frames, layout)
+        calibration_arm = args.calibrate_arm or variants[0]
+        if calibration_arm not in forwards:
+            parser.error("--calibrate-arm must select one selected arm")
+        measured, _ = measure_variant(forwards[calibration_arm], frames, layout)
         if measured is None:
             print(
-                f"cannot calibrate: variant B efficient Sage OOMs at {frames} "
+                f"cannot calibrate: arm {calibration_arm} OOMs at {frames} "
                 "frames. Free the card and retry."
             )
             return
@@ -99,7 +100,7 @@ def run(
         )
         print(
             f"calibration {frames} frames is known to fit {args.budget:.1f} GB on "
-            f"variant B (efficient Sage), so the shared reserve is {solved:.2f} GB"
+            f"arm {calibration_arm}, so the shared reserve is {solved:.2f} GB"
         )
         if solved < 0:
             print(
@@ -123,41 +124,42 @@ def run(
         "measured isolated block memory/residency "
         f"(physical free from cudaMemGetInfo; LOW < {args.physical_warning_mb} MiB)"
     )
-    print(
-        f"{'frames':>7} {'tokens':>9} {'A tr':>8} {'B tr':>8} {'C tr':>8} "
-        f"{'A-B':>8} {'B-C':>8} {'A free':>7} {'B free':>7} {'C free':>7}  residency"
-    )
+    print("frames  tokens  " + "  ".join("%s tr" % key for key in variants) + "  residency")
 
-    best_projected = {key: None for key in VARIANTS}
-    last_physical_safe = {key: None for key in VARIANTS}
-    first_low = {key: None for key in VARIANTS}
-    first_spill = {key: None for key in VARIANTS}
-    resident_points = {key: [] for key in VARIANTS}
+    best_projected = {key: None for key in variants}
+    last_physical_safe = {key: None for key in variants}
+    first_low = {key: None for key in variants}
+    first_spill = {key: None for key in variants}
+    resident_points = {key: [] for key in variants}
+    retired = {}
     rows = []
 
     for frames in profiles:
+        retired_before = set(retired)
         layout, latent, condition = shared_cost(frames)
         measurements = {}
-        for key in VARIANTS:
+        for key in variants:
+            if key in retired:
+                continue
             measurements[key], _ = measure_variant(
                 forwards[key], frames, layout
             )
 
         transient = {
             key: (
-                measurements[key].peak_bytes
-                if measurements[key] is not None
+                measurements.get(key).peak_bytes
+                if measurements.get(key) is not None
                 else None
             )
-            for key in VARIANTS
+            for key in variants
         }
         median_ms = {
             key: (
-                measurements[key].median_ms
-                if measurements[key] is not None
+                measurements.get(key).median_ms
+                if measurements.get(key) is not None
                 else None
             )
-            for key in VARIANTS
+            for key in variants
         }
         totals = {
             key: (
@@ -165,34 +167,26 @@ def run(
                 if transient[key] is not None
                 else None
             )
-            for key in VARIANTS
+            for key in variants
         }
-        for key in VARIANTS:
+        for key in variants:
+            if key in retired:
+                continue
             if totals[key] is not None and totals[key] <= args.budget:
                 best_projected[key] = frames
-
-        saved_ab = (
-            transient["A"] - transient["B"]
-            if transient["A"] is not None and transient["B"] is not None
-            else None
-        )
-        saved_bc = (
-            transient["B"] - transient["C"]
-            if transient["B"] is not None and transient["C"] is not None
-            else None
-        )
-        saved_ac = (
-            transient["A"] - transient["C"]
-            if transient["A"] is not None and transient["C"] is not None
-            else None
-        )
 
         phys_safe = {}
         spills = {}
         states = {}
         sequence = layout["seq_len"]
-        for key in VARIANTS:
-            measurement = measurements[key]
+        for key in tuple(variants):
+            if key in retired_before:
+                phys_safe[key] = False
+                spills[key] = False
+                reason, retired_at = retired[key]
+                states[key] = "retired:%s@%d" % (reason, retired_at)
+                continue
+            measurement = measurements.get(key)
             phys_safe[key] = bool(
                 measurement is not None
                 and measurement.physical_free_min >= threshold_bytes
@@ -216,21 +210,21 @@ def run(
             states[key] = _variant_state(
                 measurement, spills[key], threshold_bytes
             )
+            if measurement is None:
+                retired.setdefault(key, ("OOM", frames))
+            elif not phys_safe[key]:
+                retired.setdefault(key, ("LOW", frames))
+            elif spills[key]:
+                retired.setdefault(key, ("SPILL", frames))
 
-        saved_ab_text = (
-            "    n/a" if saved_ab is None else f"{saved_ab / base.GB:>7.3f}G"
-        )
-        saved_bc_text = (
-            "    n/a" if saved_bc is None else f"{saved_bc / base.GB:>7.3f}G"
-        )
         print(
             f"{frames:>7} {sequence:>9} "
-            f"{fmt_gib(transient['A'])} {fmt_gib(transient['B'])} {fmt_gib(transient['C'])} "
-            f"{saved_ab_text} {saved_bc_text} "
-            f"{fmt_mib(measurements['A'].physical_free_min if measurements['A'] else None)} "
-            f"{fmt_mib(measurements['B'].physical_free_min if measurements['B'] else None)} "
-            f"{fmt_mib(measurements['C'].physical_free_min if measurements['C'] else None)}  "
-            f"A:{states['A']} B:{states['B']} C:{states['C']}"
+            + " ".join("%s:%s/%s" % (
+                key,
+                "  SKIP" if key in retired_before else fmt_gib(transient[key]),
+                states.get(key, "retired"),
+            )
+                       for key in variants)
         )
 
         rows.append({
@@ -240,37 +234,27 @@ def run(
             "transient": transient,
             "median_ms": median_ms,
             "totals": totals,
-            "saved_ab": saved_ab,
-            "saved_bc": saved_bc,
-            "saved_ac": saved_ac,
             "spills": spills,
             "states": states,
+            "retired_before": retired_before,
         })
 
-        if all(spills.values()) and not args.past_spill:
-            print(
-                "\nstopping: all three variants left their resident timing "
-                "curves; pass --past-spill to continue"
-            )
-            break
-        if all(measurements[key] is None for key in VARIANTS):
-            print("\nstopping: all three variants hard-OOM at this profile")
+        if all(key in retired for key in variants):
+            print("\nstopping: all selected arms retired")
             break
 
     print()
     print("measured isolated block timing (same profiles; median of timed forwards)")
     print(
-        f"{'frames':>7} {'A ms':>8} {'B ms':>8} {'C ms':>8} "
-        f"{'B/A':>7} {'C/B':>7} {'C/A':>7}"
+        f"{'frames':>7} " + " ".join(f"{key + ' ms':>16}" for key in variants)
     )
     for row in rows:
         times = row["median_ms"]
         print(
-            f"{row['frames']:>7} "
-            f"{fmt_ms(times['A'])} {fmt_ms(times['B'])} {fmt_ms(times['C'])} "
-            f"{_fmt_pct(_pct(times['B'], times['A']))} "
-            f"{_fmt_pct(_pct(times['C'], times['B']))} "
-            f"{_fmt_pct(_pct(times['C'], times['A']))}"
+            f"{row['frames']:>7} " + " ".join(
+                f"{('skip' if key in row['retired_before'] else fmt_ms(times[key])):>16}"
+                for key in variants
+            )
         )
 
     print()
@@ -279,95 +263,80 @@ def run(
         "(arithmetic only: calibrated reserve is not allocated in this probe)"
     )
     print(
-        f"{'frames':>7} {'A projected':>15} {'B projected':>15} "
-        f"{'C projected':>15}  budget state"
+        f"{'frames':>7} " + " ".join(f"{key + ' projected':>15}" for key in variants)
     )
     for row in rows:
         totals = row["totals"]
         texts = {
-            key: ("OOM" if totals[key] is None else f"{totals[key]:.3f} GiB")
-            for key in VARIANTS
+            key: (
+                "retired"
+                if key in row["retired_before"]
+                else "OOM" if totals[key] is None else f"{totals[key]:.3f} GiB"
+            )
+            for key in variants
         }
         state = " ".join(
-            f"{key}:{_budget_state(totals[key], args.budget)}"
-            for key in VARIANTS
+            f"{key}:" + (
+                "retired"
+                if key in row["retired_before"]
+                else _budget_state(totals[key], args.budget)
+            )
+            for key in variants
         )
         print(
-            f"{row['frames']:>7} {texts['A']:>15} {texts['B']:>15} "
-            f"{texts['C']:>15}  {state}"
+            f"{row['frames']:>7} " + " ".join(f"{texts[key]:>15}" for key in variants) + f"  {state}"
         )
 
     print()
     complete = [
         row for row in rows
-        if all(row["measurements"][key] is not None for key in VARIANTS)
+        if all(row["measurements"].get(key) is not None for key in variants)
     ]
     if complete:
         target = max(complete, key=lambda row: row["frames"])
-        a = target["transient"]["A"]
-        b = target["transient"]["B"]
-        c = target["transient"]["C"]
-        print(
-            "largest complete profile: C=%d S=%d; "
-            "A→B saves %.3f GiB, B→C saves %.3f GiB, "
-            "A→C saves %.3f GiB"
-            % (
-                target["frames"],
-                target["sequence"],
-                (a - b) / base.GB,
-                (b - c) / base.GB,
-                (a - c) / base.GB,
-            )
-        )
-        print(
-            "timing at that profile: B/A %+.1f%%, C/B %+.1f%%, C/A %+.1f%%"
-            % (
-                _pct(target["median_ms"]["B"], target["median_ms"]["A"]),
-                _pct(target["median_ms"]["C"], target["median_ms"]["B"]),
-                _pct(target["median_ms"]["C"], target["median_ms"]["A"]),
-            )
-        )
+        print("largest complete profile: frames=%d tokens=%d" %
+              (target["frames"], target["sequence"]))
 
     print(f"physical warning threshold: {args.physical_warning_mb} MiB")
     print(
         "last measured at/above threshold: "
         + ", ".join(
             f"{key}={_profile_text(last_physical_safe[key])}"
-            for key in VARIANTS
+            for key in variants
         )
     )
     print(
         "first measured below threshold: "
         + ", ".join(
             f"{key}={_profile_text(first_low[key])}"
-            for key in VARIANTS
+            for key in variants
         )
     )
     print(
         "first timing-curve spill: "
         + ", ".join(
             f"{key}={_profile_text(first_spill[key])}"
-            for key in VARIANTS
+            for key in variants
         )
     )
     print(
         f"largest projected under {args.budget:.1f} GB: "
         + ", ".join(
             f"{key}={_profile_text(best_projected[key])}"
-            for key in VARIANTS
+            for key in variants
         )
     )
 
     sample_counts = [
-        row["measurements"][key].physical_samples
+        row["measurements"].get(key).physical_samples
         for row in rows
-        for key in VARIANTS
-        if row["measurements"][key] is not None
-        and row["measurements"][key].physical_samples
+        for key in variants
+        if row["measurements"].get(key) is not None
+        and row["measurements"].get(key).physical_samples
     ]
     if sample_counts:
         print(
-            "physical sampler: %.2f ms requested interval, %d..%d samples per variant"
+            "physical sampler: %.2f ms requested interval, %d..%d samples per arm"
             % (
                 args.physical_poll_ms,
                 min(sample_counts),
@@ -383,6 +352,6 @@ def run(
     if streamed and args.calibrate_to is None:
         print(
             "Reserve is a streamed-weight floor, so projected budget lines are "
-            "upper bounds. Use --calibrate-to with a known-good variant-B "
-            "efficient-Sage length."
+            "upper bounds. Use --calibrate-to with a known-good selected-arm "
+            "length."
         )

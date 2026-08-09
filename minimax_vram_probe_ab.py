@@ -1,15 +1,12 @@
-"""A/B/C one real MiniMax-H3 DiT block at production packed-sequence shapes.
+"""One real MiniMax-H3 DiT block across a selectable QKV x MLP arm matrix.
 
-Dispatched by ``minimax_vram_probe.py --ab-activation-memory``. One block and one
-random BF16 weight set remain resident while the probe compares:
+Dispatched by ``minimax_vram_probe.py --ab-activation-memory``. One block and
+one shared checkpoint weight set remain resident while the selected arms compare
+production ``sage128``/``sage128_fused_qkv`` with untiled/2-tile/4-tile MLPs.
 
-    A: ordinary unmodified Sage through core H3 Attention.forward
-    B: the two-stage efficient-Sage attention forward
-    C: efficient Sage plus the token-chunked MLP block forward
-
-Use ``--ab-frames grid`` for the complete 17k+5 ladder. Checkpoint headers supply
-architecture and disk size only; the probe intentionally keeps random BF16 block
-weights to isolate activation geometry, as the legacy probe does.
+Use ``--ab-frames grid`` for the complete 17k+5 ladder. The probe loads only one
+block's QKV/norm and MLP tensors from ``--ckpt``; the remaining block parameters
+stay synthetic and shared by every arm.
 """
 
 import os
@@ -17,8 +14,8 @@ import os
 import torch
 
 import _minimax_vram_probe_base as base
-from _minimax_vram_probe_ab_cli import build_parser
-from _minimax_vram_probe_ab_runtime import build_forwards
+from _minimax_vram_probe_ab_cli import build_parser, selected_arms
+from _minimax_vram_probe_ab_runtime import build_forwards, load_block_weights
 from _minimax_vram_probe_ab_sweep import run as run_sweep
 
 
@@ -35,11 +32,21 @@ def main():
         parser.error("--physical-warning-mb must be >= 0")
     if args.physical_poll_ms <= 0:
         parser.error("--physical-poll-ms must be > 0")
+    if args.activation_chunk_rows <= 0:
+        parser.error("--activation-chunk-rows must be > 0")
+    if not args.ckpt:
+        parser.error("--ckpt is required for the real-weight arm matrix")
+    try:
+        arms = selected_arms(args)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     arch = dict(base.DEFAULT_ARCH)
     ckpt_gb = None
     arch_source = "H3 defaults (pass --ckpt to confirm against your weights)"
     if args.ckpt:
+        from _minimax_vram_probe_ab_sweep import resolve_checkpoint
+        args.ckpt = resolve_checkpoint(args.ckpt)
         arch, total_bytes = base.arch_from_ckpt(args.ckpt)
         arch_source = os.path.basename(args.ckpt)
         ckpt_gb = total_bytes / base.GB
@@ -65,9 +72,6 @@ def main():
     device = torch.device("cuda", torch.cuda.current_device())
     dtype = torch.bfloat16
 
-    # Must run before importing the H3 model or efficient-Sage implementation.
-    selected = base.select_attention(True)
-
     print(f"canvas      {args.width}x{args.height}  ->  latent {args.height // 16}x{args.width // 16}")
     print(f"arch        {arch_source}")
     print("            " + "  ".join(f"{key}={value}" for key, value in arch.items()))
@@ -80,11 +84,8 @@ def main():
                if streamed else "  (fits, held resident)")
         )
     print(f"budget      {args.budget:.1f} GB  (reserve {reserve_gb:.2f} GB outside transient)")
-    print(
-        "method      measured A/B/C on GPU; "
-        f"variant A uses Comfy-selected {selected}"
-    )
-    print("weights     one shared random BF16 block; activation geometry, not checkpoint INT8 streaming")
+    print("method      measured selected production hybrid-Sage QKV x MLP arms on GPU")
+    print("weights     one shared real checkpoint block; selected tensors only")
     print(
         f"physical    LOW below {args.physical_warning_mb} MiB; "
         f"cudaMemGetInfo sampled every {args.physical_poll_ms:g} ms during untimed probes"
@@ -106,23 +107,17 @@ def main():
         print("task        t2va -- target stream only")
 
     block = base.build_block(arch, dtype, device)
-    plain, efficient, activation, backend, config = build_forwards(block, args)
-    print("variants    A=plain Sage; B=efficient Sage; C=efficient Sage + activation memory")
-    print(
-        "C config    %s rows=%d alignment=%d held=%s"
-        % (
-            config.mode,
-            config.chunk_rows,
-            config.alignment,
-            config.prefer_held_weights,
+    load_block_weights(block, args.ckpt)
+    forwards, backends, configs = build_forwards(block, args)
+    print("arms        " + ", ".join(arms))
+    for label in arms:
+        config = configs[label]
+        backend = backends[label.split("/", 1)[0]]
+        mlp = config["mode"] if not config["tile_count"] else "%d-tile ConvRot rows=%d" % (
+            config["tile_count"], config["chunk_rows"]
         )
-    )
-    print(
-        "Sage B/C    version=%s kernel=%s accumulation=%s"
-        % (backend.api.version, backend.api.kernel_name, backend.api.accumulation)
-    )
-    if config.native_swiglu:
-        print("note        BF16 probe weights cannot exercise native TensorWise-INT8 FC2")
+        print("            %s: backend=%s fused_qkv=%s mlp=%s" %
+              (label, backend.config.mode, backend.projector is not None, mlp))
     print()
 
     run_sweep(
@@ -133,9 +128,7 @@ def main():
         device,
         reserve_gb,
         streamed,
-        plain,
-        efficient,
-        activation,
+        forwards,
     )
 
 
