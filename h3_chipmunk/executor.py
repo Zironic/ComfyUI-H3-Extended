@@ -116,17 +116,26 @@ def _selector(weights, h, cache, config):
     if act.shape[-1] % fg:
         raise ChipmunkExecutionError("H3 FFN is not feature-group aligned")
     grouped = act.float().reshape(act.shape[0], act.shape[1] // fg, fg).mean(dim=-1)
-    scores = grouped.abs() if cache.selector_summary is None else (
-        grouped - cache.selector_summary.float()
-    ).abs()
+    old_summary = cache.selector_summary
+    if old_summary is not None and old_summary.device != grouped.device:
+        old_summary = old_summary.to(grouped.device, non_blocking=False)
+    scores = grouped.abs() if old_summary is None else (grouped - old_summary.float()).abs()
     indices, counts = select_top_groups(scores, config.top_fraction, config.random_groups)
-    cache.selector_summary = grouped.to(torch.bfloat16)
-    cache.selected_groups = indices
-    cache.selected_counts = counts
+    cache.selector_summary = (
+        grouped.to(torch.bfloat16).cpu()
+        if config.mode == "measure"
+        else grouped.to(torch.bfloat16)
+    )
+    cache.selected_groups = indices.cpu() if config.mode == "measure" else indices
+    cache.selected_counts = counts.cpu() if config.mode == "measure" else counts
     return indices, counts, scores
 
 
 def _selected_activation_all_groups(weights, h, indices, counts, config):
+    if indices.device != h.device:
+        indices = indices.to(h.device)
+    if counts.device != h.device:
+        counts = counts.to(h.device)
     tg = int(config.token_group_rows)
     fg = int(config.feature_group)
     pieces = []
@@ -141,6 +150,12 @@ def _delta_update(weights, h, cache, config):
     indices, counts = cache.selected_groups, cache.selected_counts
     if indices is None or counts is None or cache.activation is None or cache.output is None:
         raise ChipmunkExecutionError("sparse update requested without a dense cache")
+    if indices.device != h.device:
+        indices = indices.to(h.device)
+    if counts.device != h.device:
+        counts = counts.to(h.device)
+    if cache.activation.device != h.device or cache.output.device != h.device:
+        raise ChipmunkExecutionError("reference_delta cache must remain GPU-resident")
     tg = int(config.token_group_rows)
     fg = int(config.feature_group)
     out = cache.output
@@ -155,6 +170,11 @@ def _delta_update(weights, h, cache, config):
         cache.activation[a:b].copy_(current)
     cache.output = out
     return out
+
+
+def _store_selected_activation(value, config):
+    value = value.detach()
+    return value.cpu() if config.mode == "measure" else value.clone()
 
 
 def run_chipmunk_chunk(
@@ -179,10 +199,9 @@ def run_chipmunk_chunk(
             try:
                 with ConvRotGroupWeights(block.mlp, h[:1]) as weights:
                     indices, counts, scores = _selector(weights, h, cache, config)
-                    cache.activation = _selected_activation_all_groups(
-                        weights, h, indices, counts, config
-                    ).contiguous()
-                    cache.output = out.detach().clone()
+                    selected = _selected_activation_all_groups(weights, h, indices, counts, config)
+                    cache.activation = _store_selected_activation(selected, config)
+                    cache.output = out.detach().clone() if config.mode == "reference_delta" else None
                     cache.refresh_step = step
                     cache.update_step = step
                     active = float(indices.shape[1] * config.feature_group / weights.ffn)
@@ -207,24 +226,24 @@ def run_chipmunk_chunk(
         cache.dense_calls += 1
         try:
             with ConvRotGroupWeights(block.mlp, h[:1]) as weights:
-                previous_indices = None if cache.selected_groups is None else cache.selected_groups.clone()
-                previous_counts = None if cache.selected_counts is None else cache.selected_counts.clone()
+                previous_indices = cache.selected_groups
+                previous_counts = cache.selected_counts
                 previous_activation = cache.activation
                 delta_rms = float("nan")
                 if previous_indices is not None and previous_activation is not None:
                     current_previous = _selected_activation_all_groups(
                         weights, h, previous_indices, previous_counts, config
                     )
-                    if current_previous.shape == previous_activation.shape:
+                    previous_gpu = previous_activation.to(current_previous.device)
+                    if current_previous.shape == previous_gpu.shape:
                         delta_rms = float(
-                            (current_previous.float() - previous_activation.float())
+                            (current_previous.float() - previous_gpu.float())
                             .square().mean().sqrt().item()
                         )
                 indices, counts, scores = _selector(weights, h, cache, config)
-                cache.activation = _selected_activation_all_groups(
-                    weights, h, indices, counts, config
-                ).detach().clone()
-                cache.output = out.detach().clone()
+                selected = _selected_activation_all_groups(weights, h, indices, counts, config)
+                cache.activation = _store_selected_activation(selected, config)
+                cache.output = None
                 active = float(indices.shape[1] * config.feature_group / weights.ffn)
             session.record(
                 step=step, layer=layer_index, chunk=chunk_index, kind=kind,
