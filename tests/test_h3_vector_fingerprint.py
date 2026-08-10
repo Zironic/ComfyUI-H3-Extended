@@ -11,7 +11,7 @@ comfy.options.enable_args_parsing()
 
 from h3_vector_accel.config import SamplerConfig  # noqa: E402
 from h3_vector_accel.fingerprint import configuration_fingerprint, configuration_payload  # noqa: E402
-from h3_vector_accel.schedules import geometric_schedule  # noqa: E402
+from h3_vector_accel.schedules import continuous_schedule  # noqa: E402
 sys.argv = _ORIGINAL_ARGV
 
 class FingerprintTests(unittest.TestCase):
@@ -124,14 +124,18 @@ class FingerprintTests(unittest.TestCase):
         linear_ends = SamplerConfig(
             method="res_multistep", evaluation_profile="geometric_linear_ends_11",
         )
-        geometric_sigmas, _, _ = geometric_schedule(sigmas, geometric.evaluation_profile)
-        linear_sigmas, _, _ = geometric_schedule(sigmas, linear_ends.evaluation_profile)
+        geometric_sigmas, _, _ = continuous_schedule(sigmas, geometric.evaluation_profile)
+        linear_sigmas, _, _ = continuous_schedule(sigmas, linear_ends.evaluation_profile)
         payload = configuration_payload(
             geometric, sigmas, effective_sigmas=geometric_sigmas,
         )
         self.assertIsNone(payload["actual_mask"])
         self.assertEqual(payload["continuous_schedule"]["true_nfe"], 11)
-        self.assertEqual(payload["continuous_schedule"]["time_coordinate"], "negative_log_sigma")
+        self.assertEqual(payload["continuous_schedule"]["time_coordinate"], "sigma")
+        self.assertEqual(
+            payload["continuous_schedule"]["interval_rule"],
+            "normalized_reverse_powers_sum_to_sigma_span",
+        )
         self.assertNotEqual(
             configuration_fingerprint(
                 geometric, sigmas, effective_sigmas=geometric_sigmas,
@@ -139,6 +143,32 @@ class FingerprintTests(unittest.TestCase):
             configuration_fingerprint(
                 linear_ends, sigmas, effective_sigmas=linear_sigmas,
             ),
+        )
+
+    def test_multiplicative_stride_profiles_have_distinct_schedule_identities(self):
+        sigmas = torch.linspace(20.0, 0.0, 21)
+        full = SamplerConfig(
+            method="res_multistep", evaluation_profile="multiplicative_stride_11",
+        )
+        linear = SamplerConfig(
+            method="res_multistep",
+            evaluation_profile="multiplicative_stride_linear_ends_11",
+        )
+        full_sigmas, _, _ = continuous_schedule(sigmas, full.evaluation_profile)
+        linear_sigmas, _, _ = continuous_schedule(sigmas, linear.evaluation_profile)
+        full_payload = configuration_payload(full, sigmas, effective_sigmas=full_sigmas)
+        linear_payload = configuration_payload(linear, sigmas, effective_sigmas=linear_sigmas)
+        self.assertEqual(
+            full_payload["continuous_schedule"]["interval_rule"],
+            "unit_first_multiplicative_stride_sum_to_20",
+        )
+        self.assertEqual(
+            linear_payload["continuous_schedule"]["interval_rule"],
+            "native_0_1_2_multiplicative_interior_native_18_19_20",
+        )
+        self.assertNotEqual(
+            configuration_fingerprint(full, sigmas, effective_sigmas=full_sigmas),
+            configuration_fingerprint(linear, sigmas, effective_sigmas=linear_sigmas),
         )
 
 if __name__ == "__main__": unittest.main()

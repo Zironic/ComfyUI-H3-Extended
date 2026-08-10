@@ -101,6 +101,15 @@ def geometric_schedule_arms():
     )
 
 
+def multiplicative_stride_arms():
+    return (
+        StudyArm("res_multistep_multiplicative_stride_11", "multiplicative_stride",
+                 "res_multistep", "multiplicative_stride_11", 11),
+        StudyArm("res_multistep_multiplicative_stride_linear_ends_11", "multiplicative_stride",
+                 "res_multistep", "multiplicative_stride_linear_ends_11", 11),
+    )
+
+
 def adaptive_comparison_arms(best_fixed_method, best_fixed_profile,
                              repairability_profile, predictor_method,
                              conditioning_mode, quality_presets=("conservative", "balanced", "aggressive")):

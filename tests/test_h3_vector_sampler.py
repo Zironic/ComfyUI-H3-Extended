@@ -22,7 +22,7 @@ from h3_vector_accel.adaptive_res import IncrementalRES  # noqa: E402
 from h3_vector_accel.diagnostics import RunDiagnostics, current_callback_metadata  # noqa: E402
 from h3_vector_accel.predictor import Prediction  # noqa: E402
 from h3_vector_accel.sampler import sample_vector_accel  # noqa: E402
-from h3_vector_accel.schedules import geometric_schedule  # noqa: E402
+from h3_vector_accel.schedules import continuous_schedule  # noqa: E402
 from h3_vector_accel.nodes import MiniMaxH3VectorAccelSampler  # noqa: E402
 sys.argv = _ORIGINAL_ARGV
 
@@ -196,6 +196,8 @@ class SamplerTests(unittest.TestCase):
         self.assertIn("adaptive_embedded_res_v1", inputs["evaluation_profile"].options)
         self.assertIn("geometric_11", inputs["evaluation_profile"].options)
         self.assertIn("geometric_linear_ends_11", inputs["evaluation_profile"].options)
+        self.assertIn("multiplicative_stride_11", inputs["evaluation_profile"].options)
+        self.assertIn("multiplicative_stride_linear_ends_11", inputs["evaluation_profile"].options)
         self.assertEqual(inputs["method"].display_name, "solver / forecast mode")
         self.assertEqual(inputs["evaluation_profile"].display_name, "actual-evaluation schedule")
         self.assertEqual(inputs["max_adaptive_step_scale"].default, 3.0)
@@ -310,22 +312,26 @@ class SamplerTests(unittest.TestCase):
                 self.assertTrue(torch.equal(out, expected), (method, profile))
                 self.assertEqual(model.calls, expected_counts[profile], (method, profile))
 
-    def test_geometric_profiles_have_expected_ratios_and_native_end_contracts(self):
-        geometric, _, geometric_ratio = geometric_schedule(self.sigmas, "geometric_11")
+    def test_geometric_profiles_have_expected_ratios_and_end_contracts(self):
+        geometric, _, geometric_ratio = continuous_schedule(self.sigmas, "geometric_11")
         self.assertEqual(geometric.numel(), 12)
         self.assertEqual(float(geometric[-1]), 0.0)
         self.assertEqual(float(geometric[0]), float(self.sigmas[0]))
-        self.assertEqual(float(geometric[1]), float(self.sigmas[1]))
-        self.assertEqual(float(geometric[-2]), float(self.sigmas[-2]))
-        geometric_h = torch.diff(-torch.log(geometric[:-1].double()))
-        geometric_ratios = geometric_h[1:] / geometric_h[:-1]
+        geometric_delta = geometric[:-1].double() - geometric[1:].double()
+        geometric_ratios = geometric_delta[1:] / geometric_delta[:-1]
         self.assertTrue(torch.allclose(
             geometric_ratios,
             torch.full_like(geometric_ratios, geometric_ratio),
-            atol=2e-5, rtol=2e-5,
+            atol=2e-4, rtol=2e-4,
         ))
+        base = 1.0 / geometric_ratio
+        self.assertAlmostEqual(
+            sum(base ** power for power in range(1, 12)), 1.0, places=12,
+        )
+        self.assertLess(float(geometric_delta[0]), float(self.sigmas[0] - self.sigmas[1]))
+        self.assertGreater(float(geometric_delta[-1]), float(self.sigmas[-2] - self.sigmas[-1]))
 
-        linear_ends, _, interior_ratio = geometric_schedule(
+        linear_ends, _, interior_ratio = continuous_schedule(
             self.sigmas, "geometric_linear_ends_11",
         )
         self.assertEqual(linear_ends.numel(), 12)
@@ -339,12 +345,49 @@ class SamplerTests(unittest.TestCase):
             atol=2e-5, rtol=2e-5,
         ))
 
-    def test_geometric_profiles_require_res_and_match_direct_core(self):
-        for profile in ("geometric_11", "geometric_linear_ends_11"):
-            with self.assertRaisesRegex(ValueError, "require the res_multistep"):
+    def test_multiplicative_stride_profiles_have_expected_logical_coordinates(self):
+        full, coordinates, ratio = continuous_schedule(
+            self.sigmas, "multiplicative_stride_11",
+        )
+        full_coordinates = torch.tensor((*coordinates, 20.0), dtype=torch.float64)
+        full_strides = torch.diff(full_coordinates)
+        self.assertEqual(full.numel(), 12)
+        self.assertEqual(float(full[0]), float(self.sigmas[0]))
+        self.assertEqual(float(full[-1]), 0.0)
+        self.assertAlmostEqual(float(full_strides[0]), 1.0, places=12)
+        self.assertTrue(torch.allclose(
+            full_strides[1:] / full_strides[:-1],
+            torch.full_like(full_strides[1:], ratio),
+            atol=1e-10, rtol=1e-10,
+        ))
+        self.assertAlmostEqual(float(full_strides.sum()), 20.0, places=12)
+
+        linear, coordinates, interior_ratio = continuous_schedule(
+            self.sigmas, "multiplicative_stride_linear_ends_11",
+        )
+        linear_coordinates = torch.tensor((*coordinates, 20.0), dtype=torch.float64)
+        linear_strides = torch.diff(linear_coordinates)
+        self.assertEqual(linear.numel(), 12)
+        self.assertEqual(tuple(linear_coordinates[:3].tolist()), (0.0, 1.0, 2.0))
+        self.assertEqual(tuple(linear_coordinates[-3:].tolist()), (18.0, 19.0, 20.0))
+        self.assertTrue(torch.equal(linear[:3], self.sigmas[:3]))
+        self.assertTrue(torch.equal(linear[-3:], self.sigmas[-3:]))
+        self.assertTrue(torch.allclose(
+            linear_strides[3:9] / linear_strides[2:8],
+            torch.full_like(linear_strides[3:9], interior_ratio),
+            atol=1e-10, rtol=1e-10,
+        ))
+
+    def test_continuous_profiles_require_res_and_match_direct_core(self):
+        profiles = (
+            "geometric_11", "geometric_linear_ends_11",
+            "multiplicative_stride_11", "multiplicative_stride_linear_ends_11",
+        )
+        for profile in profiles:
+            with self.assertRaisesRegex(ValueError, "continuous schedules require"):
                 SamplerConfig(method="euler", evaluation_profile=profile)
             config = SamplerConfig(method="res_multistep", evaluation_profile=profile)
-            effective, coordinates, ratio = geometric_schedule(self.sigmas, profile)
+            effective, coordinates, ratio = continuous_schedule(self.sigmas, profile)
             velocity = lambda x, sigma: 0.2 * x + 0.03 * sigma + 1.0
             direct_model = ResModel(velocity)
             configured_model = ResModel(velocity)

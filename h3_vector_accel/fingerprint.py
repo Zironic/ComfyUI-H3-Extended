@@ -7,7 +7,7 @@ import torch
 
 from .config import ADAPTIVE_PROFILES, CONTINUOUS_PROFILES, SamplerConfig
 from .adaptive_res import controller_identity
-from .schedules import geometric_schedule_identity
+from .schedules import continuous_schedule_identity
 
 
 def canonical_json(value) -> str:
@@ -80,7 +80,7 @@ def configuration_payload(config: SamplerConfig, sigmas=None, model_identity=Non
             config.evaluation_profile, config.max_adaptive_step_scale
         )
     elif config.evaluation_profile in CONTINUOUS_PROFILES:
-        payload["continuous_schedule"] = geometric_schedule_identity(
+        payload["continuous_schedule"] = continuous_schedule_identity(
             config.evaluation_profile
         )
     if sigmas is not None:

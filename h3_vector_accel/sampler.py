@@ -26,7 +26,7 @@ from .fingerprint import (
 from .policy import make_policy
 from .predictor import make_predictor
 from .repairability import ProfileCompatibility, RepairabilityProfile
-from .schedules import geometric_schedule
+from .schedules import continuous_schedule
 from .adaptive_res import (
     AdaptiveHistoryController,
     AdaptiveHistoryControllerV2,
@@ -644,7 +644,7 @@ def _sample_core_solver(model, x, source_sigmas, extra_args, callback, disable, 
         return _sample_adaptive_res(model, x, source_sigmas, extra_args, callback, disable,
                                     config, diagnostics, context)
     if config.evaluation_profile in CONTINUOUS_PROFILES:
-        effective_sigmas, logical_coordinates, schedule_ratio = geometric_schedule(
+        effective_sigmas, logical_coordinates, schedule_ratio = continuous_schedule(
             source_sigmas, config.evaluation_profile,
         )
         actual_indices = None

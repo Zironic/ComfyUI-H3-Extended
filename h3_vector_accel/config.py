@@ -11,7 +11,10 @@ MASK_PROFILES = (
     "late_aggressive_12", "late_max_11", "conservative_12",
     "early_aggressive_13", "uniform_13",
 )
-CONTINUOUS_PROFILE_NAMES = ("geometric_11", "geometric_linear_ends_11")
+CONTINUOUS_PROFILE_NAMES = (
+    "geometric_11", "geometric_linear_ends_11",
+    "multiplicative_stride_11", "multiplicative_stride_linear_ends_11",
+)
 CONTINUOUS_PROFILES = frozenset(CONTINUOUS_PROFILE_NAMES)
 PROFILES = MASK_PROFILES + CONTINUOUS_PROFILE_NAMES
 ADAPTIVE_PROFILES = frozenset(("adaptive_history_v1", "adaptive_history_v2", "adaptive_history_v3", "adaptive_embedded_res_v1"))
@@ -123,7 +126,7 @@ class SamplerConfig:
         if self.evaluation_profile in ADAPTIVE_PROFILES and self.method != "res_multistep":
             raise ValueError("adaptive history schedule requires the res_multistep method")
         if self.evaluation_profile in CONTINUOUS_PROFILES and self.method != "res_multistep":
-            raise ValueError("geometric schedules require the res_multistep method")
+            raise ValueError("continuous schedules require the res_multistep method")
         if self.policy == "adaptive_repair" and self.method not in PREDICTOR_METHODS:
             raise ValueError("adaptive repair policy requires a predictor method")
         if self.policy == "adaptive_repair" and not self.repairability_profile:

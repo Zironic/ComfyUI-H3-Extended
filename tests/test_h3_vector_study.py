@@ -22,6 +22,7 @@ from h3_vector_accel.study import (
     fixed_policy_arms,
     four_arm_study_arms,
     geometric_schedule_arms,
+    multiplicative_stride_arms,
     run_fixed_policy_study,
 )
 sys.argv = _ORIGINAL_ARGV
@@ -105,6 +106,18 @@ class StudyTests(unittest.TestCase):
         self.assertEqual(
             [(arm.evaluation_profile, arm.expected_true_nfe) for arm in arms],
             [("geometric_11", 11), ("geometric_linear_ends_11", 11)],
+        )
+        self.assertTrue(all(arm.method == "res_multistep" for arm in arms))
+        self.assertTrue(all(arm.as_dict()["actual_indices"] is None for arm in arms))
+
+    def test_multiplicative_stride_arms_have_equal_nfe_and_no_source_grid_indices(self):
+        arms = multiplicative_stride_arms()
+        self.assertEqual(
+            [(arm.evaluation_profile, arm.expected_true_nfe) for arm in arms],
+            [
+                ("multiplicative_stride_11", 11),
+                ("multiplicative_stride_linear_ends_11", 11),
+            ],
         )
         self.assertTrue(all(arm.method == "res_multistep" for arm in arms))
         self.assertTrue(all(arm.as_dict()["actual_indices"] is None for arm in arms))
