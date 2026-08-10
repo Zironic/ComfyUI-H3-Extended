@@ -6,11 +6,14 @@ import math
 PREDICTOR_METHODS = frozenset(("hold", "linear_velocity", "vde"))
 CORE_SOLVER_METHODS = frozenset(("euler", "res_multistep"))
 METHODS = ("euler", "res_multistep", "hold", "linear_velocity", "vde")
-PROFILES = (
+MASK_PROFILES = (
     "full_20", "late_aggressive_13", "late_cautious_14",
     "late_aggressive_12", "late_max_11", "conservative_12",
     "early_aggressive_13", "uniform_13",
 )
+CONTINUOUS_PROFILE_NAMES = ("geometric_11", "geometric_linear_ends_11")
+CONTINUOUS_PROFILES = frozenset(CONTINUOUS_PROFILE_NAMES)
+PROFILES = MASK_PROFILES + CONTINUOUS_PROFILE_NAMES
 ADAPTIVE_PROFILES = frozenset(("adaptive_history_v1", "adaptive_history_v2", "adaptive_history_v3", "adaptive_embedded_res_v1"))
 EVALUATION_PROFILES = PROFILES + ("adaptive_history_v1", "adaptive_history_v2", "adaptive_history_v3", "adaptive_embedded_res_v1")
 DIAGNOSTICS = ("off", "summary", "full")
@@ -48,6 +51,8 @@ def profile_mask(profile: str, logical_steps: int = 20) -> tuple[bool, ...]:
         profile = "full_20"
     if profile in ADAPTIVE_PROFILES:
         raise ValueError(f"adaptive schedule {profile} does not have a fixed mask")
+    if profile in CONTINUOUS_PROFILES:
+        raise ValueError(f"continuous schedule {profile} does not have a source-grid mask")
     if profile not in PROFILES:
         raise ValueError(f"unknown evaluation profile: {profile}")
     if logical_steps != 20:
@@ -117,6 +122,8 @@ class SamplerConfig:
             raise ValueError("core solver methods require the fixed policy")
         if self.evaluation_profile in ADAPTIVE_PROFILES and self.method != "res_multistep":
             raise ValueError("adaptive history schedule requires the res_multistep method")
+        if self.evaluation_profile in CONTINUOUS_PROFILES and self.method != "res_multistep":
+            raise ValueError("geometric schedules require the res_multistep method")
         if self.policy == "adaptive_repair" and self.method not in PREDICTOR_METHODS:
             raise ValueError("adaptive repair policy requires a predictor method")
         if self.policy == "adaptive_repair" and not self.repairability_profile:
@@ -163,19 +170,21 @@ class SamplerConfig:
             raise ValueError("adaptive_safety_factor must be greater than zero and at most one")
         if self.max_adaptive_growth_ratio < 1:
             raise ValueError("max_adaptive_growth_ratio must be at least one")
-        mask = tuple() if self.evaluation_profile in ADAPTIVE_PROFILES else profile_mask(self.evaluation_profile, 20)
+        mask = (tuple() if self.evaluation_profile in ADAPTIVE_PROFILES or
+                self.evaluation_profile in CONTINUOUS_PROFILES else
+                profile_mask(self.evaluation_profile, 20))
         object.__setattr__(self, "_mask", mask)
 
     @property
     def mask(self) -> tuple[bool, ...]:
-        if self.evaluation_profile in ADAPTIVE_PROFILES:
-            raise ValueError(f"adaptive schedule {self.evaluation_profile} does not have a fixed mask")
+        if self.evaluation_profile in ADAPTIVE_PROFILES or self.evaluation_profile in CONTINUOUS_PROFILES:
+            raise ValueError(f"schedule {self.evaluation_profile} does not have a fixed mask")
         return self._mask
 
     @property
     def actual_indices(self) -> tuple[int, ...]:
-        if self.evaluation_profile in ADAPTIVE_PROFILES:
-            raise ValueError(f"adaptive schedule {self.evaluation_profile} does not have fixed actual indices")
+        if self.evaluation_profile in ADAPTIVE_PROFILES or self.evaluation_profile in CONTINUOUS_PROFILES:
+            raise ValueError(f"schedule {self.evaluation_profile} does not have fixed actual indices")
         return tuple(i for i, value in enumerate(self._mask) if value)
 
     def validate_schedule_length(self, logical_steps: int) -> None:

@@ -74,8 +74,12 @@ residual feedback chooses every interval until terminal zero.
 
 `adaptive_embedded_res_v1` uses one fixed bootstrap interval, then solves the
 eta-zero IncrementalRES embedded correction defect from video x0 changes by
-bounded scalar bisection. Safety, absolute, growth, and final-positive-sigma
-clamps are recorded explicitly; audio disagreement is diagnostic only.
+scalar expansion and bisection. `embedded_video_tolerance`,
+`adaptive_safety_factor`, `max_adaptive_growth_ratio`, and the existing maximum
+step scale control the experiment. Tolerance, safety, absolute, growth, and
+final-positive-sigma selections are recorded separately; audio disagreement is
+diagnostic only. The defect bounds RES's second-order correction—it is not a
+validated estimator of visible video quality.
 
 `late_aggressive_13` is the current accelerated reference profile. The first
 controlled placement comparison found that the equal-NFE early profile severely
@@ -89,6 +93,18 @@ Diagnostics can be inspected without importing ComfyUI or loading a model:
 python benchmarks/analyze_vector_runs.py --run latest --decisions
 python benchmarks/analyze_vector_runs.py --run RUN_ID --compare OTHER_RUN_ID --format json
 ```
+
+To inspect completed H3 MP4s without a running server, use the read-only
+settings catalog (all files are included by default):
+
+```powershell
+python benchmarks/catalog_h3_videos.py --format text
+python benchmarks/catalog_h3_videos.py --last 5 --format json
+```
+
+It reads the embedded `prompt`/`workflow` tags through `ffprobe`; set
+`COMFYUI_OUTPUT_DIR` or pass `--video-root` and `--ffprobe` when the defaults
+do not match the installation.
 
 The analyzer checks schedule/NFE/fallback invariants and labels explicit
 comparisons `raw/not automatically comparable`. `--server http://127.0.0.1:PORT`
@@ -139,8 +155,10 @@ path so every AIMDO lifecycle and custom-kernel call executes normally.
 The default `sage128` mode requires `spas_sage_attn` compiled for the active
 device and resolves its architecture contract at preflight: SM80/86/87 use
 128Q/64KV tiles with FP16 V, SM89 uses 128Q/64KV with FP8 V, and SM90 uses
-64Q/128KV with FP8 V. Both current monolithic and architecture-split compiled
-extension layouts are normalized at this boundary. Blackwell is not supported.
+64Q/128KV with FP8 V. SM120 uses the maintained architecture-split package's
+128Q/64KV FP8-V path and requires CUDA 12.8 or newer. Both monolithic and
+architecture-split compiled extension layouts are normalized at this boundary;
+SM100/103/121 are not accepted.
 This mode retains the established BF16 QKV projection. The opt-in `sage128_fused_qkv` mode remains
 SM89-only because its projection emits 128Q/64KV routing summaries. It projects
 directly from the checkpoint's ConvRot-256 INT8 weights into Sparse Sage's INT8
@@ -417,7 +435,8 @@ Armed from either of two places, whichever is in the graph:
 - `SamplerCustomAdvancedMiniMaxPreview` in `comfyui-minimax-preview`, via the same
   widget — covers the whole sampling run including the preview decode.
 
-Default `800` MB in both, `0` disables. **The model-patch route only arms if the
+Default `800` MB in both, `0` disables. The value is the capacity proof's safety
+margin and the secondary monitor's low-free floor. **The model-patch route only arms if the
 `(Zi)` shift node is actually in the workflow** — a graph on the stock
 `MiniMaxH3SigmaShift` gets no guard, and the giveaway is that none of this
 extension's `[H3 Extended]` log lines appear at all. The sampler route exists
@@ -431,19 +450,34 @@ loading — and an OOM raised from inside the DiT forward tends to cascade throu
 `model_management`'s recovery path and take the `prompt_worker` thread with it,
 which needs a full server restart rather than a re-queue.
 
-So rather than waiting for the driver to refuse an allocation, the guard checks
-free **physical** VRAM at each point where the next allocation is about to be a
-big one — before every DiT forward, and, when armed from the preview sampler,
-either side of the preview decode (that decoder is a resident 2.26 GiB fp8 model,
-invisible to the pre-forward check) plus once before sampling starts:
+The model-patch route proves capacity before the first successful forward of each
+distinct packed layout and execution signature:
 
-- above the threshold: nothing happens (one cheap `torch.cuda.mem_get_info` call);
-- below it: logs the memory picture at `WARNING`, releases cached blocks
-  (`soft_empty_cache(force=True)`) and re-measures;
-- still below after that: logs the full picture at `ERROR` and raises
-  `InterruptProcessingException` — the same exception the Cancel button raises, so
-  the executor unwinds cleanly, the prompt is marked cancelled, and the worker
-  survives.
+```text
+non-reclaimable floor
++ H3 working-set upper bound
++ incremental mandatory AIMDO pages
++ safety margin
+<= physical VRAM
+```
+
+It synchronizes and releases the Torch cache first, then measures one consistent
+`torch.cuda.mem_get_info()` free/total pair. The floor subtracts only this model's
+resident, unpinned VBAR pages. Pinned pages stay in the floor, so mandatory pages
+already pinned are not added again. The weight term is the largest complete H3
+block page union, not all 50 sequential blocks and not a sum of raw weight sizes.
+
+The unprofiled working-set bound uses the measured H3 envelope of about 118,750
+bytes per packed row, rounded up to 128 KiB per row. The first successful forward
+records its allocated-memory peak increment for that full signature; an observation
+can raise the process-local bound with 10% allowance, never lower the calibrated
+bound. Unknown layouts fail closed rather than guessing from a latent dimension.
+
+An over-capacity run is cancelled before `apply_model`. A secondary low-free
+monitor still runs before every DiT forward, releases cached blocks and rechecks
+before cancelling. With the captured model it credits only verified resident,
+unpinned pages from that model. The preview-only route has no patcher, so its checks
+around sampling and the 2.26 GiB preview decoder use raw physical free VRAM.
 
 The check runs *before* the forward, so the allocation that would have OOM'd
 never happens.
@@ -457,8 +491,14 @@ So those nodes deposit their inputs in `run_context.py` as they run, and the
 cancel log prints them next to the memory picture:
 
 ```text
-[H3 Extended] VRAM guard cancelling run at DiT forward (sigma 0.7413)
-  memory: free physical 612 MB / 12282 MB total; torch reserved 9942 MB, allocated 8801 MB (threshold 800 MB, still under it after releasing cached blocks)
+[H3 Extended] VRAM capacity cancelling run before apply_model
+  Physical VRAM: 12282 MB
+  Non-reclaimable starting floor: 1742 MB
+  H3 working-set upper bound: 8914 MB (calibrated H3 envelope, rounded ...)
+  Mandatory AIMDO pages: 1024 MB (blocks.0)
+  Safety margin: 800 MB
+  Predicted physical peak: 12480 MB
+  Deficit: 198 MB
   sampling: video latent [2, 24, 12, 48, 84], audio latent [2, 32, 2, 207], cond_or_uncond [1, 0]
   packed tokens: seq_len=13834 text=300 ref_img=1024 audio=414(t=207) video=12096(t=12,24x42)
   node inputs for this run:
@@ -470,7 +510,6 @@ cancel log prints them next to the memory picture:
       ref_video_1: 1920x1080 x240 frames source -> 1344x768 canvas x226 frames used (latent t=67, 84x48)
       video latent: [1, 24, 12, 48, 84]
       audio latent: [1, 32, 2, 207]
-  Cancelling now rather than letting the next allocation raise a CUDA OOM, ...
 ```
 
 Two different provenances, deliberately: the `sampling` and `packed tokens` lines
@@ -488,12 +527,10 @@ of it is best-effort: an unresolvable layout is skipped, an unreadable input
 prints as `unreadable`, and a description that throws is logged and stepped over.
 The cancellation itself always happens.
 
-This deliberately does not use `comfy.model_management.get_free_memory`, which
-adds torch's reserved-but-unused bytes back into the total. The question the guard
-asks is what the driver can still hand out — and under `cudaMallocAsync` a full
-pool is exactly the condition worth trimming, which is what the release-and-recheck
-second chance is for. Log lines report both readings (`free physical` plus torch
-`reserved`/`allocated`) so the two can be compared after the fact.
+This deliberately does not use `comfy.model_management.get_free_memory` or
+device-wide `vbars_analyze()`. The former mixes allocator-reserved bytes into the
+driver reading; the latter includes pinned pages and unrelated resident caches.
+Neither value proves the next phase's irreducible capacity.
 
 Log lines are prefixed `[H3 Extended] VRAM guard` and land in
 `D:\AI\ComfyUI\User\comfyui.log`.
@@ -836,10 +873,9 @@ the other two force `--cpu` before the first comfy import so `model_management`
 never initializes a CUDA context.
 
 `test_attention_backend.py` **runs real kernels on the card** when CUDA and
-SageAttention are present. `test_probe.py` and `test_vram_guard.py` stub the
-driver queries but still construct CUDA tensors, so they need a device to exist
-and will fail with `No CUDA GPUs are available` if one is masked — they are
-cheap, but they are not free.
+SageAttention are present. `test_probe.py` stubs driver queries but still
+constructs CUDA tensors. `test_vram_guard.py` forces CPU mode and mocks every
+CUDA/VBAR operation used by its accounting tests.
 
 Note that `CUDA_VISIBLE_DEVICES=""` does *not* mask the device on Windows; it is
 silently ignored and torch still sees the GPU. Only `CUDA_VISIBLE_DEVICES=-1`
@@ -849,12 +885,10 @@ The backend test verifies routing with a registered stand-in (so it runs
 anywhere) and, when SageAttention and CUDA are present, additionally checks the
 real kernel's accuracy and that it did not silently fall back.
 
-The VRAM-guard test stubs the driver query and the cache release — neither can be
-exercised honestly without pushing a real GPU to the edge — and covers the
-decision logic around them: the threshold comparison, the release-and-recheck
-second chance, that a breach raises `InterruptProcessingException` before the
-forward runs, and that an already-installed unet wrapper is chained rather than
-replaced. It also asserts on the contents of the cancel log, and resolves a real
+The VRAM-guard test stubs the driver, cache, allocator, and VBAR residency calls.
+It covers page unions, pinned-page accounting, capacity accept/reject decisions,
+per-signature checks and observation, the emergency release/recheck path, and
+wrapper composition. It also asserts on the contents of the cancel log and resolves a real
 `PackedLayout` to check the `packed tokens` line.
 
 The masked-cache test plants an edit of known extent in a synthetic source and

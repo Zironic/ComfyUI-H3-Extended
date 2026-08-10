@@ -777,15 +777,19 @@ class AdaptiveEmbeddedRESController(AdaptiveHistoryController):
                 if defect(hi) > self.video_tolerance:
                     break
                 hi *= 2.0
-            lo = 0.0
-            for _ in range(self.constants["bisection_iterations"]):
-                mid = (lo + hi) * 0.5
-                if defect(mid) <= self.video_tolerance:
-                    lo = mid
-                else:
-                    hi = mid
-            solved = lo
-            safety_h = solved * self.safety_factor
+            if defect(hi) <= self.video_tolerance:
+                solved = None
+                safety_h = None
+            else:
+                lo = 0.0
+                for _ in range(self.constants["bisection_iterations"]):
+                    mid = (lo + hi) * 0.5
+                    if defect(mid) <= self.video_tolerance:
+                        lo = mid
+                    else:
+                        hi = mid
+                solved = lo
+                safety_h = solved * self.safety_factor
         accepted, clamp = (float("inf"), "unbounded_defect") if safety_h is None else (safety_h, "tolerance")
         for limit, name in ((local_base * self.max_step_scale, "absolute"),
                             (h_previous * self.max_growth_ratio, "growth"),

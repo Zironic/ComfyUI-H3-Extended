@@ -14,9 +14,11 @@ steps, or rollback.
 
 The named `adaptive_embedded_res_v1` profile is a separate video-controlled
 experiment: after one bootstrap interval it uses the eta-zero IncrementalRES
-embedded correction defect and bounded scalar bisection to select transformed
-time. Audio disagreement remains diagnostic only, and the final positive
-source sigma is mandatory before the existing Euler-to-zero transition.
+embedded correction defect and a scalar root solve to select transformed time.
+This regulates the RES correction signal; it is not evidence that the signal
+predicts visible quality. Audio disagreement remains diagnostic only, and the
+final positive source sigma is mandatory before the existing Euler-to-zero
+transition.
 
 ## Evidence behind the change
 

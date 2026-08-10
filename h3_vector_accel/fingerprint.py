@@ -5,8 +5,9 @@ import json
 
 import torch
 
-from .config import ADAPTIVE_PROFILES, SamplerConfig
+from .config import ADAPTIVE_PROFILES, CONTINUOUS_PROFILES, SamplerConfig
 from .adaptive_res import controller_identity
+from .schedules import geometric_schedule_identity
 
 
 def canonical_json(value) -> str:
@@ -47,7 +48,8 @@ def configuration_payload(config: SamplerConfig, sigmas=None, model_identity=Non
         "method": config.method,
         "evaluation_profile": config.evaluation_profile,
         "actual_mask": (
-            None if config.evaluation_profile in ADAPTIVE_PROFILES
+            None if (config.evaluation_profile in ADAPTIVE_PROFILES or
+                     config.evaluation_profile in CONTINUOUS_PROFILES)
             else list(config.actual_indices)
         ),
         "mask_version": config.mask_version,
@@ -76,6 +78,10 @@ def configuration_payload(config: SamplerConfig, sigmas=None, model_identity=Non
     if config.evaluation_profile in ADAPTIVE_PROFILES:
         payload["adaptive_controller"] = controller_identity(
             config.evaluation_profile, config.max_adaptive_step_scale
+        )
+    elif config.evaluation_profile in CONTINUOUS_PROFILES:
+        payload["continuous_schedule"] = geometric_schedule_identity(
+            config.evaluation_profile
         )
     if sigmas is not None:
         payload["sigma_hash"] = sigma_hash(sigmas)

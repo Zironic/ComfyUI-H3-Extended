@@ -21,6 +21,7 @@ from h3_vector_accel.study import (
     adaptive_embedded_res_v1_arm,
     fixed_policy_arms,
     four_arm_study_arms,
+    geometric_schedule_arms,
     run_fixed_policy_study,
 )
 sys.argv = _ORIGINAL_ARGV
@@ -98,6 +99,15 @@ class StudyTests(unittest.TestCase):
             self.assertEqual(arm.evaluation_profile, profile)
             self.assertIsNone(arm.expected_true_nfe)
             self.assertIsNone(arm.as_dict()["actual_indices"])
+
+    def test_geometric_schedule_arms_have_equal_nfe_and_no_source_grid_indices(self):
+        arms = geometric_schedule_arms()
+        self.assertEqual(
+            [(arm.evaluation_profile, arm.expected_true_nfe) for arm in arms],
+            [("geometric_11", 11), ("geometric_linear_ends_11", 11)],
+        )
+        self.assertTrue(all(arm.method == "res_multistep" for arm in arms))
+        self.assertTrue(all(arm.as_dict()["actual_indices"] is None for arm in arms))
 
 
 if __name__ == "__main__":

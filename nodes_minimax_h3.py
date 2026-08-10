@@ -452,6 +452,7 @@ def _set_h3_attention_backend(transformer_options, backend):
     models whose forward pass carries these options - the H3 DiT - and leaves
     every other model on the global default.
     """
+    transformer_options["minimax_h3_attention_backend"] = str(backend)
     if backend == "comfy":
         logging.info("[H3 Extended] Using Comfy default attention")
         return
@@ -515,11 +516,10 @@ class MiniMaxH3SigmaShift(io.ComfyNode):
                     max=24576,
                     step=64,
                     tooltip=(
-                        "Cancel the run if free physical VRAM drops below this many MB "
-                        "before a DiT forward. Logs the memory picture, releases cached "
-                        "blocks, and only cancels if the memory does not come back - so "
-                        "the prompt ends the way the Cancel button ends it instead of "
-                        "raising a CUDA OOM that can kill the prompt worker. 0 disables."
+                        "Safety margin in MB for the H3 capacity proof and the emergency "
+                        "low-free monitor. The proof runs once per forward shape and "
+                        "cancels before apply_model when physical capacity is insufficient; "
+                        "0 disables."
                     ),
                 ),
             ],

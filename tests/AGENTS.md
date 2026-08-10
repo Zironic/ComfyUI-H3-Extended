@@ -16,9 +16,10 @@
   probe alternate temp roots, repair ACLs, or delete legacy ACL-locked folders
   as part of an unrelated test run.
 - Inspect CUDA behavior before execution. `test_attention_backend.py` can run
-  real kernels when CUDA/SageAttention are present; `test_probe.py` and
-  `test_vram_guard.py` construct CUDA tensors despite mocked driver decisions.
-  These require explicit GPU permission.
+  real kernels when CUDA/SageAttention are present, and `test_probe.py`
+  constructs CUDA tensors despite mocked driver decisions. These require
+  explicit GPU permission. `test_vram_guard.py` forces CPU mode and mocks its
+  CUDA and VBAR calls.
 - Distinguish contract coverage from live evidence. Mocked driver calls,
   synthetic tensors, fake CUDA events, imports, and compilation do not establish
   real kernel selection, VRAM behavior, model loading, inference, or media

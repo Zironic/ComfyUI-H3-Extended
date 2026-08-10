@@ -11,6 +11,7 @@ comfy.options.enable_args_parsing()
 
 from h3_vector_accel.config import SamplerConfig  # noqa: E402
 from h3_vector_accel.fingerprint import configuration_fingerprint, configuration_payload  # noqa: E402
+from h3_vector_accel.schedules import geometric_schedule  # noqa: E402
 sys.argv = _ORIGINAL_ARGV
 
 class FingerprintTests(unittest.TestCase):
@@ -113,6 +114,31 @@ class FingerprintTests(unittest.TestCase):
         self.assertNotEqual(
             configuration_fingerprint(v1, sigmas),
             configuration_fingerprint(SamplerConfig(method="res_multistep"), sigmas),
+        )
+
+    def test_geometric_schedule_identity_and_effective_sigmas_are_fingerprinted(self):
+        sigmas = torch.linspace(20.0, 0.0, 21)
+        geometric = SamplerConfig(
+            method="res_multistep", evaluation_profile="geometric_11",
+        )
+        linear_ends = SamplerConfig(
+            method="res_multistep", evaluation_profile="geometric_linear_ends_11",
+        )
+        geometric_sigmas, _, _ = geometric_schedule(sigmas, geometric.evaluation_profile)
+        linear_sigmas, _, _ = geometric_schedule(sigmas, linear_ends.evaluation_profile)
+        payload = configuration_payload(
+            geometric, sigmas, effective_sigmas=geometric_sigmas,
+        )
+        self.assertIsNone(payload["actual_mask"])
+        self.assertEqual(payload["continuous_schedule"]["true_nfe"], 11)
+        self.assertEqual(payload["continuous_schedule"]["time_coordinate"], "negative_log_sigma")
+        self.assertNotEqual(
+            configuration_fingerprint(
+                geometric, sigmas, effective_sigmas=geometric_sigmas,
+            ),
+            configuration_fingerprint(
+                linear_ends, sigmas, effective_sigmas=linear_sigmas,
+            ),
         )
 
 if __name__ == "__main__": unittest.main()

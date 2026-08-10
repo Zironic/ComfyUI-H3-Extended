@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass
 import json
 from pathlib import Path
 
-from .config import ADAPTIVE_PROFILES, PREDICTOR_METHODS, SamplerConfig, actual_mask
+from .config import ADAPTIVE_PROFILES, CONTINUOUS_PROFILES, PREDICTOR_METHODS, SamplerConfig, actual_mask
 
 
 @dataclass(frozen=True)
@@ -33,7 +33,8 @@ class StudyArm:
     def as_dict(self):
         value = asdict(self)
         value["actual_indices"] = (
-            None if self.evaluation_profile in ADAPTIVE_PROFILES else
+            None if (self.evaluation_profile in ADAPTIVE_PROFILES or
+                     self.evaluation_profile in CONTINUOUS_PROFILES) else
             (list(actual_mask(self.evaluation_profile)) if self.policy == "fixed" else None)
         )
         return value
@@ -89,6 +90,15 @@ def adaptive_history_v3_arm():
 def adaptive_embedded_res_v1_arm():
     return StudyArm("res_multistep_adaptive_embedded_res_v1", "adaptive_history",
                     "res_multistep", "adaptive_embedded_res_v1", None)
+
+
+def geometric_schedule_arms():
+    return (
+        StudyArm("res_multistep_geometric_11", "geometric_schedule",
+                 "res_multistep", "geometric_11", 11),
+        StudyArm("res_multistep_geometric_linear_ends_11", "geometric_schedule",
+                 "res_multistep", "geometric_linear_ends_11", 11),
+    )
 
 
 def adaptive_comparison_arms(best_fixed_method, best_fixed_profile,

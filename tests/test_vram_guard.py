@@ -1,14 +1,11 @@
-"""Self-test for the H3 VRAM guard.
+"""CPU-safe self-test for the H3 VRAM capacity and emergency guards.
 
 Run from the ComfyUI root:
 
     python custom_nodes/ComfyUI-H3-Extended/tests/test_vram_guard.py
 
-The driver query and the cache release are the two things that cannot be
-exercised honestly without pushing a real GPU to the edge, so both are stubbed
-and the decision logic around them is what gets tested: threshold comparison,
-the release-and-recheck second chance, that a breach raises the same exception
-the Cancel button raises, and that the wrapper chains rather than replaces.
+Driver, allocator, cache-release, and VBAR residency calls are stubbed. The test
+covers the accounting and wrapper contracts, not live physical-VRAM behavior.
 """
 
 import logging
@@ -19,11 +16,20 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(_HERE))
 sys.path.insert(0, os.path.abspath(os.path.join(_HERE, "..", "..", "..")))
 
+# model_management selects its device while importing; keep this self-test
+# runnable on CI hosts without CUDA while the driver calls below remain mocked.
+if "--cpu" not in sys.argv:
+    sys.argv.append("--cpu")
+import comfy.options  # noqa: E402
+comfy.options.enable_args_parsing()
+
 import torch  # noqa: E402
 
 import comfy.model_management  # noqa: E402
 import run_context  # noqa: E402
 import vram_guard  # noqa: E402
+import weight_footprint  # noqa: E402
+import working_set  # noqa: E402
 
 MB = vram_guard.MB
 CUDA = torch.device("cuda:0")
@@ -38,18 +44,30 @@ def check(cond, msg):
 class FakeGPU:
     """Stands in for the driver: `free` is what mem_get_info reports next."""
 
-    def __init__(self, free_mb, recovers_to_mb=None):
+    def __init__(self, free_mb, recovers_to_mb=None, total_mb=12282,
+                 allocated_mb=8, peak_mb=12):
         self.free = free_mb * MB
+        self.total = total_mb * MB
         self.recovers_to = None if recovers_to_mb is None else recovers_to_mb * MB
+        self.allocated = allocated_mb * MB
+        self.peak = peak_mb * MB
         self.releases = 0
+        self.synchronizes = 0
+        self.peak_resets = 0
 
     def mem_get_info(self, device=None):
-        return self.free, 12282 * MB
+        return self.free, self.total
 
     def release(self, force=False):
         self.releases += 1
         if self.recovers_to is not None:
             self.free = self.recovers_to
+
+    def synchronize(self, device=None):
+        self.synchronizes += 1
+
+    def reset_peak(self, device=None):
+        self.peak_resets += 1
 
 
 def with_gpu(gpu, fn):
@@ -57,10 +75,20 @@ def with_gpu(gpu, fn):
     real_release = comfy.model_management.soft_empty_cache
     real_reserved = torch.cuda.memory_reserved
     real_alloc = torch.cuda.memory_allocated
+    real_peak = torch.cuda.max_memory_allocated
+    real_reset = torch.cuda.reset_peak_memory_stats
+    real_sync = torch.cuda.synchronize
+    real_capability = torch.cuda.get_device_capability
+    real_device = comfy.model_management.get_torch_device
     torch.cuda.mem_get_info = gpu.mem_get_info
     comfy.model_management.soft_empty_cache = gpu.release
     torch.cuda.memory_reserved = lambda device=None: 9000 * MB
-    torch.cuda.memory_allocated = lambda device=None: 8000 * MB
+    torch.cuda.memory_allocated = lambda device=None: gpu.allocated
+    torch.cuda.max_memory_allocated = lambda device=None: gpu.peak
+    torch.cuda.reset_peak_memory_stats = gpu.reset_peak
+    torch.cuda.synchronize = gpu.synchronize
+    torch.cuda.get_device_capability = lambda device=None: (8, 9)
+    comfy.model_management.get_torch_device = lambda: CUDA
     try:
         return fn()
     finally:
@@ -68,11 +96,18 @@ def with_gpu(gpu, fn):
         comfy.model_management.soft_empty_cache = real_release
         torch.cuda.memory_reserved = real_reserved
         torch.cuda.memory_allocated = real_alloc
+        torch.cuda.max_memory_allocated = real_peak
+        torch.cuda.reset_peak_memory_stats = real_reset
+        torch.cuda.synchronize = real_sync
+        torch.cuda.get_device_capability = real_capability
+        comfy.model_management.get_torch_device = real_device
 
 
 class FakePatcher:
-    def __init__(self, existing=None):
+    def __init__(self, existing=None, model=None):
         self.model_options = {}
+        self.model = model
+        self.load_device = CUDA
         if existing is not None:
             self.model_options["model_function_wrapper"] = existing
 
@@ -80,8 +115,157 @@ class FakePatcher:
         self.model_options["model_function_wrapper"] = fn
 
 
+class FakeVBAR:
+    def __init__(self, residency, base_addr=0x10000000, device=0):
+        self.residency = list(residency)
+        self.base_addr = base_addr
+        self.device = device
+        self.reads = 0
+
+    def get_residency(self):
+        self.reads += 1
+        return list(self.residency)
+
+
+class FakeWeight(torch.nn.Module):
+    def __init__(self, allocation):
+        super().__init__()
+        self._v = allocation
+
+
+class FakeNested:
+    def __init__(self, tensors):
+        self.tensors = tensors
+
+
+class FakeTensorMeta:
+    def __init__(self, shape, dtype=torch.bfloat16, device=CUDA):
+        self.shape = tuple(shape)
+        self.dtype = dtype
+        self.device = device
+
+
+def allocation(vbar, page, pages=1, offset=0):
+    return (vbar, vbar.base_addr + page * weight_footprint.PAGE_SIZE + offset,
+            pages * weight_footprint.PAGE_SIZE - offset)
+
+
+def fake_h3_model():
+    vbar = FakeVBAR([1, 3, 0, 0, 0])
+    diffusion = torch.nn.Module()
+    block0 = torch.nn.Module()
+    block0.a = FakeWeight(allocation(vbar, 0))
+    block0.overlap = FakeWeight(allocation(vbar, 0, offset=4096))
+    block0.b = FakeWeight(allocation(vbar, 1))
+    block0.c = FakeWeight(allocation(vbar, 2))
+    block0.d = FakeWeight(allocation(vbar, 3))
+    block0.attn = torch.nn.Module()
+    block1 = torch.nn.Module()
+    block1.a = FakeWeight(allocation(vbar, 2))
+    block1.b = FakeWeight(allocation(vbar, 3))
+    block1.c = FakeWeight(allocation(vbar, 4))
+    block1.attn = torch.nn.Module()
+    diffusion.blocks = torch.nn.ModuleList([block0, block1])
+    diffusion.final_layer = torch.nn.Module()
+    model = torch.nn.Module()
+    model.diffusion_model = diffusion
+    model.model_loaded_weight_memory = 9999 * MB
+    return model, vbar
+
+
+def forward_args(text_len=2):
+    video = FakeTensorMeta((1, 24, 2, 4, 4))
+    audio = FakeTensorMeta((1, 32, 2, 3))
+    return {
+        "input": FakeNested([video, audio]),
+        "timestep": torch.tensor([0.7]),
+        "c": {
+            "c_crossattn": torch.zeros(1, text_len, 64),
+            "minimax_payload": {},
+            "transformer_options": {"minimax_h3_attention_backend": "sage"},
+            "y": 1,
+        },
+        "cond_or_uncond": [0],
+    }
+
+
 def main():
     logging.basicConfig(level=logging.INFO, format="    %(levelname)s %(message)s")
+
+    print("VBAR page accounting")
+    model, vbar = fake_h3_model()
+    pages = weight_footprint.pages_for_allocation(allocation(vbar, 0, offset=4096))
+    check(len(pages) == 1, "an unaligned allocation maps to its containing 32 MiB page")
+    crossing = weight_footprint.pages_for_allocation(
+        (vbar, vbar.base_addr + weight_footprint.PAGE_SIZE - 512, 1024)
+    )
+    check(len(crossing) == 2, "an allocation crossing a page boundary includes both pages")
+    fp = weight_footprint.footprint(model, device=CUDA)
+    check(fp.resident_unpinned_pages == 1 and fp.pinned_pages == 1,
+          "resident and pinned page bits are classified separately")
+    check(fp.mandatory_group == "blocks.0" and fp.mandatory_pages == 4,
+          "the largest complete block is selected without combining sequential blocks")
+    check(fp.mandatory_pinned_pages == 1 and fp.mandatory_bytes == 3 * weight_footprint.PAGE_SIZE,
+          "mandatory pages already pinned in the floor are not added twice")
+    check(vbar.reads >= 1, "residency is read without faulting or pinning pages")
+
+    print("working-set signature and profile")
+    patcher = FakePatcher(model=model)
+    sig = with_gpu(FakeGPU(900), lambda: working_set.make_signature(forward_args(), patcher))
+    bound, source = working_set.upper_bound(sig)
+    check(sig.seq_len == 16 and len(sig.segments) == 3,
+          "signature uses the resolved packed layout and segment geometry")
+    check(bound == 16 * working_set.CALIBRATED_BYTES_PER_ROW and "calibrated" in source,
+          "unprofiled signatures use the conservative 128 KiB-per-row envelope")
+    working_set.clear_observed()
+    working_set.record_observed(sig, bound // 2)
+    check(working_set.upper_bound(sig)[0] == bound,
+          "a low observation never lowers the conservative bound")
+    working_set.record_observed(sig, bound * 2)
+    check(working_set.upper_bound(sig)[0] > bound,
+          "a higher observation raises the bound with an allowance")
+    working_set.clear_observed()
+
+    print("capacity proof")
+    gpu = FakeGPU(free_mb=176, total_mb=256)
+    signature, proof = with_gpu(
+        gpu, lambda: vram_guard._capacity_proof(patcher, forward_args(), 32, device=CUDA)
+    )
+    check(signature.seq_len == 16, "capacity proof returns the checked signature")
+    check(proof.floor == 48 * MB,
+          "floor subtracts only the current model's resident-unpinned page")
+    check(proof.mandatory == 96 * MB,
+          "capacity adds only incremental pages from the largest phase")
+    check(proof.predicted <= proof.total,
+          "capacity accepts when floor + working + weights + margin fits")
+    check(gpu.synchronizes == 1 and gpu.releases == 1,
+          "capacity settles CUDA and releases the Torch cache before measuring")
+    check(proof.floor < model.model_loaded_weight_memory,
+          "force-loaded weights already in physical usage are not double-counted")
+
+    exact_gpu = FakeGPU(free_mb=98, total_mb=178)
+    _, exact = with_gpu(
+        exact_gpu, lambda: vram_guard._capacity_proof(
+            patcher, forward_args(), 32, device=CUDA)
+    )
+    check(exact.headroom == 0, "predicted peak equal to physical VRAM is accepted")
+
+    records = []
+    real_error = logging.error
+    logging.error = lambda msg, *a: records.append(msg % a if a else msg)
+    try:
+        gpu = FakeGPU(free_mb=80, total_mb=160)
+        try:
+            with_gpu(gpu, lambda: vram_guard._capacity_proof(
+                patcher, forward_args(), 32, device=CUDA))
+            raise AssertionError("expected the capacity proof to cancel")
+        except comfy.model_management.InterruptProcessingException:
+            check(True, "capacity rejects before apply_model when the equation exceeds VRAM")
+    finally:
+        logging.error = real_error
+    capacity_log = "\n".join(records)
+    check("Non-reclaimable starting floor" in capacity_log and "Deficit:" in capacity_log,
+          "capacity cancellation logs every proof term and the deficit")
 
     print("above threshold")
     gpu = FakeGPU(free_mb=3000)
@@ -121,7 +305,8 @@ def main():
 
     print("wrapper install")
     calls = []
-    patcher = FakePatcher()
+    model, _ = fake_h3_model()
+    patcher = FakePatcher(model=model)
     vram_guard.install_unet_guard(patcher, 800)
     wrapper = patcher.model_options["model_function_wrapper"]
     check(callable(wrapper), "wrapper installed on the patcher")
@@ -130,12 +315,52 @@ def main():
         calls.append((x, timestep, c))
         return "denoised"
 
-    args = {"input": torch.zeros(1), "timestep": torch.tensor([0.7]), "c": {"y": 1},
-            "cond_or_uncond": [0]}
-    gpu = FakeGPU(free_mb=3000)
+    args = forward_args()
+    gpu = FakeGPU(free_mb=11000)
     out = with_gpu(gpu, lambda: wrapper(apply_model, args))
     check(out == "denoised", "wrapper calls through to apply_model with headroom")
-    check(calls[-1][2] == {"y": 1}, "conditioning kwargs are forwarded unchanged")
+    check(calls[-1][2]["y"] == 1 and "c_crossattn" in calls[-1][2],
+          "conditioning kwargs are forwarded unchanged")
+    check(gpu.releases == 1 and gpu.peak_resets == 1,
+          "the first signature is proved and observed once")
+    with_gpu(gpu, lambda: wrapper(apply_model, args))
+    check(gpu.releases == 1 and gpu.peak_resets == 1,
+          "the same successful signature is not proved again")
+    changed = forward_args(text_len=3)
+    with_gpu(gpu, lambda: wrapper(apply_model, changed))
+    check(gpu.releases == 2 and gpu.peak_resets == 2,
+          "a changed packed signature receives a new capacity proof")
+
+    retry_patcher = FakePatcher(model=model)
+    vram_guard.install_unet_guard(retry_patcher, 800)
+    retry_wrapper = retry_patcher.model_options["model_function_wrapper"]
+    retry_gpu = FakeGPU(free_mb=11000)
+
+    def fail_forward(*_args, **_kwargs):
+        raise ValueError("forward failed")
+
+    try:
+        with_gpu(retry_gpu, lambda: retry_wrapper(
+            fail_forward,
+            forward_args(text_len=4),
+        ))
+    except ValueError:
+        pass
+    with_gpu(retry_gpu, lambda: retry_wrapper(apply_model, forward_args(text_len=4)))
+    check(retry_gpu.releases == 2,
+          "a failed first forward is proved again before the signature is trusted")
+
+    broken_patcher = FakePatcher(model=model)
+    vram_guard.install_unet_guard(broken_patcher, 800)
+    broken_calls = []
+    broken_args = forward_args()
+    broken_args["c"].pop("c_crossattn")
+    try:
+        with_gpu(FakeGPU(free_mb=11000), lambda: broken_patcher.model_options[
+            "model_function_wrapper"](lambda *_a, **_k: broken_calls.append(True), broken_args))
+        raise AssertionError("expected an unknown signature to fail closed")
+    except comfy.model_management.InterruptProcessingException:
+        check(not broken_calls, "an unresolved working-set signature fails closed before apply_model")
 
     gpu = FakeGPU(free_mb=100, recovers_to_mb=100)
     n_before = len(calls)
@@ -153,9 +378,10 @@ def main():
         chained.append(args)
         return "from previous wrapper"
 
-    patcher = FakePatcher(existing=previous)
+    model, _ = fake_h3_model()
+    patcher = FakePatcher(existing=previous, model=model)
     vram_guard.install_unet_guard(patcher, 800)
-    gpu = FakeGPU(free_mb=3000)
+    gpu = FakeGPU(free_mb=11000)
     out = with_gpu(gpu, lambda: patcher.model_options["model_function_wrapper"](apply_model, args))
     check(out == "from previous wrapper" and len(chained) == 1,
           "an existing wrapper is chained, not replaced")

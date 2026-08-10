@@ -9,7 +9,13 @@ import torch
 from comfy.utils import model_trange as trange
 from comfy.k_diffusion.sampling import sample_euler, sample_res_multistep
 
-from .config import ADAPTIVE_PROFILES, CORE_SOLVER_METHODS, PREDICTOR_METHODS, SamplerConfig
+from .config import (
+    ADAPTIVE_PROFILES,
+    CONTINUOUS_PROFILES,
+    CORE_SOLVER_METHODS,
+    PREDICTOR_METHODS,
+    SamplerConfig,
+)
 from .diagnostics import RunDiagnostics, callback_metadata_scope
 from .fingerprint import (
     configuration_fingerprint,
@@ -20,6 +26,7 @@ from .fingerprint import (
 from .policy import make_policy
 from .predictor import make_predictor
 from .repairability import ProfileCompatibility, RepairabilityProfile
+from .schedules import geometric_schedule
 from .adaptive_res import (
     AdaptiveHistoryController,
     AdaptiveHistoryControllerV2,
@@ -636,9 +643,17 @@ def _sample_core_solver(model, x, source_sigmas, extra_args, callback, disable, 
     if config.evaluation_profile in ADAPTIVE_PROFILES:
         return _sample_adaptive_res(model, x, source_sigmas, extra_args, callback, disable,
                                     config, diagnostics, context)
-    actual_indices = config.actual_indices
-    index_tensor = torch.as_tensor(actual_indices, device=source_sigmas.device)
-    effective_sigmas = torch.cat((source_sigmas.index_select(0, index_tensor), source_sigmas[-1:]))
+    if config.evaluation_profile in CONTINUOUS_PROFILES:
+        effective_sigmas, logical_coordinates, schedule_ratio = geometric_schedule(
+            source_sigmas, config.evaluation_profile,
+        )
+        actual_indices = None
+    else:
+        actual_indices = config.actual_indices
+        index_tensor = torch.as_tensor(actual_indices, device=source_sigmas.device)
+        effective_sigmas = torch.cat((source_sigmas.index_select(0, index_tensor), source_sigmas[-1:]))
+        logical_coordinates = tuple(float(index) for index in actual_indices)
+        schedule_ratio = None
     source_hash = sigma_hash(source_sigmas)
     effective_hash = sigma_hash(effective_sigmas)
     fingerprint = configuration_fingerprint(
@@ -659,7 +674,7 @@ def _sample_core_solver(model, x, source_sigmas, extra_args, callback, disable, 
         source_sigma_sequence=source_sigmas.tolist(),
         effective_sigma_hash=effective_hash,
         effective_sigma_sequence=effective_sigmas.tolist(),
-        actual_indices=list(actual_indices),
+        actual_indices=None if actual_indices is None else list(actual_indices),
     )
 
     timed_model = _TimedModel(model)
@@ -670,17 +685,20 @@ def _sample_core_solver(model, x, source_sigmas, extra_args, callback, disable, 
         nonlocal callback_count
         callback_count += 1
         reduced_index = int(data["i"])
-        logical_index = int(actual_indices[reduced_index])
+        logical_coordinate = logical_coordinates[reduced_index]
+        logical_index = min(19, max(0, int(math.floor(logical_coordinate + 1e-9))))
         true_nfe = timed_model.calls
         payload = dict(data)
         payload["i"] = logical_index
-        payload["sigma"] = source_sigmas[logical_index]
-        payload["sigma_hat"] = source_sigmas[logical_index]
+        if actual_indices is not None:
+            payload["sigma"] = source_sigmas[logical_index]
+            payload["sigma_hat"] = source_sigmas[logical_index]
         payload.update({
             "h3_vector_forecast": False,
             "h3_vector_true_nfe": true_nfe,
             "h3_vector_actual_anchor_index": true_nfe - 1,
             "h3_vector_logical_step": logical_index,
+            "h3_vector_logical_coordinate": logical_coordinate,
             "h3_vector_method": config.method,
             "h3_vector_profile": config.evaluation_profile,
             "h3_vector_policy": config.policy,
@@ -688,7 +706,10 @@ def _sample_core_solver(model, x, source_sigmas, extra_args, callback, disable, 
             "h3_vector_core_solver": config.method,
             "h3_vector_source_sigma_hash": source_hash,
             "h3_vector_effective_sigma_hash": effective_hash,
-            "h3_vector_actual_indices": list(actual_indices),
+            "h3_vector_actual_indices": (
+                None if actual_indices is None else list(actual_indices)
+            ),
+            "h3_vector_geometric_ratio": schedule_ratio,
             "h3_vector_callback_context": "h3_vector_actual_only",
         })
         derivative = _to_d(payload["x"], payload["sigma"], payload["denoised"])

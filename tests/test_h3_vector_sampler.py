@@ -17,11 +17,12 @@ import comfy.options  # noqa: E402
 comfy.options.enable_args_parsing()
 
 from comfy.k_diffusion.sampling import sample_euler, sample_res_multistep  # noqa: E402
-from h3_vector_accel.config import PROFILES, SamplerConfig  # noqa: E402
+from h3_vector_accel.config import MASK_PROFILES, SamplerConfig  # noqa: E402
 from h3_vector_accel.adaptive_res import IncrementalRES  # noqa: E402
 from h3_vector_accel.diagnostics import RunDiagnostics, current_callback_metadata  # noqa: E402
 from h3_vector_accel.predictor import Prediction  # noqa: E402
 from h3_vector_accel.sampler import sample_vector_accel  # noqa: E402
+from h3_vector_accel.schedules import geometric_schedule  # noqa: E402
 from h3_vector_accel.nodes import MiniMaxH3VectorAccelSampler  # noqa: E402
 sys.argv = _ORIGINAL_ARGV
 
@@ -193,6 +194,8 @@ class SamplerTests(unittest.TestCase):
         self.assertIn("adaptive_history_v2", inputs["evaluation_profile"].options)
         self.assertIn("adaptive_history_v3", inputs["evaluation_profile"].options)
         self.assertIn("adaptive_embedded_res_v1", inputs["evaluation_profile"].options)
+        self.assertIn("geometric_11", inputs["evaluation_profile"].options)
+        self.assertIn("geometric_linear_ends_11", inputs["evaluation_profile"].options)
         self.assertEqual(inputs["method"].display_name, "solver / forecast mode")
         self.assertEqual(inputs["evaluation_profile"].display_name, "actual-evaluation schedule")
         self.assertEqual(inputs["max_adaptive_step_scale"].default, 3.0)
@@ -298,7 +301,7 @@ class SamplerTests(unittest.TestCase):
         }
         expected = torch.full_like(self.x, -40.0)
         for method in ("hold", "linear_velocity"):
-            for profile in PROFILES:
+            for profile in MASK_PROFILES:
                 model = FakeModel(constant_velocity())
                 out = sample_vector_accel(
                     model, self.x.clone(), self.sigmas,
@@ -306,6 +309,73 @@ class SamplerTests(unittest.TestCase):
                 )
                 self.assertTrue(torch.equal(out, expected), (method, profile))
                 self.assertEqual(model.calls, expected_counts[profile], (method, profile))
+
+    def test_geometric_profiles_have_expected_ratios_and_native_end_contracts(self):
+        geometric, _, geometric_ratio = geometric_schedule(self.sigmas, "geometric_11")
+        self.assertEqual(geometric.numel(), 12)
+        self.assertEqual(float(geometric[-1]), 0.0)
+        self.assertEqual(float(geometric[0]), float(self.sigmas[0]))
+        self.assertEqual(float(geometric[1]), float(self.sigmas[1]))
+        self.assertEqual(float(geometric[-2]), float(self.sigmas[-2]))
+        geometric_h = torch.diff(-torch.log(geometric[:-1].double()))
+        geometric_ratios = geometric_h[1:] / geometric_h[:-1]
+        self.assertTrue(torch.allclose(
+            geometric_ratios,
+            torch.full_like(geometric_ratios, geometric_ratio),
+            atol=2e-5, rtol=2e-5,
+        ))
+
+        linear_ends, _, interior_ratio = geometric_schedule(
+            self.sigmas, "geometric_linear_ends_11",
+        )
+        self.assertEqual(linear_ends.numel(), 12)
+        self.assertTrue(torch.equal(linear_ends[:3], self.sigmas[:3]))
+        self.assertTrue(torch.equal(linear_ends[-3:], self.sigmas[-3:]))
+        linear_h = torch.diff(-torch.log(linear_ends[:-1].double()))
+        interior_ratios = linear_h[2:-1] / linear_h[1:-2]
+        self.assertTrue(torch.allclose(
+            interior_ratios,
+            torch.full_like(interior_ratios, interior_ratio),
+            atol=2e-5, rtol=2e-5,
+        ))
+
+    def test_geometric_profiles_require_res_and_match_direct_core(self):
+        for profile in ("geometric_11", "geometric_linear_ends_11"):
+            with self.assertRaisesRegex(ValueError, "require the res_multistep"):
+                SamplerConfig(method="euler", evaluation_profile=profile)
+            config = SamplerConfig(method="res_multistep", evaluation_profile=profile)
+            effective, coordinates, ratio = geometric_schedule(self.sigmas, profile)
+            velocity = lambda x, sigma: 0.2 * x + 0.03 * sigma + 1.0
+            direct_model = ResModel(velocity)
+            configured_model = ResModel(velocity)
+            callbacks = []
+            diagnostics = RunDiagnostics(config=config, latent_shapes=ResInner.latent_shapes)
+            direct = sample_res_multistep(
+                direct_model, self.x.clone(), effective, disable=True,
+            )
+            configured = sample_vector_accel(
+                configured_model, self.x.clone(), self.sigmas,
+                callback=callbacks.append, disable=True,
+                config=config, diagnostics=diagnostics,
+            )
+            self.assertTrue(torch.equal(direct, configured))
+            self.assertEqual(direct_model.calls, 11)
+            self.assertEqual(configured_model.calls, 11)
+            self.assertEqual(len(callbacks), 11)
+            self.assertEqual(
+                [float(row["sigma"]) for row in callbacks],
+                [float(value) for value in effective[:-1]],
+            )
+            self.assertEqual(
+                [row["h3_vector_logical_coordinate"] for row in callbacks],
+                list(coordinates),
+            )
+            self.assertTrue(all(row["h3_vector_actual_indices"] is None for row in callbacks))
+            self.assertTrue(all(row["h3_vector_geometric_ratio"] == ratio for row in callbacks))
+            self.assertIsNone(diagnostics._run_metadata["actual_indices"])
+            self.assertEqual(
+                diagnostics._run_metadata["effective_sigma_sequence"], effective.tolist(),
+            )
 
     def test_dense_hold_equals_reduced_schedule_euler_at_same_anchors(self):
         intervals = torch.tensor([
