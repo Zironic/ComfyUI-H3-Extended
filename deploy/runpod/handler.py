@@ -54,6 +54,18 @@ def safe_asset_name(name: str) -> str:
     return path.as_posix()
 
 
+def hybrid_mode_for_capability(capability: tuple[int, int]) -> str:
+    return "sage128_fused_qkv" if tuple(capability) == (8, 9) else "sage128"
+
+
+def current_hybrid_mode() -> str:
+    import torch
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("Hybrid Sparse workflow requires CUDA")
+    return hybrid_mode_for_capability(tuple(torch.cuda.get_device_capability()))
+
+
 def decode_asset(job_id: str, asset: dict) -> dict:
     name = safe_asset_name(str(asset.get("name", "")))
     encoded = asset.get("base64")
@@ -90,11 +102,18 @@ def replace_strings(value, replacements: dict[str, str]):
     return value
 
 
-def prepare_workflow(job_id: str, workflow: dict, downloaded: list[dict]) -> tuple[dict, str]:
+def prepare_workflow(
+    job_id: str,
+    workflow: dict,
+    downloaded: list[dict],
+    hybrid_mode: str | None = None,
+) -> tuple[dict, str]:
     output_prefix = f"runpod/{job_id}/result"
+    hybrid_mode = current_hybrid_mode() if hybrid_mode is None else hybrid_mode
     replacements = {
         "{{RUNPOD_JOB_ID}}": job_id,
         "{{RUNPOD_OUTPUT_PREFIX}}": output_prefix,
+        "{{RUNPOD_HYBRID_MODE}}": hybrid_mode,
     }
     for item in downloaded:
         replacements[f"{{{{ASSET:{item['name']}}}}}"] = item["comfy_path"]

@@ -426,7 +426,47 @@ def test_kernel_spec_resolution():
         "SM90 resolves Hopper FP8-V 64Q x 128KV geometry",
     )
 
-    for capability, expected in (((12, 0), "12.0"), ((9, 0), "_sm90")):
+    sm120 = resolve_sparse_sage_spec(
+        qattn, fused, capability=(12, 0), version="test",
+        cuda_version=(12, 8),
+    )
+    check(
+        sm120.kernel is ada_f16 and sm120.architecture == "sm120"
+        and sm120.accumulator == "f16" and sm120.v_format == "fp8"
+        and sm120.v_quant_bound == 2.25
+        and (sm120.q_tile, sm120.kv_tile) == (128, 64),
+        "SM120 resolves the SM89-family FP8-V 128Q x 64KV f16 ABI",
+    )
+    try:
+        resolve_sparse_sage_spec(
+            qattn, fused, capability=(12, 0), version="test",
+            cuda_version=(12, 7),
+        )
+    except SparseSageError as exc:
+        check("CUDA 12.8" in str(exc), "SM120 rejects CUDA versions below 12.8")
+    else:
+        raise AssertionError("SM120 must reject CUDA versions below 12.8")
+    try:
+        resolve_sparse_sage_spec(
+            qattn, None, capability=(12, 0), version="test",
+            cuda_version=(12, 8),
+        )
+    except SparseSageError as exc:
+        check("_fused" in str(exc), "SM120 reports a missing compiled _fused extension")
+    else:
+        raise AssertionError("SM120 must require the compiled _fused extension")
+    try:
+        resolve_sparse_sage_spec(
+            SimpleNamespace(), fused, capability=(12, 0), version="test",
+            cuda_version=(12, 8),
+        )
+    except SparseSageError as exc:
+        check("SM120" in str(exc) and "required kernel" in str(exc),
+              "SM120 reports a missing block-sparse symbol")
+    else:
+        raise AssertionError("SM120 must require its block-sparse symbol")
+
+    for capability, expected in (((9, 0), "_sm90"),):
         surface = SimpleNamespace() if capability == (9, 0) else qattn
         try:
             resolve_sparse_sage_spec(
@@ -453,9 +493,22 @@ def test_kernel_spec_resolution():
     ), mock.patch.object(
             torch.ops, "spas_sage_attn_qattn_sm89", split, create=True,
     ):
+        check(_load_qattn_surface((8, 9)) == (split, "split"),
+              "architecture registry normalizes split SM89 extension packages")
+        check(_load_qattn_surface((12, 0)) == (split, "split"),
+              "SM120 reuses the split SM89 extension namespace")
+
+    direct_split = SimpleNamespace(**{
+        "qk_int8_sv_f8_accum_f16_block_sparse_attn_inst_buf_fuse_v_scale_with_pv_threshold":
+            lambda *args: None,
+    })
+    with mock.patch(
+            "h3_attention.hybrid.sparse_sage.importlib.import_module",
+            return_value=direct_split,
+    ):
         check(
-            _load_qattn_surface((8, 9)) == (split, "split"),
-            "architecture registry normalizes split compiled extension packages",
+            _load_qattn_surface((12, 0)) == (direct_split, "split"),
+            "split extension direct Python kernel exports are preserved",
         )
 
     monolithic = SimpleNamespace(monolithic=True)
@@ -467,6 +520,33 @@ def test_kernel_spec_resolution():
             _load_qattn_surface((9, 0)) == (monolithic, "monolithic"),
             "architecture registry prefers current upstream's monolithic extension",
         )
+
+    fused_surface = SimpleNamespace(
+        transpose_pad_permute_cuda=lambda *args: None,
+        scale_fuse_quant_cuda=lambda *args: None,
+    )
+
+    def sm120_import(name):
+        if name in ("spas_sage_attn", "spas_sage_attn._qattn_sm89"):
+            return SimpleNamespace()
+        if name == "spas_sage_attn._fused":
+            return fused_surface
+        raise AssertionError("unexpected SM120 extension import %s" % name)
+
+    with mock.patch(
+            "h3_attention.hybrid.sparse_sage.importlib.import_module",
+            side_effect=sm120_import,
+    ), mock.patch.object(
+            torch.ops, "spas_sage_attn_qattn_sm89", qattn, create=True,
+    ):
+        loaded = load_sparse_sage_spec(
+            capability=(12, 0), cuda_version=(12, 8),
+        )
+    check(
+        loaded.capability == (12, 0) and loaded.extension_layout == "split"
+        and loaded.kernel is ada_f16,
+        "load accepts SM120 and resolves the split SM89-family ABI",
+    )
 
 
 def test_architecture_specific_carriers_and_abis():

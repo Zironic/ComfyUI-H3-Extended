@@ -123,7 +123,17 @@ _SPLIT_QATTN = {
     (8, 6): ("sm80", "spas_sage_attn_qattn_sm80"),
     (8, 7): ("sm80", "spas_sage_attn_qattn_sm80"),
     (8, 9): ("sm89", "spas_sage_attn_qattn_sm89"),
+    (12, 0): ("sm89", "spas_sage_attn_qattn_sm89"),
     (9, 0): ("sm90", "spas_sage_attn_qattn_sm90"),
+}
+
+_SPLIT_KERNELS = {
+    (8, 0): (_AMPERE_KERNEL,),
+    (8, 6): (_AMPERE_KERNEL,),
+    (8, 7): (_AMPERE_KERNEL,),
+    (8, 9): (_SM89_F16_KERNEL, _SM89_F32_KERNEL),
+    (9, 0): (_SM90_KERNEL,),
+    (12, 0): (_SM89_F16_KERNEL,),
 }
 
 
@@ -137,15 +147,23 @@ def _kernel(surface, name):
     return value if callable(value) else None
 
 
+def _load_split_qattn_surface(capability):
+    family, namespace = _SPLIT_QATTN[capability]
+    module = importlib.import_module("spas_sage_attn._qattn_%s" % family)
+    if any(_kernel(module, name) is not None for name in _SPLIT_KERNELS[capability]):
+        return module, "split"
+    return getattr(torch.ops, namespace), "split"
+
+
 def _load_qattn_surface(capability):
+    if capability == (12, 0):
+        return _load_split_qattn_surface(capability)
     try:
         return importlib.import_module("spas_sage_attn._qattn"), "monolithic"
     except ModuleNotFoundError as exc:
         if exc.name != "spas_sage_attn._qattn":
             raise
-    family, namespace = _SPLIT_QATTN[capability]
-    importlib.import_module("spas_sage_attn._qattn_%s" % family)
-    return getattr(torch.ops, namespace), "split"
+    return _load_split_qattn_surface(capability)
 
 
 def _load_fused_surface():
@@ -210,6 +228,25 @@ def resolve_sparse_sage_spec(qattn, fused, *, capability, version, cuda_version=
             extension_layout=extension_layout, fused_v_ops=fused,
             kernel_name=name,
         )
+    if capability == (12, 0):
+        if cuda_version < (12, 8):
+            raise SparseSageError(
+                "Sparse Sage SM120 requires CUDA 12.8 or newer; found CUDA %d.%d"
+                % cuda_version
+            )
+        name = _SM89_F16_KERNEL
+        kernel = _kernel(qattn, name)
+        if kernel is None:
+            raise SparseSageError("Sparse Sage SM120 lacks required kernel %s" % name)
+        if fused is None:
+            raise SparseSageError("Sparse Sage SM120 requires the compiled _fused extension")
+        return SparseSageKernelSpec(
+            version=str(version), architecture="sm120", capability=capability,
+            q_tile=128, kv_tile=64, v_format="fp8", kernel=kernel,
+            accumulator="f16", v_quant_bound=2.25,
+            extension_layout=extension_layout, fused_v_ops=fused,
+            kernel_name=name,
+        )
     raise SparseSageError("Sparse Sage does not support device capability %d.%d" % capability)
 
 
@@ -226,7 +263,7 @@ def load_sparse_sage_spec(*, capability=None, capability_getter=None, cuda_versi
         capability = tuple(getter())
     if capability is not None:
         capability = tuple(int(x) for x in capability)
-        if capability not in ((8, 0), (8, 6), (8, 7), (8, 9), (9, 0)):
+        if capability not in ((8, 0), (8, 6), (8, 7), (8, 9), (9, 0), (12, 0)):
             raise SparseSageError(
                 "Sparse Sage does not support device capability %d.%d" % capability
             )

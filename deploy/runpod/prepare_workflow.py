@@ -157,6 +157,8 @@ def prepare_workflow(workflow: dict, input_name: str | None = None) -> dict:
             inputs["filename_prefix"] = "{{RUNPOD_OUTPUT_PREFIX}}"
         if class_type == HYBRID_NODE and "run_tag" in inputs:
             inputs["run_tag"] = "{{RUNPOD_JOB_ID}}"
+        if class_type == HYBRID_NODE:
+            inputs["mode"] = "{{RUNPOD_HYBRID_MODE}}"
 
     return prepared
 

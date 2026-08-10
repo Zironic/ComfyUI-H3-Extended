@@ -10,7 +10,9 @@ RunPod has mounted it.
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import json
+import re
 import shlex
 import shutil
 import subprocess
@@ -19,11 +21,88 @@ from collections.abc import Iterator
 from typing import Any
 
 
-DEFAULT_IMAGE = "runpod/worker-comfyui:5.8.6-base"
-DEFAULT_GPU = "NVIDIA RTX 6000 Ada Generation"
+DEFAULT_IMAGE = "runpod/worker-comfyui:5.8.6-base-cuda12.8.1"
+DEFAULT_GPU_PROFILE = "rtx4090"
 DEFAULT_MODEL_REFERENCE = "https://huggingface.co/Comfy-Org/MiniMax-H3:main"
-DEFAULT_BRANCH = "agent/runpod-serverless"
+DEFAULT_BRANCH = "main"
 DEFAULT_COMFY_REF = "v0.31.0"
+
+
+@dataclass(frozen=True)
+class GPUProfile:
+    gpu_id: str
+    capability: str
+    memory_gb: int
+
+
+GPU_PROFILES = {
+    "rtx4090": GPUProfile("NVIDIA GeForce RTX 4090", "8.9", 24),
+    "rtx5090": GPUProfile("NVIDIA GeForce RTX 5090", "12.0", 32),
+    "rtx6000-ada": GPUProfile("NVIDIA RTX 6000 Ada Generation", "8.9", 48),
+    "l40s": GPUProfile("NVIDIA L40S", "8.9", 48),
+    "a100-80gb": GPUProfile("NVIDIA A100-SXM4-80GB", "8.0", 80),
+}
+UNSUPPORTED_GPU_PROFILES = {
+    "b200": "B200 is SM100, which the current H3 Hybrid Sparse backend does not support",
+}
+DEFAULT_GPU = GPU_PROFILES[DEFAULT_GPU_PROFILE].gpu_id
+DEFAULT_ENDPOINT_NAME = f"h3-extended-{DEFAULT_GPU_PROFILE}"
+DEFAULT_TEMPLATE_NAME = f"{DEFAULT_ENDPOINT_NAME}-comfy-serverless"
+
+
+def _slug(value: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+    return slug or "custom-gpu"
+
+
+def _resolve_gpu(
+    profile_name: str,
+    raw_gpu: str | None,
+    endpoint_name: str | None,
+    template_name: str | None,
+) -> dict[str, Any]:
+    if raw_gpu:
+        name = f"custom-{_slug(raw_gpu)}"
+        gpu_id = raw_gpu
+        capability = "runtime-detected"
+        memory_gb = None
+    else:
+        if profile_name in UNSUPPORTED_GPU_PROFILES:
+            raise ValueError(UNSUPPORTED_GPU_PROFILES[profile_name])
+        profile = GPU_PROFILES[profile_name]
+        name = profile_name
+        gpu_id = profile.gpu_id
+        capability = profile.capability
+        memory_gb = profile.memory_gb
+    endpoint = endpoint_name or f"h3-extended-{name}"
+    template = template_name or f"{endpoint}-comfy-serverless"
+    return {
+        "profile": name,
+        "gpu": gpu_id,
+        "capability": capability,
+        "memory_gb": memory_gb,
+        "endpoint_name": endpoint,
+        "template_name": template,
+    }
+
+
+def _profile_payload() -> dict[str, dict[str, Any]]:
+    payload = {
+        name: {
+            "gpu_id": profile.gpu_id,
+            "capability": profile.capability,
+            "memory_gb": profile.memory_gb,
+            "supported": True,
+        }
+        for name, profile in GPU_PROFILES.items()
+    }
+    payload.update(
+        {
+            name: {"supported": False, "reason": reason}
+            for name, reason in UNSUPPORTED_GPU_PROFILES.items()
+        }
+    )
+    return payload
 
 
 def _run(args: list[str]) -> str:
@@ -197,10 +276,16 @@ def main() -> int:
             "Submitting a job later is what actually causes a GPU worker to scale from zero."
         )
     )
-    parser.add_argument("--endpoint-name", default="h3-extended-6000-ada")
-    parser.add_argument("--template-name", default="h3-extended-comfy-serverless")
+    parser.add_argument("--endpoint-name")
+    parser.add_argument("--template-name")
     parser.add_argument("--image", default=DEFAULT_IMAGE)
-    parser.add_argument("--gpu", default=DEFAULT_GPU)
+    parser.add_argument(
+        "--gpu-profile",
+        choices=sorted(GPU_PROFILES | UNSUPPORTED_GPU_PROFILES),
+        default=DEFAULT_GPU_PROFILE,
+    )
+    parser.add_argument("--gpu", help="exact RunPod GPU ID; overrides --gpu-profile")
+    parser.add_argument("--list-gpu-profiles", action="store_true")
     parser.add_argument("--model-reference", default=DEFAULT_MODEL_REFERENCE)
     parser.add_argument("--h3-ref", default=DEFAULT_BRANCH)
     parser.add_argument("--comfy-ref", default=DEFAULT_COMFY_REF)
@@ -208,7 +293,7 @@ def main() -> int:
     parser.add_argument("--workers-max", type=int, default=1)
     parser.add_argument("--idle-timeout", type=int, default=5)
     parser.add_argument("--execution-timeout", type=int, default=7200, help="seconds")
-    parser.add_argument("--min-cuda-version", default="12.6")
+    parser.add_argument("--min-cuda-version", default="12.8")
     parser.add_argument("--scale-threshold", type=int, default=1, help="queue delay in seconds")
     parser.add_argument(
         "--force-new-endpoint",
@@ -216,6 +301,21 @@ def main() -> int:
         help="create a new endpoint even when an endpoint with --endpoint-name already exists",
     )
     args = parser.parse_args()
+
+    if args.list_gpu_profiles:
+        print(json.dumps(_profile_payload(), indent=2, sort_keys=True))
+        return 0
+
+    try:
+        selected = _resolve_gpu(
+            args.gpu_profile, args.gpu, args.endpoint_name, args.template_name
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    args.gpu_profile = selected["profile"]
+    args.gpu = selected["gpu"]
+    args.endpoint_name = selected["endpoint_name"]
+    args.template_name = selected["template_name"]
 
     _require_runpodctl()
 
@@ -238,6 +338,9 @@ def main() -> int:
                 "endpoint_name": args.endpoint_name,
                 "template_id": template_id,
                 "gpu": args.gpu,
+                "gpu_profile": args.gpu_profile,
+                "expected_capability": selected["capability"],
+                "memory_gb": selected["memory_gb"],
                 "model_reference": args.model_reference,
                 "workers_min": 0,
                 "workers_max": args.workers_max,

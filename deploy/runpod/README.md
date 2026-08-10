@@ -7,17 +7,18 @@ The runtime sequence is:
 1. boot RunPod's stock `worker-comfyui` image,
 2. fetch the requested ComfyUI revision into the existing runtime,
 3. fetch this repository into `custom_nodes`,
-4. symlink selected MiniMax H3 files from RunPod Cached Models into Comfy's model directories,
-5. replace the stock image-only RunPod handler with the H3-aware handler in this directory,
-6. hand control back to RunPod's stock `/start.sh`.
+4. detect the worker GPU and compile the pinned SpargeAttention extension for its CUDA architecture in the stock venv,
+5. symlink selected MiniMax H3 files from RunPod Cached Models into Comfy's model directories,
+6. replace the stock image-only RunPod handler with the H3-aware handler in this directory,
+7. hand control back to RunPod's stock `/start.sh`.
 
 The deployment code lives here because it is source-controlled deployment logic. Runtime state is written beneath `/comfyui/user/runpod`, while per-job inputs and outputs use `/comfyui/input/runpod/<job_id>` and `/comfyui/output/runpod/<job_id>`.
 
 ## RunPod endpoint
 
-Recommended first smoke-test configuration:
+Default smoke-test configuration:
 
-- GPU class: L40 / L40S / RTX 6000 Ada 48 GB
+- GPU profile: `rtx4090` (`NVIDIA GeForce RTX 4090`, SM89, 24 GB)
 - active workers: 0
 - max workers: 1
 - GPUs per worker: 1
@@ -27,7 +28,18 @@ Recommended first smoke-test configuration:
 - Cached Model: `Comfy-Org/MiniMax-H3`
 - Hybrid Sparse Attention: enabled by the submitted workflow
 
-The endpoint must use a RunPod `worker-comfyui` base image that contains `/start.sh`, `/opt/venv`, `uv`, `git`, and `wget`. The deployment currently targets the `5.8.6` worker layout.
+The endpoint uses the stock RunPod image `runpod/worker-comfyui:5.8.6-base-cuda12.8.1`, which contains `/start.sh`, `/opt/venv`, `uv`, `git`, and `wget`. No custom image or Dockerfile is required. Each newly allocated worker may pay the CUDA compiler install and source-build cost before ComfyUI starts. A still-running worker reuses its marker only when the GPU architecture, pinned ref, Torch/CUDA build identity, and extension symbols all match.
+
+`setup_endpoint.py` keeps GPU choice outside the worker code. `rtx4090` is the default, while `rtx5090`, `rtx6000-ada`, `l40s`, and `a100-80gb` are named alternatives. Use `--gpu` for an exact RunPod GPU ID that is not yet in the profile list. Profiles create distinct default endpoint/template names, so switching GPU does not silently mutate an existing endpoint.
+
+```bash
+python deploy/runpod/setup_endpoint.py --list-gpu-profiles
+python deploy/runpod/setup_endpoint.py
+python deploy/runpod/setup_endpoint.py --gpu-profile l40s
+python deploy/runpod/setup_endpoint.py --gpu "NVIDIA Future GPU"
+```
+
+The bootstrap currently supports SM80, SM86, SM87, SM89, SM90, and SM120. B200 is deliberately rejected because it is SM100, which the current H3 Hybrid Sparse backend does not support.
 
 ## Container start command
 
@@ -44,9 +56,9 @@ For this experimental branch:
 
 ```bash
 wget -qO /tmp/h3-runpod-bootstrap.sh \
-  https://raw.githubusercontent.com/Zironic/ComfyUI-H3-Extended/agent/runpod-serverless/deploy/runpod/bootstrap.sh \
+  https://raw.githubusercontent.com/Zironic/ComfyUI-H3-Extended/main/deploy/runpod/bootstrap.sh \
 && chmod +x /tmp/h3-runpod-bootstrap.sh \
-&& H3_EXTENDED_REF=agent/runpod-serverless /tmp/h3-runpod-bootstrap.sh
+&& H3_EXTENDED_REF=main /tmp/h3-runpod-bootstrap.sh
 ```
 
 Useful bootstrap environment variables:
@@ -54,17 +66,22 @@ Useful bootstrap environment variables:
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `COMFYUI_REF` | `v0.31.0` | ComfyUI tag, branch, or commit fetched at startup |
-| `H3_EXTENDED_REF` | `agent/runpod-serverless` | H3-Extended branch/tag/commit fetched at startup |
+| `H3_EXTENDED_REF` | `main` | H3-Extended branch/tag/commit fetched at startup |
 | `RUNPOD_SKIP_COMFY_UPDATE` | `0` | Set to `1` to retain the ComfyUI version bundled in the stock image |
 | `RUNPOD_H3_MODEL_REPO` | `Comfy-Org/MiniMax-H3` | Hugging Face repo configured as RunPod Cached Model |
 | `RUNPOD_H3_REQUIRED` | `0` | Set to `1` to fail startup if no expected cached H3 file is linked |
 | `RUNPOD_BOOTSTRAP_SMOKE_TEST` | `0` | Set to `1` to run Comfy's CPU import quick test before worker startup |
+| `SPARGE_REPO` | `https://github.com/woct0rdho/SpargeAttn.git` | SpargeAttention source repository |
+| `SPARGE_REF` | `067d80cb6b76345c7b8be40e86c7d19a3cf7c4eb` | Pinned portable SpargeAttention commit |
+| `SPARGE_BUILD_JOBS` | empty | Optional source-build parallelism override |
 
-The bootstrap records the resolved ComfyUI and H3-Extended commits in:
+The bootstrap records the resolved ComfyUI, H3-Extended, and SpargeAttention refs in:
 
 ```text
 /comfyui/user/runpod/deployment.json
 ```
+
+The install marker is `/comfyui/user/runpod/sparge-attn.json`. It is never used by itself: the bootstrap also matches the detected architecture, Torch and CUDA versions, and H3's exact extension ABI before skipping a build.
 
 ## Cached H3 models
 
@@ -192,7 +209,7 @@ RUNPOD_ENDPOINT_ID
 
 ## First smoke test
 
-Keep `MiniMaxH3HybridSparseAttentionZi` enabled in the target workflow. GPU portability is owned by that H3 node; the deployment bootstrap does not install or gate a GPU-specific Sparse Sage package.
+Keep `MiniMaxH3HybridSparseAttentionZi` enabled in the target workflow. The bootstrap detects the actual worker capability and builds the matching Sparse Sage extension in `/opt/venv` when needed. At submission time the handler selects `sage128_fused_qkv` on SM89 GPUs (4090, RTX 6000 Ada, and L40S profiles) and portable `sage128` on the other supported architectures.
 
 The first test should establish, in order:
 
@@ -201,7 +218,7 @@ The first test should establish, in order:
 3. H3-Extended imports,
 4. cached H3 files are visible and linked,
 5. an API workflow validates,
-6. H3 runs on the 48 GB worker,
+6. H3 fits and runs on the selected worker,
 7. MP4/audio output is produced,
 8. the MP4 is returned inline and decoded locally,
 9. the worker scales back to zero.
@@ -212,4 +229,4 @@ The first test should establish, in order:
 - Inline requests and results must remain below RunPod's payload limits after base64 expansion.
 - The handler assumes a single ComfyUI process on `127.0.0.1:8188`, matching RunPod's stock worker architecture.
 - Cached-model file discovery is filename-based and deliberately fails on duplicate matches.
-- The branch has not yet been exercised on a live RunPod endpoint; the first live run is the validation step.
+- The branch has not yet been exercised on a live RunPod endpoint; the first live run is the validation step. In particular, the default 4090 has 24 GB, so CPU tests and shell syntax checks cannot prove that this exact workflow fits, that the worker can install the CUDA toolkit, or that the extension compiles successfully.

@@ -2,11 +2,13 @@
 
 import base64
 import importlib.util
+import inspect
 import os
 from pathlib import Path
 import sys
 import types
 import unittest
+from unittest import mock
 
 import h3_test_tempfile as tempfile
 
@@ -17,12 +19,14 @@ _DEPLOY = _ROOT / "deploy" / "runpod"
 
 def load_module(name, path, stubs=None):
     previous = {}
+    previous[name] = sys.modules.get(name)
     for module_name, module in (stubs or {}).items():
         previous[module_name] = sys.modules.get(module_name)
         sys.modules[module_name] = module
     try:
         spec = importlib.util.spec_from_file_location(name, path)
         module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
         spec.loader.exec_module(module)
         return module
     finally:
@@ -55,6 +59,100 @@ class RunPodInlineTests(unittest.TestCase):
         cls.linker = load_module(
             "h3_runpod_linker_test", _DEPLOY / "link_h3_models.py"
         )
+        cls.setup = load_module(
+            "h3_runpod_setup_endpoint_test", _DEPLOY / "setup_endpoint.py"
+        )
+        cls.sparge_runtime = load_module(
+            "h3_runpod_sparge_runtime_test", _DEPLOY / "sparge_runtime.py"
+        )
+        cls.bootstrap_text = (_DEPLOY / "bootstrap.sh").read_text(encoding="utf-8")
+        cls.readme_text = (_DEPLOY / "README.md").read_text(encoding="utf-8")
+
+    def test_gpu_profiles_default_to_4090_and_allow_raw_override(self):
+        self.assertEqual(
+            self.setup.DEFAULT_IMAGE,
+            "runpod/worker-comfyui:5.8.6-base-cuda12.8.1",
+        )
+        self.assertEqual(self.setup.DEFAULT_GPU_PROFILE, "rtx4090")
+        self.assertEqual(self.setup.DEFAULT_GPU, "NVIDIA GeForce RTX 4090")
+        self.assertEqual(self.setup.DEFAULT_ENDPOINT_NAME, "h3-extended-rtx4090")
+        self.assertEqual(self.setup.DEFAULT_BRANCH, "main")
+        self.assertEqual(
+            self.setup.DEFAULT_TEMPLATE_NAME,
+            "h3-extended-rtx4090-comfy-serverless",
+        )
+        profile = self.setup._resolve_gpu("l40s", None, None, None)
+        self.assertEqual(profile["gpu"], "NVIDIA L40S")
+        self.assertEqual(profile["capability"], "8.9")
+        self.assertEqual(profile["endpoint_name"], "h3-extended-l40s")
+        custom = self.setup._resolve_gpu(
+            "rtx4090", "NVIDIA Future GPU", None, None
+        )
+        self.assertEqual(custom["gpu"], "NVIDIA Future GPU")
+        self.assertEqual(custom["capability"], "runtime-detected")
+        with self.assertRaisesRegex(ValueError, "SM100"):
+            self.setup._resolve_gpu("b200", None, None, None)
+        self.assertIn('parser.add_argument("--min-cuda-version", default="12.8")',
+                      inspect.getsource(self.setup.main))
+
+    def test_portable_bootstrap_is_pinned_and_stock_image_only(self):
+        self.assertIn(
+            "https://github.com/woct0rdho/SpargeAttn.git",
+            self.bootstrap_text,
+        )
+        self.assertIn("067d80cb6b76345c7b8be40e86c7d19a3cf7c4eb", self.bootstrap_text)
+        self.assertIn("runpod/worker-comfyui:5.8.6-base-cuda12.8.1", self.readme_text)
+        self.assertNotIn("Dockerfile", self.bootstrap_text)
+
+    def test_portable_bootstrap_probes_runtime_architecture(self):
+        for expected in (
+            'sparge-attn.json',
+            'sparge_runtime probe --field capability',
+            'sparge_runtime probe --field architecture',
+            'sparge_runtime probe --field arch_list',
+            'Detected ${architecture}',
+            'requires nvcc >= 12.8',
+            '--no-build-isolation --no-deps',
+            'python3-dev',
+            '"sparge_ref": sparge_ref',
+            '"sparge_architecture": sparge_architecture',
+        ):
+            self.assertIn(expected, self.bootstrap_text)
+        self.assertNotIn('capability != (12, 0)', self.bootstrap_text)
+
+    def test_sparge_runtime_maps_supported_gpu_architectures(self):
+        expected = {
+            (8, 0): ("sm80", "8.0"),
+            (8, 6): ("sm86", "8.6"),
+            (8, 7): ("sm87", "8.7"),
+            (8, 9): ("sm89", "8.9"),
+            (9, 0): ("sm90", "9.0"),
+            (12, 0): ("sm120", "12.0"),
+        }
+        for capability, (architecture, arch_list) in expected.items():
+            torch = types.ModuleType("torch")
+            torch.cuda = types.SimpleNamespace(
+                is_available=lambda: True,
+                get_device_capability=lambda value=capability: value,
+            )
+            torch.version = types.SimpleNamespace(cuda="12.8")
+            torch.__version__ = "2.9.0+cu128"
+            with mock.patch.dict(sys.modules, {"torch": torch}):
+                info = self.sparge_runtime.runtime_info()
+            self.assertEqual(info["architecture"], architecture)
+            self.assertEqual(info["arch_list"], arch_list)
+
+    def test_sparge_runtime_rejects_b200_sm100(self):
+        torch = types.ModuleType("torch")
+        torch.cuda = types.SimpleNamespace(
+            is_available=lambda: True,
+            get_device_capability=lambda: (10, 0),
+        )
+        torch.version = types.SimpleNamespace(cuda="12.8")
+        torch.__version__ = "2.9.0+cu128"
+        with mock.patch.dict(sys.modules, {"torch": torch}):
+            with self.assertRaisesRegex(RuntimeError, "10.0"):
+                self.sparge_runtime.runtime_info()
 
     def test_asset_round_trip_and_workflow_placeholders(self):
         with tempfile.TemporaryDirectory(prefix="runpod-inline-") as root:
@@ -73,9 +171,13 @@ class RunPodInlineTests(unittest.TestCase):
                 {
                     "1": {"inputs": {"image": "{{ASSET:references/reference.png}}"}},
                     "2": {"inputs": {"filename_prefix": "{{RUNPOD_OUTPUT_PREFIX}}"}},
-                    "3": {"inputs": {"run_tag": "{{RUNPOD_JOB_ID}}"}},
+                    "3": {"inputs": {
+                        "run_tag": "{{RUNPOD_JOB_ID}}",
+                        "mode": "{{RUNPOD_HYBRID_MODE}}",
+                    }},
                 },
                 [decoded],
+                hybrid_mode="sage128",
             )
             self.assertEqual(
                 workflow["1"]["inputs"]["image"],
@@ -83,6 +185,7 @@ class RunPodInlineTests(unittest.TestCase):
             )
             self.assertEqual(workflow["2"]["inputs"]["filename_prefix"], "runpod/job-1/result")
             self.assertEqual(workflow["3"]["inputs"]["run_tag"], "job-1")
+            self.assertEqual(workflow["3"]["inputs"]["mode"], "sage128")
             self.assertEqual(prefix, "runpod/job-1/result")
 
     def test_invalid_asset_base64_is_rejected(self):
@@ -171,7 +274,7 @@ class RunPodInlineTests(unittest.TestCase):
         self.assertEqual(prepared["4"]["class_type"], "SamplerCustomAdvanced")
         self.assertNotIn("enable_preview", prepared["4"]["inputs"])
         self.assertTrue(prepared["5"]["inputs"]["enabled"])
-        self.assertEqual(prepared["5"]["inputs"]["mode"], "portable_sparse")
+        self.assertEqual(prepared["5"]["inputs"]["mode"], "{{RUNPOD_HYBRID_MODE}}")
         self.assertEqual(prepared["5"]["inputs"]["run_tag"], "{{RUNPOD_JOB_ID}}")
         self.assertEqual(prepared["6"]["inputs"]["unet_name"], "model.safetensors")
         self.assertEqual(
@@ -230,6 +333,17 @@ class RunPodInlineTests(unittest.TestCase):
             self.client.safe_asset_name("../secret.png")
         with self.assertRaisesRegex(ValueError, "Invalid asset name"):
             self.handler.safe_asset_name("../secret.png")
+
+    def test_hybrid_mode_uses_fused_qkv_only_on_sm89(self):
+        self.assertEqual(
+            self.handler.hybrid_mode_for_capability((8, 9)),
+            "sage128_fused_qkv",
+        )
+        for capability in ((8, 0), (8, 6), (9, 0), (12, 0)):
+            self.assertEqual(
+                self.handler.hybrid_mode_for_capability(capability),
+                "sage128",
+            )
 
     def test_required_cached_model_set_rejects_a_partial_snapshot(self):
         with tempfile.TemporaryDirectory(prefix="runpod-models-") as root:
