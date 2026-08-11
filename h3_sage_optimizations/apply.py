@@ -2,135 +2,105 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass
 import logging
 
+from .dense_resolver import resolve_dense_attention
+from .environment import RuntimeEnvironment
+from .qkv.formats import inspect_h3_linears
+from .model import get_h3_blocks, is_minimax_h3
 from .patch import configure_backend
 from .plan import (
     ATTENTION_EXISTING,
     FUSED_QKV_OFF,
-    FUSED_QKV_REQUIRED,
     PLAN_KEY,
     STATUS_KEY,
     H3SageOptimizationPlan,
 )
+from .qkv.providers import (
+    MLP_OFF,
+    QKV_DENSE_CONVROT_INT8,
+    QKV_SPARSE_CONVROT_INT8,
+    resolve_mlp_provider,
+    resolve_qkv_provider,
+)
 
 LOG_PREFIX = "[H3 Sage optimizations]"
-ATTENTION_SPARSE = "hybrid_sparse"
+ATTENTION_SPARSE = "sparse_sage"
 
 
-def _imports():
-    try:
-        from ..h3_memory_optimizer.attention import (
-            ATTENTION_EXISTING as CORE_ATTENTION_EXISTING,
-            AttentionDecision,
-            RuntimeEnvironment,
-            resolve_attention,
-        )
-        from ..h3_memory_optimizer.config import (
-            ACTIVATION_OFF,
-            MemoryOptimizerConfig,
-        )
-        from ..h3_memory_optimizer.patch import apply
-    except ImportError:
-        from h3_memory_optimizer.attention import (
-            ATTENTION_EXISTING as CORE_ATTENTION_EXISTING,
-            AttentionDecision,
-            RuntimeEnvironment,
-            resolve_attention,
-        )
-        from h3_memory_optimizer.config import (
-            ACTIVATION_OFF,
-            MemoryOptimizerConfig,
-        )
-        from h3_memory_optimizer.patch import apply
-    return (
-        CORE_ATTENTION_EXISTING,
-        AttentionDecision,
-        RuntimeEnvironment,
-        resolve_attention,
-        ACTIVATION_OFF,
-        MemoryOptimizerConfig,
-        apply,
-    )
+@dataclass(frozen=True)
+class ResolvedAttention:
+    requested: str
+    selected: str
+    backend: object | None
+    reason: str
+    backend_kind: str
+    projector: object | None = None
 
 
 def _fused_request(plan):
     return FUSED_QKV_OFF if plan.memory is None else plan.memory.fused_qkv
 
 
-def _dense_fused_support(decision, environment):
-    if decision.backend is None:
-        return False, "no prepared dense Sage backend was selected"
-    if tuple(environment.capability or ()) != (8, 9):
-        return False, "dense fused QKV currently requires SM89"
-    if getattr(decision.backend, "name", None) != "sage_mem_eff":
-        return False, "the selected dense backend does not consume SM89 carriers"
+def _dense_triton_available():
     try:
         from .dense_fused_qkv import TRITON_AVAILABLE
-    except Exception as exc:
-        return False, "dense fused QKV import failed: %s: %s" % (
-            type(exc).__name__, exc
-        )
-    if not TRITON_AVAILABLE:
-        return False, "Triton is unavailable"
-    return True, "SM89 dense Sage per-thread Q/K carrier"
+    except Exception:
+        return False
+    return bool(TRITON_AVAILABLE)
 
 
-def _resolve_dense(plan, environment, resolve_attention):
-    memory = plan.memory
-    requested = ATTENTION_EXISTING if memory is None else memory.attention
-    decision = resolve_attention(
-        requested=requested,
-        fallback="allow",
-        environment=environment,
-    )
-    fused = _fused_request(plan)
-    if fused == FUSED_QKV_OFF:
-        return decision, "off", "fused QKV was disabled"
-
-    supported, reason = _dense_fused_support(decision, environment)
-    if not supported:
-        if fused == FUSED_QKV_REQUIRED:
-            raise RuntimeError("required fused QKV is unavailable: %s" % reason)
-        return decision, "standard", reason
-
-    from .dense_backend import ProjectedSM89SageBackend
-    from .dense_fused_qkv import DenseFusedQKVProjector
-
-    backend = ProjectedSM89SageBackend(decision.backend)
-    projector = DenseFusedQKVProjector()
-    return (
-        replace(
-            decision,
-            backend=backend,
-            projector=projector,
-            reason="%s; fused QKV: %s" % (decision.reason, reason),
-        ),
-        "dense_per_thread",
-        reason,
-    )
-
-
-def _sparse_fused_support(environment, kernel_spec):
-    if tuple(environment.capability or ()) != (8, 9):
-        return False, "Sparse Sage fused QKV currently requires SM89"
-    if (
-        tuple(kernel_spec.capability) != (8, 9)
-        or int(kernel_spec.q_tile) != 128
-        or int(kernel_spec.kv_tile) != 64
-    ):
-        return False, "the selected Sparse Sage ABI is not SM89 128Q x 64KV"
+def _sparse_triton_available():
     try:
         from ..h3_attention.hybrid.fused_qkv import TRITON_AVAILABLE
     except ImportError:
-        from h3_attention.hybrid.fused_qkv import TRITON_AVAILABLE
-    if not TRITON_AVAILABLE:
-        return False, "Triton is unavailable"
-    return True, "SM89 Sparse Sage block Q/K carrier"
+        try:
+            from h3_attention.hybrid.fused_qkv import TRITON_AVAILABLE
+        except Exception:
+            return False
+    except Exception:
+        return False
+    return bool(TRITON_AVAILABLE)
 
 
-def _resolve_sparse(plan, environment, AttentionDecision):
+def _resolve_dense(plan, environment, inventory):
+    memory = plan.memory
+    requested = (
+        ATTENTION_EXISTING if memory is None else memory.attention
+    )
+    dense = resolve_dense_attention(requested, environment)
+    qkv = resolve_qkv_provider(
+        inventory,
+        request=_fused_request(plan),
+        backend_kind=dense.backend_kind,
+        capability=environment.capability,
+        triton_available=_dense_triton_available(),
+    )
+    backend = dense.backend
+    projector = None
+    if qkv.provider_id == QKV_DENSE_CONVROT_INT8:
+        from .dense_backend import ProjectedSM89SageBackend
+        from .qkv.projectors import DenseFusedQKVProjector
+
+        backend = ProjectedSM89SageBackend(backend)
+        projector = DenseFusedQKVProjector(
+            required=_fused_request(plan) == "required"
+        )
+    return (
+        ResolvedAttention(
+            requested=dense.requested,
+            selected=dense.selected,
+            backend=backend,
+            reason=dense.reason,
+            backend_kind=dense.backend_kind,
+            projector=projector,
+        ),
+        qkv,
+    )
+
+
+def _resolve_sparse(plan, environment, inventory):
     try:
         from ..h3_attention.hybrid import (
             HybridSparseBackend,
@@ -152,161 +122,259 @@ def _resolve_sparse(plan, environment, AttentionDecision):
         cuda_available=lambda: environment.cuda_available,
         capability_getter=lambda: environment.capability,
     )
-    fused = _fused_request(plan)
-    supported, fused_reason = _sparse_fused_support(
-        environment, kernel_spec
+    qkv = resolve_qkv_provider(
+        inventory,
+        request=_fused_request(plan),
+        backend_kind="sparse_sage",
+        capability=environment.capability,
+        triton_available=_sparse_triton_available(),
+        sparse_spec=kernel_spec,
     )
-    use_fused = fused != FUSED_QKV_OFF and supported
-    if fused == FUSED_QKV_REQUIRED and not supported:
-        raise RuntimeError(
-            "required Sparse Sage fused QKV is unavailable: %s" % fused_reason
-        )
-
-    sparse = plan.sparse
+    use_fused = qkv.provider_id == QKV_SPARSE_CONVROT_INT8
     config = HybridSparseConfig(
-        mode=MODE_SAGE128_FUSED_QKV if use_fused else MODE_SAGE128,
-        video_budget=float(sparse.video_budget),
-        density_mode=sparse.density_mode,
+        mode=(
+            MODE_SAGE128_FUSED_QKV
+            if use_fused
+            else MODE_SAGE128
+        ),
+        video_budget=float(plan.sparse.video_budget),
+        density_mode=plan.sparse.density_mode,
         strict=True,
         run_tag="production",
         timing=False,
     )
+    projector = None
     if use_fused:
-        from .sparse_projector import SparseFusedQKVProjector
+        from .qkv.projectors import SparseFusedQKVProjector
 
-        projector = SparseFusedQKVProjector()
-    else:
-        projector = None
+        projector = SparseFusedQKVProjector(
+            required=_fused_request(plan) == "required"
+        )
     backend = HybridSparseBackend(
         config,
         kernel_spec=kernel_spec,
         projector=projector,
     )
-    decision = AttentionDecision(
-        requested=ATTENTION_SPARSE,
-        selected=ATTENTION_SPARSE,
-        backend=backend,
-        adapter=ATTENTION_SPARSE,
-        reason="explicit fixed-density Sparse Sage attention",
-        environment=environment,
-        projector=backend.projector,
+    return (
+        ResolvedAttention(
+            requested=ATTENTION_SPARSE,
+            selected=ATTENTION_SPARSE,
+            backend=backend,
+            reason="explicit fixed-density Sparse Sage attention",
+            backend_kind="sparse_sage",
+            projector=projector,
+        ),
+        qkv,
     )
-    if use_fused:
-        return decision, "sparse_block", fused_reason
-    if fused == FUSED_QKV_OFF:
-        return decision, "off", "fused QKV was disabled"
-    return decision, "standard", fused_reason
 
 
-def _optimizer_config(plan, MemoryOptimizerConfig, ACTIVATION_OFF):
+def _install_mlp(model_patcher, plan, inventory):
     memory = plan.memory
-    return MemoryOptimizerConfig(
-        attention=(
-            ATTENTION_EXISTING if memory is None else memory.attention
-        ),
-        attention_fallback="allow",
-        activation=(
-            ACTIVATION_OFF if memory is None else memory.activation
-        ),
-        chunk_rows=(2048 if memory is None else int(memory.chunk_rows)),
-        prefer_held_weights=(
-            True if memory is None else bool(memory.prefer_held_weights)
-        ),
-        activation_strict=False,
-        adaln_precompute="off",
-        block_cache="off",
-        cuda_async_soft_gc=False,
-        timing=False,
+    if memory is None:
+        return resolve_mlp_provider(inventory, request="off"), 0
+
+    resolution = resolve_mlp_provider(
+        inventory, request=memory.mlp_memory
     )
+    if resolution.provider_id == MLP_OFF:
+        return resolution, 0
+
+    try:
+        from ..h3_activation_memory.config import ActivationMemoryConfig
+        from ..h3_activation_memory.patch import install
+    except ImportError:
+        from h3_activation_memory.config import ActivationMemoryConfig
+        from h3_activation_memory.patch import install
+
+    config = ActivationMemoryConfig(
+        mode=resolution.activation_mode,
+        chunk_rows=int(memory.chunk_rows),
+        strict=False,
+        prefer_held_weights=bool(memory.prefer_held_weights),
+    )
+    return resolution, int(install(model_patcher, config))
 
 
-def _status(plan, decision, qkv_selected, qkv_reason, result):
-    environment = decision.environment
+def _ensure_sparse_runtime(model_patcher, backend):
+    try:
+        from ..h3_runtime.context import (
+            H3RuntimeSession,
+            RUNTIME_SESSION_KEY,
+            install_runtime_wrapper,
+        )
+    except ImportError:
+        from h3_runtime.context import (
+            H3RuntimeSession,
+            RUNTIME_SESSION_KEY,
+            install_runtime_wrapper,
+        )
+
+    options = model_patcher.model_options["transformer_options"] = (
+        model_patcher.model_options.get(
+            "transformer_options", {}
+        ).copy()
+    )
+    session = options.get(RUNTIME_SESSION_KEY)
+    listeners = tuple(
+        listener
+        for listener in getattr(
+            backend, "runtime_listeners", ()
+        )
+        if listener is not None
+    )
+    if session is not None:
+        if not hasattr(session, "add_listener"):
+            raise TypeError(
+                "%s is not an H3 runtime session"
+                % RUNTIME_SESSION_KEY
+            )
+        session.strict_layout = True
+        for listener in listeners:
+            session.add_listener(listener)
+        return session, False
+
+    session = H3RuntimeSession(
+        strict_layout=True,
+        listeners=listeners,
+    )
+    install_runtime_wrapper(model_patcher, session)
+    return session, True
+
+
+def _inventory_status(inventory):
+    return {
+        "qkv": list(inventory.labels("qkv")),
+        "fc1": list(inventory.labels("fc1")),
+        "fc2": list(inventory.labels("fc2")),
+    }
+
+
+def _status(
+    plan,
+    environment,
+    attention,
+    qkv,
+    mlp,
+    *,
+    attention_blocks,
+    mlp_blocks,
+    runtime_installed,
+    inventory,
+):
     return {
         "plan_version": int(plan.version),
         "plan_signature": plan.signature,
         "attention": {
-            "requested": decision.requested,
-            "selected": decision.selected,
-            "reason": decision.reason,
-            "patched_blocks": int(result.attention_blocks),
+            "requested": attention.requested,
+            "selected": attention.selected,
+            "reason": attention.reason,
+            "patched_blocks": int(attention_blocks),
         },
         "fused_qkv": {
             "requested": _fused_request(plan),
-            "selected": qkv_selected,
-            "reason": qkv_reason,
-            "projector": getattr(decision.projector, "name", None),
+            "provider": qkv.provider_id,
+            "fused": bool(qkv.fused),
+            "reason": qkv.reason,
+            "projector": getattr(
+                attention.projector, "name", None
+            ),
         },
-        "mlp": None if plan.memory is None else {
-            "mode": plan.memory.activation,
-            "chunk_rows": int(plan.memory.chunk_rows),
-            "prefer_held_weights": bool(plan.memory.prefer_held_weights),
-            "patched_blocks": int(result.activation_blocks),
+        "mlp": {
+            "requested": (
+                "off"
+                if plan.memory is None
+                else plan.memory.mlp_memory
+            ),
+            "provider": mlp.provider_id,
+            "activation_mode": mlp.activation_mode,
+            "reason": mlp.reason,
+            "chunk_rows": (
+                None
+                if plan.memory is None
+                else int(plan.memory.chunk_rows)
+            ),
+            "patched_blocks": int(mlp_blocks),
         },
-        "sparse": None if plan.sparse is None else {
-            "video_budget": float(plan.sparse.video_budget),
-            "density_mode": plan.sparse.density_mode,
-        },
-        "runtime_installed": bool(result.runtime_installed),
+        "weight_formats": _inventory_status(inventory),
+        "runtime_installed": bool(runtime_installed),
         "device": {
             "name": environment.device_name,
             "architecture": environment.architecture,
             "capability": (
                 None
                 if environment.capability is None
-                else [int(value) for value in environment.capability]
+                else [
+                    int(value)
+                    for value in environment.capability
+                ]
             ),
         },
     }
 
 
 def apply_plan(model, plan: H3SageOptimizationPlan):
-    """Clone a model and reconcile the full plan as one transaction."""
+    """Apply only compatible H3 features; unknown models are exact no-ops."""
 
     if not isinstance(plan, H3SageOptimizationPlan):
         raise TypeError("plan must be H3SageOptimizationPlan")
-    (
-        _core_existing,
-        AttentionDecision,
-        RuntimeEnvironment,
-        resolve_attention,
-        ACTIVATION_OFF,
-        MemoryOptimizerConfig,
-        apply,
-    ) = _imports()
+    if not is_minimax_h3(model):
+        return model
 
+    blocks = get_h3_blocks(model)
+    inventory = inspect_h3_linears(blocks)
     environment = RuntimeEnvironment.detect()
+
     if plan.sparse is not None:
-        decision, qkv_selected, qkv_reason = _resolve_sparse(
-            plan, environment, AttentionDecision
+        attention, qkv = _resolve_sparse(
+            plan, environment, inventory
         )
     else:
-        decision, qkv_selected, qkv_reason = _resolve_dense(
-            plan, environment, resolve_attention
+        attention, qkv = _resolve_dense(
+            plan, environment, inventory
         )
 
-    config = _optimizer_config(plan, MemoryOptimizerConfig, ACTIVATION_OFF)
     patched = model.clone()
-    result = apply(
-        patched,
-        config=config,
-        decision=decision,
-        attention_configurer=configure_backend,
-        pool_policy=None,
+    attention_blocks = 0
+    if attention.backend is not None:
+        _backend, attention_blocks = configure_backend(
+            patched,
+            attention.backend,
+            projector=attention.projector,
+        )
+
+    mlp, mlp_blocks = _install_mlp(
+        patched, plan, inventory
     )
+    runtime_installed = False
+    if plan.sparse is not None:
+        _session, _created = _ensure_sparse_runtime(
+            patched, attention.backend
+        )
+        runtime_installed = True
+
     patched.model_options[PLAN_KEY] = plan
     options = patched.model_options["transformer_options"] = (
-        patched.model_options.get("transformer_options", {}).copy()
+        patched.model_options.get(
+            "transformer_options", {}
+        ).copy()
     )
     options[STATUS_KEY] = _status(
-        plan, decision, qkv_selected, qkv_reason, result
+        plan,
+        environment,
+        attention,
+        qkv,
+        mlp,
+        attention_blocks=attention_blocks,
+        mlp_blocks=mlp_blocks,
+        runtime_installed=runtime_installed,
+        inventory=inventory,
     )
     logging.info(
-        "%s armed: attention=%s fused_qkv=%s mlp=%s device=%s",
+        "%s armed: attention=%s qkv=%s mlp=%s device=%s",
         LOG_PREFIX,
-        decision.selected,
-        qkv_selected,
-        "off" if plan.memory is None else plan.memory.activation,
+        attention.selected,
+        qkv.provider_id,
+        mlp.provider_id,
         environment.device_name,
     )
     return patched

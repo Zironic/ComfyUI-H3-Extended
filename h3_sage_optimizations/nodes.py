@@ -2,27 +2,24 @@
 
 from comfy_api.latest import ComfyExtension, io
 
-try:
-    from ..h3_activation_memory.config import DEFAULT_CHUNK_ROWS, DEFAULT_MODE
-    from ..h3_memory_optimizer.config import ACTIVATION_MODES
-except ImportError:
-    from h3_activation_memory.config import DEFAULT_CHUNK_ROWS, DEFAULT_MODE
-    from h3_memory_optimizer.config import ACTIVATION_MODES
-
 from .apply import apply_plan
 from .plan import (
     ATTENTION_AUTO,
     ATTENTION_EXISTING,
     FUSED_QKV_AUTO,
     FUSED_QKV_OFF,
+    MLP_MEMORY_AUTO,
+    MLP_MEMORY_OFF,
     MemoryRequest,
     SparseRequest,
     read_plan,
 )
 
+DEFAULT_CHUNK_ROWS = 2048
+
 
 class MiniMaxH3SageMemoryOptimizer(io.ComfyNode):
-    """Lossless-oriented dense/fused QKV and MLP execution controls."""
+    """Format-aware fused QKV and MLP memory execution controls."""
 
     @classmethod
     def define_schema(cls):
@@ -31,10 +28,10 @@ class MiniMaxH3SageMemoryOptimizer(io.ComfyNode):
             display_name="MiniMax H3 Sage Memory Optimizer (Zi)",
             category="model/patch/minimax",
             description=(
-                "H3 execution and memory optimizations without sparse routing. "
-                "Fused QKV is selected only when the resolved dense or Sparse "
-                "Sage backend supports its native projected carrier; MLP "
-                "chunking/tiling remains independently configurable."
+                "H3-only memory and execution optimizations. Unknown models "
+                "pass through unchanged. Auto preserves each H3 checkpoint's "
+                "QKV and MLP weight layouts, selecting a specialized fused or "
+                "tiled provider only when that exact format is supported."
             ),
             inputs=[
                 io.Model.Input("model"),
@@ -44,26 +41,30 @@ class MiniMaxH3SageMemoryOptimizer(io.ComfyNode):
                     options=[ATTENTION_AUTO, ATTENTION_EXISTING],
                     default=ATTENTION_AUTO,
                     tooltip=(
-                        "auto selects prepared dense Sage unless a Sparse Sage "
-                        "node is also present. existing preserves incoming dense "
-                        "attention when no Sparse Sage node is present."
+                        "auto selects prepared dense Sage unless Sparse Sage "
+                        "is also present. existing preserves incoming dense "
+                        "attention."
                     ),
                 ),
                 io.Combo.Input(
                     "fused_qkv",
                     options=[FUSED_QKV_AUTO, FUSED_QKV_OFF],
-                    default=FUSED_QKV_OFF,
+                    default=FUSED_QKV_AUTO,
                     tooltip=(
-                        "auto emits the projected-QKV format requested by the "
-                        "resolved attention backend. It is opt-in while dense "
-                        "fused-QKV CUDA parity is being validated; unsupported "
-                        "combinations use the standard H3 projection."
+                        "auto uses a fused provider only when the actual H3 "
+                        "QKV weight format and resolved attention backend are "
+                        "compatible; otherwise it uses standard H3 QKV."
                     ),
                 ),
                 io.Combo.Input(
-                    "mlp_mode",
-                    options=list(ACTIVATION_MODES),
-                    default=DEFAULT_MODE,
+                    "mlp_memory",
+                    options=[MLP_MEMORY_AUTO, MLP_MEMORY_OFF],
+                    default=MLP_MEMORY_AUTO,
+                    tooltip=(
+                        "auto uses ConvRot feature tiling when compatible and "
+                        "otherwise performs generic token chunking through "
+                        "the model's existing Comfy quantized linear format."
+                    ),
                 ),
                 io.Int.Input(
                     "chunk_rows",
@@ -72,7 +73,9 @@ class MiniMaxH3SageMemoryOptimizer(io.ComfyNode):
                     max=65_536,
                     step=256,
                 ),
-                io.Boolean.Input("prefer_held_weights", default=True),
+                io.Boolean.Input(
+                    "prefer_held_weights", default=True
+                ),
             ],
             outputs=[io.Model.Output()],
         )
@@ -83,8 +86,8 @@ class MiniMaxH3SageMemoryOptimizer(io.ComfyNode):
         model,
         enabled=True,
         attention=ATTENTION_AUTO,
-        fused_qkv=FUSED_QKV_OFF,
-        mlp_mode=DEFAULT_MODE,
+        fused_qkv=FUSED_QKV_AUTO,
+        mlp_memory=MLP_MEMORY_AUTO,
         chunk_rows=DEFAULT_CHUNK_ROWS,
         prefer_held_weights=True,
     ):
@@ -94,9 +97,11 @@ class MiniMaxH3SageMemoryOptimizer(io.ComfyNode):
             MemoryRequest(
                 attention=attention,
                 fused_qkv=fused_qkv,
-                activation=mlp_mode,
+                mlp_memory=mlp_memory,
                 chunk_rows=int(chunk_rows),
-                prefer_held_weights=bool(prefer_held_weights),
+                prefer_held_weights=bool(
+                    prefer_held_weights
+                ),
             )
         )
         return io.NodeOutput(apply_plan(model, plan))
@@ -112,9 +117,10 @@ class MiniMaxH3SparseSageAttention(io.ComfyNode):
             display_name="MiniMax H3 Sparse Sage Attention (Zi)",
             category="model/patch/minimax",
             description=(
-                "Approximate H3 acceleration through fixed-density Sparse Sage. "
-                "All non-video context and mixed boundary tiles remain dense; "
-                "video_budget controls retained pure target-video KV tiles."
+                "H3-only fixed-density Sparse Sage attention. Unknown models "
+                "pass through unchanged. Non-video context and mixed boundary "
+                "tiles remain dense; video_budget controls retained pure "
+                "target-video KV tiles."
             ),
             inputs=[
                 io.Model.Input("model"),
@@ -135,7 +141,9 @@ class MiniMaxH3SparseSageAttention(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model, enabled=True, video_budget=0.5):
+    def execute(
+        cls, model, enabled=True, video_budget=0.5
+    ):
         if not enabled:
             return io.NodeOutput(model)
         plan = read_plan(model).with_sparse(

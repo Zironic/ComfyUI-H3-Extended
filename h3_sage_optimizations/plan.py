@@ -7,7 +7,7 @@ import math
 
 PLAN_KEY = "minimax_h3_sage_optimization_plan"
 STATUS_KEY = "minimax_h3_sage_optimization_status"
-PLAN_VERSION = 1
+PLAN_VERSION = 2
 
 ATTENTION_AUTO = "auto"
 ATTENTION_EXISTING = "existing"
@@ -18,6 +18,10 @@ FUSED_QKV_OFF = "off"
 FUSED_QKV_REQUIRED = "required"
 FUSED_QKV_REQUESTS = (FUSED_QKV_AUTO, FUSED_QKV_OFF, FUSED_QKV_REQUIRED)
 
+MLP_MEMORY_AUTO = "auto"
+MLP_MEMORY_OFF = "off"
+MLP_MEMORY_REQUESTS = (MLP_MEMORY_AUTO, MLP_MEMORY_OFF)
+
 DENSITY_FIXED = "fixed"
 
 
@@ -26,8 +30,8 @@ class MemoryRequest:
     """Execution/memory options owned by the Memory Optimizer node."""
 
     attention: str = ATTENTION_AUTO
-    fused_qkv: str = FUSED_QKV_OFF
-    activation: str = "mlp_chunked_native"
+    fused_qkv: str = FUSED_QKV_AUTO
+    mlp_memory: str = MLP_MEMORY_AUTO
     chunk_rows: int = 2048
     prefer_held_weights: bool = True
 
@@ -36,17 +40,17 @@ class MemoryRequest:
             raise ValueError("unknown H3 Sage attention request %r" % self.attention)
         if self.fused_qkv not in FUSED_QKV_REQUESTS:
             raise ValueError("unknown fused QKV request %r" % self.fused_qkv)
+        if self.mlp_memory not in MLP_MEMORY_REQUESTS:
+            raise ValueError("unknown MLP memory request %r" % self.mlp_memory)
         if int(self.chunk_rows) <= 0:
             raise ValueError("chunk_rows must be positive")
-        if not str(self.activation).strip():
-            raise ValueError("activation mode must not be empty")
 
     @property
     def signature(self):
         return (
             self.attention,
             self.fused_qkv,
-            self.activation,
+            self.mlp_memory,
             int(self.chunk_rows),
             bool(self.prefer_held_weights),
         )

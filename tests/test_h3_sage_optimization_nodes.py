@@ -44,16 +44,23 @@ def main():
             "enabled",
             "attention",
             "fused_qkv",
-            "mlp_mode",
+            "mlp_memory",
             "chunk_rows",
             "prefer_held_weights",
         ],
-        "memory optimizer contains only dense/fused/MLP controls",
+        "memory optimizer exposes format-neutral controls",
     )
-    fused = next(item for item in memory.inputs if item.id == "fused_qkv")
+    fused = next(
+        item for item in memory.inputs
+        if item.id == "fused_qkv"
+    )
+    mlp = next(
+        item for item in memory.inputs
+        if item.id == "mlp_memory"
+    )
     check(
-        fused.default == "off",
-        "fused QKV remains opt-in until dense CUDA parity is validated",
+        fused.default == "auto" and mlp.default == "auto",
+        "safe format-aware selection is the production default",
     )
     check(
         sparse.node_id == "MiniMaxH3SparseSageAttentionZi",
@@ -66,12 +73,16 @@ def main():
 
     marker = object()
     check(
-        MiniMaxH3SageMemoryOptimizer.execute(marker, enabled=False).args[0]
+        MiniMaxH3SageMemoryOptimizer.execute(
+            marker, enabled=False
+        ).args[0]
         is marker,
         "disabled memory optimizer is an exact pass-through",
     )
     check(
-        MiniMaxH3SparseSageAttention.execute(marker, enabled=False).args[0]
+        MiniMaxH3SparseSageAttention.execute(
+            marker, enabled=False
+        ).args[0]
         is marker,
         "disabled Sparse Sage is an exact pass-through",
     )
