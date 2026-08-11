@@ -158,26 +158,67 @@ def main():
         _, count = configure_backend(
             patcher,
             sparse,
-            projector=sparse_projector,Bˆ
-BˆÚXÚÊˆÛİ[OHËˆ˜H]\ˆ›ÙH™XÛÛ˜Ú[\ÈHÛÛ\]H˜XÚÙ[™˜[œØXİ[Ûˆ‹ˆ
-BˆÚXÚÊˆÂˆÙ]]Šˆ]Ú\‹›Øš™XİÜ]Ú\ÖÚÙ^WÙ›ÜŠ[™^
-WKˆÔ’QÒSSÓPT’ÑT‹ˆ
-Bˆ›Üˆ[™^[ˆ˜[™ÙJÊBˆBˆOHÜšYÚ[˜[Ëˆœ™XÛÛ˜Ú[X][Ûˆ™\Ù\™\È™X[ÜšYÚ[˜[›ÜØ\™È‹ˆ
-BˆÚYÛ˜]\™\ÈHÂˆÙ]]Šˆ]Ú\‹›Øš™XİÜ]Ú\ÖÚÙ^WÙ›ÜŠ[™^
-WKˆÒQÓUT‘WÓPT’ÑT‹ˆ
-Bˆ›Üˆ[™^[ˆ˜[™ÙJÊBˆBˆÚXÚÊˆ[ŠÚYÛ˜]\™\ÊHOHKˆ™]™\H^Y\ˆØ\œšY\ÈÛ™H™\ÛÛ™YÚYÛ˜]\™H‹ˆ
-B‚ˆËÛİ[HÛÛ™šYİ\™WØ˜XÚÙ[™
-ˆ]Ú\‹ˆÜ\œÙKˆ›Ú™XİÜ\Ü\œÙWÜ›Ú™XİÜ‹ˆ
-BˆÚXÚÊˆÛİ[OHˆœ™X\Z[™ÈHØ[YH˜XÚÙ[™\ÈY[\İ[‹ˆ
-B‚ˆ›Ü™ZYÛˆH˜ZÙT]Ú\Š
-Bˆ›Ü™ZYÛ‹›Øš™XİÜ]Ú\ÖÚÙ^WÙ›ÜŠ
-WHH
-ˆ[X™H
-˜\™ÜÎˆ›Û™Bˆ
-BˆN‚ˆÛÛ™šYİ\™WØ˜XÚÙ[™
-ˆ›Ü™ZYÛ‹ˆ[œÙKˆ›Ú™XİÜY[œÙWÜ›Ú™XİÜ‹ˆ
-Bˆ^Ù\ÔØYÙT]Ú\œ›Üˆ\È^Î‚ˆÚXÚÊˆ˜[›İ\ˆ]Ú[™XYHİÛœÈˆ[ˆİŠ^ÊKˆ™›Ü™ZYÛˆİÛ™\œÚ\˜Z[È™Y›Ü™H]]][Ûˆ‹ˆ
-Bˆ[ÙN‚ˆ˜Z\ÙH\ÜÙ\[Û‘\œ›ÜŠˆ™›Ü™ZYÛˆ][[ÛˆİÛ™\œÚ\]\İ˜Z[‚ˆ
-B‚ˆš[
-—˜[ÈØYÙH][[Ûˆ™XÛÛ˜Ú[X][Ûˆ\İÈ\ÜÙYŠB‚‚šYˆ×Û˜[YW×ÈOH—×ÛXZ[—×È‚ˆXZ[Š
-B
+            projector=sparse_projector,
+        )
+        check(
+            count == 3,
+            "a later node reconciles the complete backend transaction",
+        )
+        check(
+            [
+                getattr(
+                    patcher.object_patches[key_for(index)],
+                    ORIGINAL_MARKER,
+                )
+                for index in range(3)
+            ]
+            == originals,
+            "reconciliation preserves real original forwards",
+        )
+        signatures = {
+            getattr(
+                patcher.object_patches[key_for(index)],
+                SIGNATURE_MARKER,
+            )
+            for index in range(3)
+        }
+        check(
+            len(signatures) == 1,
+            "every layer carries one resolved signature",
+        )
+
+        _, count = configure_backend(
+            patcher,
+            sparse,
+            projector=sparse_projector,
+        )
+        check(
+            count == 0,
+            "reapplying the same backend is idempotent",
+        )
+
+        foreign = FakePatcher()
+        foreign.object_patches[key_for(0)] = (
+            lambda *args: None
+        )
+        try:
+            configure_backend(
+                foreign,
+                dense,
+                projector=dense_projector,
+            )
+        except H3SagePatchError as exc:
+            check(
+                "another patch already owns" in str(exc),
+                "foreign ownership fails before mutation",
+            )
+        else:
+            raise AssertionError(
+                "foreign attention ownership must fail"
+            )
+
+    print("\nall H3 Sage attention reconciliation tests passed")
+
+
+if __name__ == "__main__":
+    main()

@@ -62,7 +62,8 @@ def run(base, first_request, second_request):
         second_plan = second_plan.with_memory(second_request)
     else:
         second_plan = second_plan.with_sparse(second_request)
-    return apply_module.apply_plan(first, second_plan)J
+    return apply_module.apply_plan(first, second_plan)
+
 
 def main():
     memory = MemoryRequest()
