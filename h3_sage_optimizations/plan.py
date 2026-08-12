@@ -23,12 +23,13 @@ MLP_MEMORY_AUTO = "auto"
 MLP_MEMORY_EPILOGUE = "epilogue_prototype"
 MLP_MEMORY_OFF = "off"
 
-# Internal values used by explicit advanced controls and the monolithic
-# experimental node. They retain the established activation-memory semantics
-# without making weight-layout names part of the ordinary production UI.
+# Internal values used by explicit advanced controls. They retain established
+# activation-memory semantics without putting kernel/layout names in the main
+# production selector.
 MLP_MEMORY_LEGACY_BF16 = "legacy_bf16"
 MLP_MEMORY_LEGACY_NATIVE = "legacy_native"
 MLP_MEMORY_LEGACY_CONVROT_REQUIRED = "legacy_convrot_2slice_required"
+MLP_MEMORY_STRICT_AUTO = "strict_auto"
 MLP_MEMORY_STRICT_BF16 = "strict_bf16"
 MLP_MEMORY_STRICT_NATIVE = "strict_native"
 
@@ -39,6 +40,7 @@ MLP_MEMORY_REQUESTS = (
     MLP_MEMORY_LEGACY_BF16,
     MLP_MEMORY_LEGACY_NATIVE,
     MLP_MEMORY_LEGACY_CONVROT_REQUIRED,
+    MLP_MEMORY_STRICT_AUTO,
     MLP_MEMORY_STRICT_BF16,
     MLP_MEMORY_STRICT_NATIVE,
 )
@@ -81,7 +83,9 @@ class MemoryRequest:
         if bool(self.strict):
             if self.fused_qkv == FUSED_QKV_AUTO:
                 object.__setattr__(self, "fused_qkv", FUSED_QKV_REQUIRED)
-            if self.mlp_memory == MLP_MEMORY_LEGACY_BF16:
+            if self.mlp_memory == MLP_MEMORY_AUTO:
+                object.__setattr__(self, "mlp_memory", MLP_MEMORY_STRICT_AUTO)
+            elif self.mlp_memory == MLP_MEMORY_LEGACY_BF16:
                 object.__setattr__(self, "mlp_memory", MLP_MEMORY_STRICT_BF16)
             elif self.mlp_memory == MLP_MEMORY_LEGACY_NATIVE:
                 object.__setattr__(self, "mlp_memory", MLP_MEMORY_STRICT_NATIVE)
