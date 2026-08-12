@@ -5,7 +5,13 @@ from dataclasses import dataclass
 MODE_BF16 = "mlp_chunked_bf16"
 MODE_NATIVE = "mlp_chunked_native"
 MODE_CONVROT_2SLICE = "mlp_chunked_convrot_2slice"
-MODES = (MODE_BF16, MODE_NATIVE, MODE_CONVROT_2SLICE)
+MODE_CONVROT_EPILOGUE = "mlp_chunked_convrot_epilogue"
+MODES = (
+    MODE_BF16,
+    MODE_NATIVE,
+    MODE_CONVROT_2SLICE,
+    MODE_CONVROT_EPILOGUE,
+)
 IMPLEMENTED_MODES = frozenset(MODES)
 DEFAULT_MODE = MODE_NATIVE
 
@@ -25,6 +31,9 @@ class ActivationMemoryConfig:
     available, and otherwise follows Comfy's eager fallback.
     ``mlp_chunked_convrot_2slice`` requires H3's BF16 ConvRot-256 weights and
     evaluates the FFN as two prepacked feature slices.
+    ``mlp_chunked_convrot_epilogue`` is the experimental two-slice path whose
+    fc1 kernel stores the activated SwiGLU carrier and whose fc2 kernel applies
+    the gate while accumulating directly into the residual tensor.
     """
 
     mode: str = DEFAULT_MODE
@@ -61,6 +70,10 @@ class ActivationMemoryConfig:
     @property
     def convrot_2slice(self):
         return self.mode == MODE_CONVROT_2SLICE
+
+    @property
+    def convrot_epilogue(self):
+        return self.mode == MODE_CONVROT_EPILOGUE
 
     @property
     def signature(self):

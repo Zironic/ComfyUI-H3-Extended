@@ -37,6 +37,7 @@ from .h3_chipmunk.nodes import MiniMaxH3ChipmunkExtension
 from .h3_masked_cache.nodes import MiniMaxH3MaskedCacheExtension
 from .h3_memory_optimizer.nodes import MiniMaxH3MemoryOptimizerExtension
 from .h3_probe.nodes import MiniMaxH3ProbeExtension
+from .h3_sage_optimizations.nodes import MiniMaxH3SageOptimizationsExtension
 from .h3_sparse_attention.nodes import MiniMaxH3HybridSparseAttentionExtension
 from .h3_vector_accel.nodes import MiniMaxH3VectorAccelExtension
 
@@ -67,6 +68,8 @@ NODE_CATEGORIES = {
     "MiniMaxH3ChipmunkMLPZi": "H3-Extender/Experiments",
     "MiniMaxH3MaskedRef2VCacheZi": "H3-Extender/Model Patches",
     "MiniMaxH3MemoryOptimizerZi": "H3-Extender/Model Patches",
+    "MiniMaxH3SageMemoryOptimizerZi": "H3-Extender/Model Patches",
+    "MiniMaxH3SparseSageAttentionZi": "H3-Extender/Model Patches",
     "MiniMaxH3SolEngineZi": "H3-Extender/Experiments",
     "MiniMaxH3HybridSparseAttentionZi": "H3-Extender/Experiments",
     "MiniMaxH3AttentionProbeZi": "H3-Extender/Diagnostics",
@@ -121,6 +124,7 @@ class H3ExtendedExtension(ComfyExtension):
             MiniMaxH3ActivationMemoryExtension(),
             MiniMaxH3ChipmunkExtension(),
             MiniMaxH3MemoryOptimizerExtension(),
+            MiniMaxH3SageOptimizationsExtension(),
             MiniMaxH3HybridSparseAttentionExtension(),
             MiniMaxH3VectorAccelExtension(),
             MiniMaxH3DiagnosticsExtension(),

@@ -7,6 +7,7 @@ import torch
 import comfy.model_management
 
 from .chunks import iter_mod_chunks, validate_mod_segments
+from .convrot_epilogue import ConvRotEpilogueMLP
 from .linear import (
     ConvRotTwoSliceMLP,
     HeldMLP,
@@ -34,17 +35,37 @@ def _gate_add(x, other, gate):
     return x.addcmul_(other, gate.to(x.dtype))
 
 
-def make_forward(block, layer_index, config, original_forward=None):
-    """Build an unbound replacement for one ``DiTBlock.forward``.
+def _open_generic_held(block, x, config):
+    if not config.prefer_held_weights:
+        return None, None
+    try:
+        held = HeldMLP(block.mlp, x[:1])
+        held.__enter__()
+        return held, None
+    except UnsafeHeldWeights as exc:
+        return None, str(exc)
+    except Exception as exc:
+        if config.strict:
+            raise
+        return None, "%s: %s" % (type(exc).__name__, exc)
 
-    ``ModelPatcher.add_object_patch`` installs this function on the instance, so
-    the block is closed over rather than received as ``self``.
-    """
+
+def make_forward(block, layer_index, config, original_forward=None):
+    """Build an unbound replacement for one ``DiTBlock.forward``."""
+
     original_forward = original_forward or block.forward
-    if config.convrot_2slice and isinstance(block.mlp, torch.nn.Module):
+    if (
+        config.convrot_2slice or config.convrot_epilogue
+    ) and isinstance(block.mlp, torch.nn.Module):
         bind_convrot_mlp(block.mlp)
 
-    def _forward(x, t_emb, mod_segments, rope_freqs, transformer_options={}):
+    def _forward(
+        x,
+        t_emb,
+        mod_segments,
+        rope_freqs,
+        transformer_options={},
+    ):
         if comfy.model_management.in_training:
             raise RuntimeError(
                 "h3_activation_memory is inference-only; training requires "
@@ -61,10 +82,14 @@ def make_forward(block, layer_index, config, original_forward=None):
             gate_mlp,
         ) = shifts
         segments = validate_mod_segments(
-            mod_segments, x.shape[0], mod_rows=shift_msa.shape[0]
+            mod_segments,
+            x.shape[0],
+            mod_rows=shift_msa.shape[0],
         )
-        stats = None if torch.compiler.is_compiling() else get_stats(
-            transformer_options, config
+        stats = (
+            None
+            if torch.compiler.is_compiling()
+            else get_stats(transformer_options, config)
         )
         if stats is not None:
             stats.blocks += 1
@@ -80,7 +105,11 @@ def make_forward(block, layer_index, config, original_forward=None):
         with timed_stage(transformer_options, "norm1_modulation"):
             h = block.norm1(x)
             for start, stop, row in segments:
-                _scale_shift(h[start:stop], shift_msa[row], scale_msa[row])
+                _scale_shift(
+                    h[start:stop],
+                    shift_msa[row],
+                    scale_msa[row],
+                )
         notify_activation(
             "attention_norm_ready",
             layer_index,
@@ -98,9 +127,15 @@ def make_forward(block, layer_index, config, original_forward=None):
             transformer_options,
             shape=tuple(attn_out.shape),
         )
-        with timed_stage(transformer_options, "attention_residual_gate"):
+        with timed_stage(
+            transformer_options, "attention_residual_gate"
+        ):
             for start, stop, row in segments:
-                _gate_add(x[start:stop], attn_out[start:stop], gate_msa[row])
+                _gate_add(
+                    x[start:stop],
+                    attn_out[start:stop],
+                    gate_msa[row],
+                )
         del h, attn_out
         notify_activation(
             "attention_gated", layer_index, transformer_options
@@ -118,31 +153,62 @@ def make_forward(block, layer_index, config, original_forward=None):
 
         held = None
         held_error = None
-        if config.convrot_2slice:
-            held = ConvRotTwoSliceMLP(block.mlp, x[:1])
-            held.__enter__()
-            if stats is not None:
-                stats.held_sessions += 1
-        elif config.prefer_held_weights:
+        use_convrot = False
+        use_epilogue = False
+        if config.convrot_epilogue:
             try:
-                held = HeldMLP(block.mlp, x[:1])
+                held = ConvRotEpilogueMLP(block.mlp, x[:1])
                 held.__enter__()
-                if stats is not None:
-                    stats.held_sessions += 1
-            except UnsafeHeldWeights as exc:
-                held_error = str(exc)
-                held = None
+                use_epilogue = True
             except Exception as exc:
                 held = None
                 if config.strict:
                     raise
-                held_error = "%s: %s" % (type(exc).__name__, exc)
+                held_error = "%s: %s" % (
+                    type(exc).__name__,
+                    exc,
+                )
+                held, generic_error = _open_generic_held(
+                    block, x, config
+                )
+                if generic_error is not None:
+                    held_error = (
+                        "%s; generic held fallback unavailable: %s"
+                        % (held_error, generic_error)
+                    )
+        elif config.convrot_2slice:
+            try:
+                held = ConvRotTwoSliceMLP(block.mlp, x[:1])
+                held.__enter__()
+                use_convrot = True
+            except Exception as exc:
+                held = None
+                if config.strict:
+                    raise
+                held_error = "%s: %s" % (
+                    type(exc).__name__,
+                    exc,
+                )
+                held, generic_error = _open_generic_held(
+                    block, x, config
+                )
+                if generic_error is not None:
+                    held_error = (
+                        "%s; generic held fallback unavailable: %s"
+                        % (held_error, generic_error)
+                    )
+        else:
+            held, held_error = _open_generic_held(
+                block, x, config
+            )
 
+        if held is not None and stats is not None:
+            stats.held_sessions += 1
         if held_error is not None:
             if stats is not None:
                 stats.record_fallback(held_error)
             logging.warning(
-                "%s block %d using ordinary module calls: %s",
+                "%s block %d selected a format-compatible fallback: %s",
                 LOG_PREFIX,
                 layer_index,
                 held_error,
@@ -161,14 +227,49 @@ def make_forward(block, layer_index, config, original_forward=None):
                     stop=chunk.stop,
                     mod_row=chunk.mod_row,
                 )
-                with timed_stage(transformer_options, "norm2_modulation"):
-                    h = block.norm2(x[chunk.start : chunk.stop])
+                with timed_stage(
+                    transformer_options, "norm2_modulation"
+                ):
+                    h = block.norm2(
+                        x[chunk.start : chunk.stop]
+                    )
                     _scale_shift(
-                        h, shift_mlp[chunk.mod_row], scale_mlp[chunk.mod_row]
+                        h,
+                        shift_mlp[chunk.mod_row],
+                        scale_mlp[chunk.mod_row],
                     )
 
+                if use_epilogue:
+                    residual = x[chunk.start : chunk.stop]
+                    path = held.fc1_swiglu_fc2_gated_(
+                        h,
+                        residual,
+                        gate_mlp[chunk.mod_row],
+                        stage_factory=lambda name: timed_stage(
+                            transformer_options, name
+                        ),
+                    )
+                    if stats is not None:
+                        stats.record_path(path)
+                    notify_activation(
+                        "mlp_epilogue_residual_ready",
+                        layer_index,
+                        transformer_options,
+                        chunk_index=chunk_index,
+                        path=path,
+                        output_shape=tuple(residual.shape),
+                    )
+                    del h, residual
+                    notify_activation(
+                        "mlp_chunk_gated",
+                        layer_index,
+                        transformer_options,
+                        chunk_index=chunk_index,
+                    )
+                    continue
+
                 expanded = None
-                if config.convrot_2slice:
+                if use_convrot:
                     out, path = held.fc1_fc2(
                         h,
                         stage_factory=lambda name: timed_stage(
@@ -176,18 +277,29 @@ def make_forward(block, layer_index, config, original_forward=None):
                         ),
                     )
                 elif held is not None:
-                    with timed_stage(transformer_options, "mlp_fc1"):
+                    with timed_stage(
+                        transformer_options, "mlp_fc1"
+                    ):
                         expanded = held.fc1(h)
-                    with timed_stage(transformer_options, "mlp_swiglu_fc2"):
+                    with timed_stage(
+                        transformer_options, "mlp_swiglu_fc2"
+                    ):
                         out, path = held.fc2_swiglu(
-                            expanded, native=config.native_swiglu
+                            expanded,
+                            native=config.native_swiglu,
                         )
                 else:
-                    with timed_stage(transformer_options, "mlp_fc1"):
+                    with timed_stage(
+                        transformer_options, "mlp_fc1"
+                    ):
                         expanded = module_fc1(block.mlp, h)
-                    with timed_stage(transformer_options, "mlp_swiglu_fc2"):
+                    with timed_stage(
+                        transformer_options, "mlp_swiglu_fc2"
+                    ):
                         out, path = module_swiglu_fc2(
-                            block.mlp, expanded, native=config.native_swiglu
+                            block.mlp,
+                            expanded,
+                            native=config.native_swiglu,
                         )
 
                 if stats is not None:
@@ -200,7 +312,9 @@ def make_forward(block, layer_index, config, original_forward=None):
                     path=path,
                     output_shape=tuple(out.shape),
                 )
-                with timed_stage(transformer_options, "final_mlp_gate"):
+                with timed_stage(
+                    transformer_options, "final_mlp_gate"
+                ):
                     _gate_add(
                         x[chunk.start : chunk.stop],
                         out,
@@ -225,10 +339,19 @@ def make_forward(block, layer_index, config, original_forward=None):
         )
         return x
 
-    def forward(x, t_emb, mod_segments, rope_freqs, transformer_options={}):
+    def forward(
+        x,
+        t_emb,
+        mod_segments,
+        rope_freqs,
+        transformer_options={},
+    ):
         with timed_stage(transformer_options, "total_dit_block"):
             return _forward(
-                x, t_emb, mod_segments, rope_freqs,
+                x,
+                t_emb,
+                mod_segments,
+                rope_freqs,
                 transformer_options=transformer_options,
             )
 
