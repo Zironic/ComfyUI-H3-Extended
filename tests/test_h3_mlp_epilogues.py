@@ -16,6 +16,8 @@ from h3_activation_memory.config import (  # noqa: E402
 )
 from h3_activation_memory.convrot_epilogue import (  # noqa: E402
     ConvRotEpilogueMLP,
+    convrot_epilogue_launch_policy,
+    convrot_fc1_swiglu,
 )
 from h3_sage_optimizations.plan import (  # noqa: E402
     MLP_MEMORY_EPILOGUE,
@@ -83,6 +85,33 @@ def test_provider_and_config():
         raise AssertionError("epilogue prototype accepted incompatible weights")
 
 
+def test_epilogue_launch_policy():
+    check(
+        convrot_epilogue_launch_policy(64)
+        == {
+            "BLOCK_M": 64,
+            "BLOCK_N": 64,
+            "BLOCK_K": 64,
+            "GROUP_M": 8,
+            "num_warps": 8,
+            "num_stages": 3,
+        },
+        "large-row epilogue launch policy is fixed",
+    )
+    check(
+        convrot_epilogue_launch_policy(63)
+        == {
+            "BLOCK_M": 32,
+            "BLOCK_N": 64,
+            "BLOCK_K": 64,
+            "GROUP_M": 8,
+            "num_warps": 4,
+            "num_stages": 3,
+        },
+        "short-row epilogue launch policy is fixed",
+    )
+
+
 def test_two_slice_epilogue_execution_contract():
     h = torch.tensor(
         [[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32
@@ -112,6 +141,7 @@ def test_two_slice_epilogue_execution_contract():
         },
     )
     calls = []
+    stages = []
 
     def fake_fc1(value, weight, scale):
         calls.append(("fc1", float(weight)))
@@ -125,6 +155,7 @@ def test_two_slice_epilogue_execution_contract():
 
     session = object.__new__(ConvRotEpilogueMLP)
     session.tiles = tiles
+    session.shared_fc1_carrier = False
     session.fc1_swiglu = fake_fc1
     session.fc2_gated_residual = fake_fc2
 
@@ -139,7 +170,7 @@ def test_two_slice_epilogue_execution_contract():
             h,
             residual,
             gate,
-            stage_factory=lambda _name: nullcontext(),
+            stage_factory=lambda name: (stages.append(name), nullcontext())[1],
         )
 
     check(
@@ -159,12 +190,98 @@ def test_two_slice_epilogue_execution_contract():
         torch.equal(residual, expected),
         "fc2 accumulates gated partials directly into the residual",
     )
+    check(
+        stages == [
+            "mlp_fc1",
+            "mlp_swiglu_fc2",
+            "mlp_fc1",
+            "mlp_swiglu_fc2",
+        ],
+        "epilogue stage names remain stable",
+    )
+
+
+def test_default_shared_fc1_carrier_execution():
+    h = torch.tensor(
+        [[1.0, 2.0], [3.0, 4.0]], dtype=torch.bfloat16
+    )
+    residual = torch.zeros((2, 2), dtype=torch.bfloat16)
+    gate = torch.tensor([0.5, 2.0], dtype=torch.bfloat16)
+    tiles = (
+        {
+            "fc1_weight": torch.tensor(1.0),
+            "fc1_scale": torch.tensor(1.0),
+            "fc2_weight": torch.eye(2, dtype=torch.bfloat16),
+            "fc2_scale": torch.tensor(1.0),
+        },
+        {
+            "fc1_weight": torch.tensor(2.0),
+            "fc1_scale": torch.tensor(1.0),
+            "fc2_weight": torch.eye(2, dtype=torch.bfloat16),
+            "fc2_scale": torch.tensor(1.0),
+        },
+    )
+    calls = []
+    stages = []
+
+    def fake_quantize(value):
+        calls.append("quantize")
+        return value.to(torch.int8), torch.ones(value.shape[0])
+
+    def fake_fc1_tensor(value, weight, scale, weight_scale):
+        calls.append(("fc1_tensor", float(weight)))
+        return (value.float() * float(weight)).to(torch.bfloat16)
+
+    def fake_fc2(value, weight, scale, destination, current_gate):
+        calls.append("fc2")
+        destination.add_((value @ weight.transpose(0, 1)) * current_gate)
+        return destination
+
+    session = object.__new__(ConvRotEpilogueMLP)
+    session.tiles = tiles
+    session.shared_fc1_carrier = True
+    session.fc1_swiglu = convrot_fc1_swiglu
+    session.fc1_quantize = fake_quantize
+    session.fc1_swiglu_tensor = fake_fc1_tensor
+    session.fc2_gated_residual = fake_fc2
+
+    with mock.patch("comfy.ops.run_every_op"):
+        path = session.fc1_swiglu_fc2_gated_(
+            h,
+            residual,
+            gate,
+            stage_factory=lambda name: (
+                stages.append(name),
+                nullcontext(),
+            )[1],
+        )
+
+    expected = torch.tensor(
+        [[1.5, 12.0], [4.5, 24.0]], dtype=torch.bfloat16
+    )
+    check(
+        calls == ["quantize", ("fc1_tensor", 1.0), "fc2", ("fc1_tensor", 2.0), "fc2"],
+        "default path quantizes FC1 once and executes tensor-only FC1 per tile",
+    )
+    check(torch.equal(residual, expected), "shared-carrier residual math is correct")
+    check(path == "held_convrot_epilogue_prototype", "optimized path label is stable")
+    check(
+        stages == [
+            "mlp_fc1",
+            "mlp_swiglu_fc2",
+            "mlp_fc1",
+            "mlp_swiglu_fc2",
+        ],
+        "optimized path keeps the existing stage order",
+    )
 
 
 def main():
     print("H3 ConvRot MLP epilogue prototype")
     test_provider_and_config()
+    test_epilogue_launch_policy()
     test_two_slice_epilogue_execution_contract()
+    test_default_shared_fc1_carrier_execution()
     print("\nall H3 MLP epilogue CPU contracts passed")
 
 

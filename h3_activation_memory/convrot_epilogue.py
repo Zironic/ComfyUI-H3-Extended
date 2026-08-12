@@ -35,6 +35,25 @@ class ConvRotEpilogueError(RuntimeError):
     pass
 
 
+def convrot_epilogue_launch_policy(rows):
+    """Return the fixed launch policy selected for an epilogue row count."""
+
+    if int(rows) >= 64:
+        block_m = 64
+        num_warps = 8
+    else:
+        block_m = 32
+        num_warps = 4
+    return {
+        "BLOCK_M": block_m,
+        "BLOCK_N": 64,
+        "BLOCK_K": 64,
+        "GROUP_M": 8,
+        "num_warps": num_warps,
+        "num_stages": 3,
+    }
+
+
 def _validate_scale(scale, rows, name, device=None):
     if not torch.is_tensor(scale) or scale.dtype != torch.float32:
         raise ConvRotEpilogueError("%s scale must be a float32 tensor" % name)
@@ -96,9 +115,17 @@ if TRITON_AVAILABLE:
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
+        GROUP_M: tl.constexpr,
     ):
-        pid_m = tl.program_id(0)
-        pid_n = tl.program_id(1)
+        pid = tl.program_id(0)
+        num_pid_m = tl.cdiv(M, BLOCK_M)
+        num_pid_n = tl.cdiv(N, BLOCK_N)
+        num_pid_in_group = GROUP_M * num_pid_n
+        group_id = pid // num_pid_in_group
+        first_pid_m = group_id * GROUP_M
+        group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
+        pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+        pid_n = (pid % num_pid_in_group) // group_size_m
         rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
         cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
         row_mask = rows < M
@@ -203,9 +230,17 @@ if TRITON_AVAILABLE:
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
+        GROUP_M: tl.constexpr,
     ):
-        pid_m = tl.program_id(0)
-        pid_n = tl.program_id(1)
+        pid = tl.program_id(0)
+        num_pid_m = tl.cdiv(M, BLOCK_M)
+        num_pid_n = tl.cdiv(N, BLOCK_N)
+        num_pid_in_group = GROUP_M * num_pid_n
+        group_id = pid // num_pid_in_group
+        first_pid_m = group_id * GROUP_M
+        group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
+        pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+        pid_n = (pid % num_pid_in_group) // group_size_m
         rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
         cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
         row_mask = rows < M
@@ -324,11 +359,10 @@ def convrot_fc1_swiglu_tensor_core(
     output = torch.empty(
         (m, n), dtype=output_dtype, device=x_int8.device
     )
-    block_m = 32
-    block_n = 64
+    launch = convrot_epilogue_launch_policy(m)
     grid = (
-        triton.cdiv(m, block_m),
-        triton.cdiv(n, block_n),
+        triton.cdiv(m, launch["BLOCK_M"])
+        * triton.cdiv(n, launch["BLOCK_N"]),
     )
     _fc1_swiglu_epilogue_kernel[grid](
         x_int8,
@@ -346,11 +380,7 @@ def convrot_fc1_swiglu_tensor_core(
         N=n,
         K=k,
         SCALE_SCALAR=weight_scale.numel() == 1,
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
-        BLOCK_K=64,
-        num_warps=4,
-        num_stages=3,
+        **launch,
     )
     return output
 
@@ -399,11 +429,10 @@ def convrot_fc2_gated_residual_tensor_core_(
     if gate.numel() != n or not gate.is_floating_point():
         raise ConvRotEpilogueError("fc2 epilogue gate is invalid")
 
-    block_m = 32
-    block_n = 64
+    launch = convrot_epilogue_launch_policy(m)
     grid = (
-        triton.cdiv(m, block_m),
-        triton.cdiv(n, block_n),
+        triton.cdiv(m, launch["BLOCK_M"])
+        * triton.cdiv(n, launch["BLOCK_N"]),
     )
     _fc2_gated_residual_epilogue_kernel[grid](
         x_int8,
@@ -423,11 +452,7 @@ def convrot_fc2_gated_residual_tensor_core_(
         N=n,
         K=k,
         SCALE_SCALAR=weight_scale.numel() == 1,
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
-        BLOCK_K=64,
-        num_warps=4,
-        num_stages=3,
+        **launch,
     )
     return residual
 
@@ -478,10 +503,17 @@ class ConvRotEpilogueMLP(ConvRotTwoSliceMLP):
         sample,
         *,
         fc1_swiglu=None,
+        fc1_quantize=None,
+        fc1_swiglu_tensor=None,
         fc2_gated_residual=None,
     ):
         super().__init__(mlp, sample)
+        self.shared_fc1_carrier = fc1_swiglu is None
         self.fc1_swiglu = fc1_swiglu or convrot_fc1_swiglu
+        self.fc1_quantize = fc1_quantize or _quantize_convrot_input
+        self.fc1_swiglu_tensor = (
+            fc1_swiglu_tensor or convrot_fc1_swiglu_tensor_core
+        )
         self.fc2_gated_residual = (
             fc2_gated_residual or convrot_fc2_gated_residual_
         )
@@ -508,20 +540,30 @@ class ConvRotEpilogueMLP(ConvRotTwoSliceMLP):
         import comfy.ops
 
         comfy.ops.run_every_op()
+        shared_carrier = None
         for tile in self.tiles:
-            if stage_factory is None:
-                activated = self.fc1_swiglu(
-                    x,
-                    tile["fc1_weight"],
-                    tile["fc1_scale"],
-                )
-            else:
-                with stage_factory("mlp_fc1"):
-                    activated = self.fc1_swiglu(
-                        x,
+            if self.shared_fc1_carrier:
+                def fc1_call():
+                    nonlocal shared_carrier
+                    if shared_carrier is None:
+                        shared_carrier = self.fc1_quantize(x)
+                    x_int8, x_scale = shared_carrier
+                    return self.fc1_swiglu_tensor(
+                        x_int8,
                         tile["fc1_weight"],
+                        x_scale,
                         tile["fc1_scale"],
                     )
+            else:
+                def fc1_call():
+                    return self.fc1_swiglu(
+                        x, tile["fc1_weight"], tile["fc1_scale"]
+                    )
+            if stage_factory is None:
+                activated = fc1_call()
+            else:
+                with stage_factory("mlp_fc1"):
+                    activated = fc1_call()
             try:
                 if stage_factory is None:
                     self.fc2_gated_residual(
