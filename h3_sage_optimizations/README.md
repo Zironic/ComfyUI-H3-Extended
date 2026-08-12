@@ -3,7 +3,8 @@
 This package is the extraction boundary for two composable model-patch nodes:
 
 - **MiniMax H3 Sage Memory Optimizer** owns prepared dense Sage selection,
-  format-aware fused QKV selection, and chunked/tiled MLP execution.
+  format-aware fused QKV selection, explicit/automatic MLP execution, and MLP
+  activation-memory policy.
 - **MiniMax H3 Sparse Sage Attention** owns target-video routing, Sparse Sage
   execution, packed-layout policy, sparse diagnostics, and optional shared
   fixed-route compilation.
@@ -18,20 +19,33 @@ The package preserves the checkpoint's existing linear layouts.
 - A validated ConvRot-256 TensorWise-INT8 H3 can use the current specialized
   dense or sparse fused-QKV provider.
 - Unsupported QKV formats use the standard H3 projection when
-  `fused_qkv=auto`; the internal `required` mode fails during preflight.
+  `fused_qkv=auto`; Advanced strict mode canonicalizes that into a required
+  fused request and fails during preflight instead.
 - Compatible ConvRot MLP weights use the established two-slice feature-tiled
   provider when `mlp_memory=auto`.
 - BF16, FP8, NVFP4, MXFP8, and other Comfy-supported layouts use generic token
   chunking and continue through the model's own quantized `F.linear` dispatch.
+- Advanced MLP execution overrides preserve the former explicit BF16, native,
+  and required ConvRot two-slice modes.
 
 The attention carrier format is independent from the checkpoint weight format:
 dense Sage consumes per-thread INT8 Q/K carriers, while Sparse Sage consumes
 architecture-specific block carriers plus routing summaries.
 
-## Sparse routing and diagnostics
+## Complete advanced control mapping
 
-The production Sparse node keeps `video_budget` as its primary control and
-places every other meaningful former sparse setting under Advanced:
+Every former setting that changed execution is represented by one of the split
+nodes:
+
+### Memory Optimizer
+
+- dense prepared Sage versus incoming dense attention;
+- fused QKV auto/off plus strict required-fused behavior;
+- MLP auto/off/epilogue plus explicit BF16, native, or required ConvRot
+  two-slice execution;
+- chunk rows and held-weight policy.
+
+### Sparse Sage
 
 - fixed or adaptive-budget routing;
 - minimum/maximum per-row video density;
@@ -46,9 +60,9 @@ tiles remain dense. The production adaptive maximum defaults to `1.0`, avoiding
 the old `video_budget=0.50` plus `max_video_density=0.50` configuration that left
 no room for upward redistribution.
 
-Reports are opt-in on the production node. The deprecated combined adapter
-preserves its historical behavior of always writing structural reports while
-using the old `timing` toggle only to include or omit deferred CUDA events.
+Reports are opt-in on the production Sparse node. The monolithic experimental
+Hybrid Sparse node remains in H3-Extended with its historical always-on
+structural collector and old `timing` semantics for development workflows.
 
 Shared compilation remains fixed-route-only and requires the completed two-node
 plan to resolve fused Sparse QKV plus the established ConvRot two-slice MLP. A
