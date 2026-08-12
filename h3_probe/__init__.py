@@ -7,6 +7,7 @@ not implement one.
 from . import capture, layout, metrics, report
 from . import q_mask_sharing_sweep
 from . import router_characterization
+from . import router_characterization_finalize
 
 __all__ = [
     "capture",
@@ -15,4 +16,5 @@ __all__ = [
     "report",
     "q_mask_sharing_sweep",
     "router_characterization",
+    "router_characterization_finalize",
 ]
