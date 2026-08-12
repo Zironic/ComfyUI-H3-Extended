@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.dirname(_HERE))
 
 import h3_sage_optimizations.apply as apply_module  # noqa: E402
 from h3_sage_optimizations.plan import (  # noqa: E402
+    COMPILE_INDUCTOR,
     H3SageOptimizationPlan,
     MemoryRequest,
     SparseRequest,
@@ -18,7 +19,9 @@ from h3_sage_optimizations.plan import (  # noqa: E402
     read_plan,
 )
 from h3_sage_optimizations.qkv.providers import (  # noqa: E402
+    MLP_CONVROT_INT8_TWO_SLICE,
     MLPProviderResolution,
+    QKV_SPARSE_CONVROT_INT8,
     QKVProviderResolution,
 )
 
@@ -65,6 +68,12 @@ def run(base, first_request, second_request):
     return apply_module.apply_plan(first, second_plan)
 
 
+def check(value, message):
+    if not value:
+        raise AssertionError(message)
+    print("  ok: %s" % message)
+
+
 def main():
     memory = MemoryRequest()
     sparse = SparseRequest(video_budget=0.5)
@@ -106,12 +115,16 @@ def main():
         apply_module, "_resolve_sparse", side_effect=resolve
     ), mock.patch.object(
         apply_module,
+        "_resolve_mlp",
+        return_value=mlp,
+    ), mock.patch.object(
+        apply_module,
         "configure_backend",
         return_value=(object(), 50),
     ), mock.patch.object(
         apply_module,
         "_install_mlp",
-        return_value=(mlp, 50),
+        return_value=(mlp, 50, None),
     ), mock.patch.object(
         apply_module,
         "_ensure_sparse_runtime",
@@ -122,11 +135,45 @@ def main():
 
     left_status = left.model_options["transformer_options"][STATUS_KEY]
     right_status = right.model_options["transformer_options"][STATUS_KEY]
-    if read_plan(left).signature != read_plan(right).signature:
-        raise AssertionError("node order changed the final plan")
-    if left_status["plan_signature"] != right_status["plan_signature"]:
-        raise AssertionError("node order changed the resolved status")
-    print("  ok: apply_plan composes both public node orders identically")
+    check(
+        read_plan(left).signature == read_plan(right).signature,
+        "node order leaves the final plan unchanged",
+    )
+    check(
+        left_status["plan_signature"] == right_status["plan_signature"],
+        "node order leaves the resolved status unchanged",
+    )
+
+    pending = apply_module._resolve_compile(
+        H3SageOptimizationPlan().with_sparse(
+            SparseRequest(compile_backend=COMPILE_INDUCTOR)
+        ),
+        qkv,
+        mlp,
+    )
+    check(
+        pending.state == "pending",
+        "Sparse-first shared compilation remains pending instead of breaking order independence",
+    )
+
+    ready = apply_module._resolve_compile(
+        H3SageOptimizationPlan()
+        .with_memory(memory)
+        .with_sparse(SparseRequest(compile_backend=COMPILE_INDUCTOR)),
+        QKVProviderResolution(
+            QKV_SPARSE_CONVROT_INT8, True, "synthetic"
+        ),
+        MLPProviderResolution(
+            MLP_CONVROT_INT8_TWO_SLICE,
+            "mlp_chunked_convrot_2slice",
+            "synthetic",
+        ),
+    )
+    check(
+        ready.ready,
+        "compatible completed plans enable shared compilation",
+    )
+    print("\nall apply-plan composition tests passed")
 
 
 if __name__ == "__main__":
