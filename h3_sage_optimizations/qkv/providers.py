@@ -12,6 +12,8 @@ from ..plan import (
     MLP_MEMORY_LEGACY_CONVROT_REQUIRED,
     MLP_MEMORY_LEGACY_NATIVE,
     MLP_MEMORY_OFF,
+    MLP_MEMORY_STRICT_BF16,
+    MLP_MEMORY_STRICT_NATIVE,
 )
 
 QKV_STANDARD = "standard_h3_qkv"
@@ -130,7 +132,7 @@ def resolve_mlp_provider(inventory, *, request):
     if not inventory.fc1 or not inventory.fc2:
         if request == MLP_MEMORY_LEGACY_CONVROT_REQUIRED:
             raise RuntimeError(
-                "required legacy ConvRot two-slice MLP is unavailable: "
+                "required ConvRot two-slice MLP is unavailable: "
                 "the H3 model has no MLP inventory"
             )
         return MLPProviderResolution(
@@ -139,18 +141,36 @@ def resolve_mlp_provider(inventory, *, request):
 
     compatible = _convrot_compatible(inventory)
 
-    if request == MLP_MEMORY_LEGACY_BF16:
+    if request in (MLP_MEMORY_LEGACY_BF16, MLP_MEMORY_STRICT_BF16):
+        strict = request == MLP_MEMORY_STRICT_BF16
         return MLPProviderResolution(
             MLP_GENERIC_CHUNKED,
-            "mlp_chunked_bf16",
-            "deprecated compatibility request preserves BF16 SwiGLU chunking",
+            (
+                "mlp_chunked_bf16_strict"
+                if strict
+                else "mlp_chunked_bf16"
+            ),
+            (
+                "explicit strict BF16 SwiGLU chunking"
+                if strict
+                else "explicit BF16 SwiGLU chunking"
+            ),
         )
 
-    if request == MLP_MEMORY_LEGACY_NATIVE:
+    if request in (MLP_MEMORY_LEGACY_NATIVE, MLP_MEMORY_STRICT_NATIVE):
+        strict = request == MLP_MEMORY_STRICT_NATIVE
         return MLPProviderResolution(
             MLP_GENERIC_CHUNKED,
-            "mlp_chunked_native",
-            "deprecated compatibility request preserves native chunked MLP",
+            (
+                "mlp_chunked_native_strict"
+                if strict
+                else "mlp_chunked_native"
+            ),
+            (
+                "explicit strict native chunked MLP"
+                if strict
+                else "explicit native chunked MLP"
+            ),
         )
 
     if request == MLP_MEMORY_LEGACY_CONVROT_REQUIRED:
@@ -159,13 +179,13 @@ def resolve_mlp_provider(inventory, *, request):
                 set(inventory.labels("fc1")) | set(inventory.labels("fc2"))
             )
             raise RuntimeError(
-                "required legacy ConvRot two-slice MLP is unavailable for %s"
+                "required ConvRot two-slice MLP is unavailable for %s"
                 % (", ".join(labels) or "unknown formats")
             )
         return MLPProviderResolution(
             MLP_CONVROT_INT8_TWO_SLICE,
             "mlp_chunked_convrot_2slice",
-            "deprecated compatibility request preserves ConvRot two-slice execution",
+            "explicit required ConvRot two-slice execution",
         )
 
     if request == MLP_MEMORY_EPILOGUE:
