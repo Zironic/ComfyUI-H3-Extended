@@ -7,6 +7,8 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(_HERE))
 
 from h3_sage_optimizations.plan import (  # noqa: E402
+    COMPILE_INDUCTOR,
+    DENSITY_ADAPTIVE_BUDGET,
     FUSED_QKV_AUTO,
     MLP_MEMORY_EPILOGUE,
     H3SageOptimizationPlan,
@@ -60,6 +62,29 @@ def main():
         "the epilogue prototype is an explicit plan request",
     )
     check(
+        sparse.density_mode == "fixed"
+        and sparse.max_video_density == 1.0
+        and not sparse.reporting_enabled,
+        "production Sparse defaults are fixed, unconstrained above, and quiet",
+    )
+
+    adaptive = SparseRequest(
+        video_budget=0.4,
+        density_mode=DENSITY_ADAPTIVE_BUDGET,
+        min_video_density=0.1,
+        max_video_density=0.9,
+        adaptive_temperature=0.75,
+        adaptive_target_mass=0.85,
+        write_report=True,
+        timing=True,
+        run_tag="adaptive40",
+    )
+    check(
+        adaptive.reporting_enabled
+        and adaptive.signature != sparse.signature,
+        "adaptive rails, diagnostics, and run tags participate in the plan",
+    )
+    check(
         first.with_memory(memory) == first,
         "reapplying the same Memory request is idempotent",
     )
@@ -83,6 +108,26 @@ def main():
     expect_error(
         lambda: SparseRequest(video_budget=0.0),
         "video_budget",
+    )
+    expect_error(
+        lambda: SparseRequest(
+            video_budget=0.4,
+            density_mode=DENSITY_ADAPTIVE_BUDGET,
+            min_video_density=0.5,
+            max_video_density=0.9,
+        ),
+        "must lie between",
+    )
+    expect_error(
+        lambda: SparseRequest(run_tag="bad tag"),
+        "run_tag",
+    )
+    expect_error(
+        lambda: SparseRequest(
+            density_mode=DENSITY_ADAPTIVE_BUDGET,
+            compile_backend=COMPILE_INDUCTOR,
+        ),
+        "requires fixed",
     )
     print("\nall H3 Sage optimization plan tests passed")
 
