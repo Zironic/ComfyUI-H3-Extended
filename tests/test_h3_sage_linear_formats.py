@@ -1,4 +1,4 @@
-"""Pure format inspection and provider-resolution contracts."""
+"""Pure format inspection and production-provider contracts."""
 
 import os
 import sys
@@ -7,6 +7,7 @@ from types import SimpleNamespace
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(_HERE))
 
+from h3_sage_optimizations.kernel_policy import KernelPolicy  # noqa: E402
 from h3_sage_optimizations.plan import MLP_MEMORY_EPILOGUE  # noqa: E402
 from h3_sage_optimizations.qkv.formats import (  # noqa: E402
     describe_linear,
@@ -51,10 +52,7 @@ def linear(weight, bias=None):
 def block(weight):
     return SimpleNamespace(
         attn=SimpleNamespace(qkv_proj=linear(weight)),
-        mlp=SimpleNamespace(
-            fc1=linear(weight),
-            fc2=linear(weight),
-        ),
+        mlp=SimpleNamespace(fc1=linear(weight), fc2=linear(weight)),
     )
 
 
@@ -65,16 +63,15 @@ def check(value, message):
 
 
 def main():
+    production = KernelPolicy()
+    research = KernelPolicy(allow_research_kernels=True, source="test")
     convrot = FakeWeight(
         layout="TensorWiseINT8Layout",
         convrot=True,
         group=256,
         dtype="int8",
     )
-    plain = FakeWeight(
-        layout=None,
-        dtype="bfloat16",
-    )
+    plain = FakeWeight(layout=None, dtype="bfloat16")
 
     convrot_format = describe_linear(linear(convrot))
     plain_format = describe_linear(linear(plain))
@@ -87,86 +84,83 @@ def main():
         "plain BF16 is not mislabeled as fused-compatible",
     )
 
-    convrot_inventory = inspect_h3_linears(
-        [block(convrot), block(convrot)]
-    )
+    convrot_inventory = inspect_h3_linears([block(convrot), block(convrot)])
     dense = resolve_qkv_provider(
         convrot_inventory,
         request="auto",
         backend_kind="dense_sage_sm89",
         capability=(8, 9),
         triton_available=True,
+        policy=production,
     )
     check(
-        dense.provider_id == QKV_DENSE_CONVROT_INT8
-        and dense.fused,
-        "compatible ConvRot H3 selects dense fused QKV",
+        dense.provider_id == QKV_STANDARD and not dense.fused,
+        "production auto preserves the optimized QKV GEMM",
     )
     mlp = resolve_mlp_provider(
-        convrot_inventory, request="auto"
+        convrot_inventory, request="auto", policy=production
     )
     check(
         mlp.provider_id == MLP_CONVROT_INT8_TWO_SLICE,
-        "auto keeps the established two-slice MLP path",
+        "auto keeps the established Kitchen-backed two-slice MLP",
     )
+
+    try:
+        resolve_mlp_provider(
+            convrot_inventory,
+            request=MLP_MEMORY_EPILOGUE,
+            policy=production,
+        )
+    except RuntimeError as exc:
+        check(
+            "research-kernel candidate" in str(exc),
+            "epilogue prototype is blocked by production policy",
+        )
+    else:
+        raise AssertionError("production policy accepted custom epilogue GEMMs")
+
     prototype = resolve_mlp_provider(
-        convrot_inventory, request=MLP_MEMORY_EPILOGUE
+        convrot_inventory,
+        request=MLP_MEMORY_EPILOGUE,
+        policy=research,
     )
     check(
         prototype.provider_id == MLP_CONVROT_INT8_EPILOGUE,
-        "explicit request selects the MLP epilogue prototype",
+        "research policy retains explicit epilogue characterization",
+    )
+    fused = resolve_qkv_provider(
+        convrot_inventory,
+        request="required",
+        backend_kind="dense_sage_sm89",
+        capability=(8, 9),
+        triton_available=True,
+        policy=research,
+    )
+    check(
+        fused.provider_id == QKV_DENSE_CONVROT_INT8 and fused.fused,
+        "research policy retains explicit fused-QKV characterization",
     )
 
-    plain_inventory = inspect_h3_linears(
-        [block(plain), block(plain)]
-    )
+    plain_inventory = inspect_h3_linears([block(plain), block(plain)])
     dense = resolve_qkv_provider(
         plain_inventory,
         request="auto",
         backend_kind="dense_sage_sm89",
         capability=(8, 9),
         triton_available=True,
+        policy=production,
     )
     check(
         dense.provider_id == QKV_STANDARD and not dense.fused,
-        "BF16 fused-QKV auto safely selects standard projection",
+        "BF16 QKV stays on standard optimized dispatch",
     )
     mlp = resolve_mlp_provider(
-        plain_inventory, request="auto"
+        plain_inventory, request="auto", policy=production
     )
     check(
         mlp.provider_id == MLP_GENERIC_CHUNKED,
-        "BF16/unknown MLP preserves its format through generic chunking",
+        "BF16 MLP preserves its optimized format through chunking",
     )
-
-    try:
-        resolve_qkv_provider(
-            plain_inventory,
-            request="required",
-            backend_kind="dense_sage_sm89",
-            capability=(8, 9),
-            triton_available=True,
-        )
-    except RuntimeError as exc:
-        check(
-            "required fused QKV" in str(exc),
-            "required mode fails during format preflight",
-        )
-    else:
-        raise AssertionError("required fused QKV accepted BF16")
-
-    try:
-        resolve_mlp_provider(
-            plain_inventory,
-            request=MLP_MEMORY_EPILOGUE,
-        )
-    except RuntimeError as exc:
-        check(
-            "MLP epilogue prototype" in str(exc),
-            "prototype fails before installing on incompatible weights",
-        )
-    else:
-        raise AssertionError("MLP epilogue prototype accepted BF16")
     print("\nall H3 Sage linear-format tests passed")
 
 

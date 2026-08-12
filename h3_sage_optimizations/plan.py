@@ -8,7 +8,7 @@ import re
 
 PLAN_KEY = "minimax_h3_sage_optimization_plan"
 STATUS_KEY = "minimax_h3_sage_optimization_status"
-PLAN_VERSION = 6
+PLAN_VERSION = 7
 
 ATTENTION_AUTO = "auto"
 ATTENTION_EXISTING = "existing"
@@ -23,9 +23,7 @@ MLP_MEMORY_AUTO = "auto"
 MLP_MEMORY_EPILOGUE = "epilogue_prototype"
 MLP_MEMORY_OFF = "off"
 
-# Internal values used by explicit advanced controls. They retain established
-# activation-memory semantics without putting kernel/layout names in the main
-# production selector.
+# Internal values used by explicit advanced controls and deprecated workflows.
 MLP_MEMORY_LEGACY_BF16 = "legacy_bf16"
 MLP_MEMORY_LEGACY_NATIVE = "legacy_native"
 MLP_MEMORY_LEGACY_CONVROT_REQUIRED = "legacy_convrot_2slice_required"
@@ -77,12 +75,10 @@ class MemoryRequest:
         if int(self.chunk_rows) <= 0:
             raise ValueError("chunk_rows must be positive")
 
-        # Canonicalize fail-closed requests inside the immutable plan so
-        # provider resolution, status, duplicate detection, and node order all
-        # observe the same effective configuration.
+        # Strictness controls fallback inside the selected production MLP path.
+        # It deliberately does not promote QKV auto to the research-only fused
+        # QKV implementation. Research kernels require a separate explicit gate.
         if bool(self.strict):
-            if self.fused_qkv == FUSED_QKV_AUTO:
-                object.__setattr__(self, "fused_qkv", FUSED_QKV_REQUIRED)
             if self.mlp_memory == MLP_MEMORY_AUTO:
                 object.__setattr__(self, "mlp_memory", MLP_MEMORY_STRICT_AUTO)
             elif self.mlp_memory == MLP_MEMORY_LEGACY_BF16:
@@ -150,27 +146,21 @@ class SparseRequest:
             )
         target_mass = float(self.adaptive_target_mass)
         if not math.isfinite(target_mass) or not 0.0 < target_mass <= 1.0:
-            raise ValueError(
-                "adaptive_target_mass must be finite and in (0, 1]"
-            )
+            raise ValueError("adaptive_target_mass must be finite and in (0, 1]")
 
         tag = str(self.run_tag).strip()
         if _RUN_TAG_RE.fullmatch(tag) is None:
             raise ValueError(
-                "run_tag must be 1-64 ASCII letters, digits, underscores, "
-                "or hyphens"
+                "run_tag must be 1-64 ASCII letters, digits, underscores, or hyphens"
             )
         if self.compile_backend not in COMPILE_BACKENDS:
-            raise ValueError(
-                "unknown compile backend %r" % self.compile_backend
-            )
+            raise ValueError("unknown compile backend %r" % self.compile_backend)
         if (
             self.compile_backend == COMPILE_INDUCTOR
             and self.density_mode != DENSITY_FIXED
         ):
             raise ValueError(
-                "shared Inductor compilation currently requires fixed "
-                "density_mode"
+                "shared Inductor compilation currently requires fixed density_mode"
             )
 
     @property
@@ -238,8 +228,6 @@ class H3SageOptimizationPlan:
 
 
 def read_plan(model):
-    """Return the immutable plan already attached to a ModelPatcher."""
-
     options = getattr(model, "model_options", {}) or {}
     plan = options.get(PLAN_KEY)
     if plan is None:

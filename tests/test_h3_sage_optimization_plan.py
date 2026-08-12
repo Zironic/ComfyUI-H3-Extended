@@ -12,6 +12,7 @@ from h3_sage_optimizations.plan import (  # noqa: E402
     FUSED_QKV_AUTO,
     FUSED_QKV_REQUIRED,
     MLP_MEMORY_EPILOGUE,
+    MLP_MEMORY_STRICT_AUTO,
     H3SageOptimizationPlan,
     MemoryRequest,
     SparseRequest,
@@ -38,16 +39,8 @@ def main():
     memory = MemoryRequest()
     sparse = SparseRequest(video_budget=0.5)
 
-    first = (
-        H3SageOptimizationPlan()
-        .with_memory(memory)
-        .with_sparse(sparse)
-    )
-    second = (
-        H3SageOptimizationPlan()
-        .with_sparse(sparse)
-        .with_memory(memory)
-    )
+    first = H3SageOptimizationPlan().with_memory(memory).with_sparse(sparse)
+    second = H3SageOptimizationPlan().with_sparse(sparse).with_memory(memory)
     check(
         first == second and first.signature == second.signature,
         "Memory and Sparse nodes compose independently of order",
@@ -56,28 +49,30 @@ def main():
         memory.fused_qkv == FUSED_QKV_AUTO
         and memory.mlp_memory == "auto"
         and memory.strict is False,
-        "format-aware QKV and MLP selection default to safe fallback",
+        "production requests default to safe automatic selection",
     )
     strict_memory = MemoryRequest(strict=True)
     check(
-        strict_memory.fused_qkv == FUSED_QKV_REQUIRED
+        strict_memory.fused_qkv == FUSED_QKV_AUTO
+        and strict_memory.mlp_memory == MLP_MEMORY_STRICT_AUTO
         and strict_memory.strict,
-        "strict Memory mode canonicalizes fused auto into a required request",
+        "strict mode affects MLP fallback but does not enable research QKV",
     )
     check(
-        MemoryRequest(fused_qkv="off", strict=True).fused_qkv == "off",
-        "strict mode does not re-enable explicitly disabled QKV optimization",
+        MemoryRequest(fused_qkv=FUSED_QKV_REQUIRED).fused_qkv
+        == FUSED_QKV_REQUIRED,
+        "internal research workflows can still express required fused QKV",
     )
     prototype = MemoryRequest(mlp_memory=MLP_MEMORY_EPILOGUE)
     check(
         prototype.mlp_memory == "epilogue_prototype",
-        "the epilogue prototype is an explicit plan request",
+        "old serialized research requests remain representable",
     )
     check(
         sparse.density_mode == "fixed"
         and sparse.max_video_density == 1.0
         and not sparse.reporting_enabled,
-        "production Sparse defaults are fixed, unconstrained above, and quiet",
+        "Sparse defaults remain fixed, unconstrained above, and quiet",
     )
 
     adaptive = SparseRequest(
@@ -92,35 +87,21 @@ def main():
         run_tag="adaptive40",
     )
     check(
-        adaptive.reporting_enabled
-        and adaptive.signature != sparse.signature,
-        "adaptive rails, diagnostics, and run tags participate in the plan",
+        adaptive.reporting_enabled and adaptive.signature != sparse.signature,
+        "adaptive rails and diagnostics participate in the plan",
     )
-    check(
-        first.with_memory(memory) == first,
-        "reapplying the same Memory request is idempotent",
-    )
-    check(
-        first.with_sparse(sparse) == first,
-        "reapplying the same Sparse request is idempotent",
-    )
+    check(first.with_memory(memory) == first, "same Memory request is idempotent")
+    check(first.with_sparse(sparse) == first, "same Sparse request is idempotent")
 
     expect_error(
-        lambda: first.with_memory(
-            MemoryRequest(fused_qkv="off")
-        ),
+        lambda: first.with_memory(MemoryRequest(fused_qkv="off")),
         "different H3 Sage Memory Optimizer",
     )
     expect_error(
-        lambda: first.with_sparse(
-            SparseRequest(video_budget=0.4)
-        ),
+        lambda: first.with_sparse(SparseRequest(video_budget=0.4)),
         "different H3 Sparse Sage",
     )
-    expect_error(
-        lambda: SparseRequest(video_budget=0.0),
-        "video_budget",
-    )
+    expect_error(lambda: SparseRequest(video_budget=0.0), "video_budget")
     expect_error(
         lambda: SparseRequest(
             video_budget=0.4,
@@ -130,10 +111,7 @@ def main():
         ),
         "must lie between",
     )
-    expect_error(
-        lambda: SparseRequest(run_tag="bad tag"),
-        "run_tag",
-    )
+    expect_error(lambda: SparseRequest(run_tag="bad tag"), "run_tag")
     expect_error(
         lambda: SparseRequest(
             density_mode=DENSITY_ADAPTIVE_BUDGET,
