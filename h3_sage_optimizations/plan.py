@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import math
+import re
 
 PLAN_KEY = "minimax_h3_sage_optimization_plan"
 STATUS_KEY = "minimax_h3_sage_optimization_status"
-PLAN_VERSION = 4
+PLAN_VERSION = 5
 
 ATTENTION_AUTO = "auto"
 ATTENTION_EXISTING = "existing"
@@ -39,6 +40,14 @@ MLP_MEMORY_REQUESTS = (
 )
 
 DENSITY_FIXED = "fixed"
+DENSITY_ADAPTIVE_BUDGET = "adaptive_budget"
+DENSITY_MODES = (DENSITY_FIXED, DENSITY_ADAPTIVE_BUDGET)
+
+COMPILE_OFF = "off"
+COMPILE_INDUCTOR = "inductor"
+COMPILE_BACKENDS = (COMPILE_OFF, COMPILE_INDUCTOR)
+
+_RUN_TAG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 
 
 @dataclass(frozen=True)
@@ -74,23 +83,94 @@ class MemoryRequest:
 
 @dataclass(frozen=True)
 class SparseRequest:
-    """Approximate attention options owned by the Sparse Sage node."""
+    """Sparse routing, diagnostics, and optional compilation controls."""
 
     video_budget: float = 0.5
     density_mode: str = DENSITY_FIXED
+    min_video_density: float = 0.05
+    max_video_density: float = 1.0
+    adaptive_temperature: float = 1.0
+    adaptive_target_mass: float = 0.80
+    strict: bool = True
+    write_report: bool = False
+    timing: bool = False
+    run_tag: str = "sparse50"
+    compile_backend: str = COMPILE_OFF
 
     def __post_init__(self):
         budget = float(self.video_budget)
         if not math.isfinite(budget) or not 0.0 < budget <= 1.0:
             raise ValueError("video_budget must be finite and in (0, 1]")
-        if self.density_mode != DENSITY_FIXED:
+        if self.density_mode not in DENSITY_MODES:
             raise ValueError(
-                "the production Sparse Sage node currently supports fixed density only"
+                "density_mode %r is unavailable; implemented modes: %s"
+                % (self.density_mode, ", ".join(DENSITY_MODES))
+            )
+
+        minimum = float(self.min_video_density)
+        maximum = float(self.max_video_density)
+        if not math.isfinite(minimum) or not 0.0 < minimum <= 1.0:
+            raise ValueError("min_video_density must be finite and in (0, 1]")
+        if not math.isfinite(maximum) or not 0.0 < maximum <= 1.0:
+            raise ValueError("max_video_density must be finite and in (0, 1]")
+        if minimum > maximum:
+            raise ValueError("min_video_density must not exceed max_video_density")
+        if self.density_mode == DENSITY_ADAPTIVE_BUDGET:
+            if budget < minimum or budget > maximum:
+                raise ValueError(
+                    "adaptive video_budget must lie between min_video_density "
+                    "and max_video_density"
+                )
+
+        temperature = float(self.adaptive_temperature)
+        if not math.isfinite(temperature) or temperature <= 0.0:
+            raise ValueError(
+                "adaptive_temperature must be finite and greater than zero"
+            )
+        target_mass = float(self.adaptive_target_mass)
+        if not math.isfinite(target_mass) or not 0.0 < target_mass <= 1.0:
+            raise ValueError(
+                "adaptive_target_mass must be finite and in (0, 1]"
+            )
+
+        tag = str(self.run_tag).strip()
+        if _RUN_TAG_RE.fullmatch(tag) is None:
+            raise ValueError(
+                "run_tag must be 1-64 ASCII letters, digits, underscores, "
+                "or hyphens"
+            )
+        if self.compile_backend not in COMPILE_BACKENDS:
+            raise ValueError(
+                "unknown compile backend %r" % self.compile_backend
+            )
+        if (
+            self.compile_backend == COMPILE_INDUCTOR
+            and self.density_mode != DENSITY_FIXED
+        ):
+            raise ValueError(
+                "shared Inductor compilation currently requires fixed "
+                "density_mode"
             )
 
     @property
+    def reporting_enabled(self):
+        return bool(self.write_report or self.timing)
+
+    @property
     def signature(self):
-        return (float(self.video_budget), self.density_mode)
+        return (
+            float(self.video_budget),
+            self.density_mode,
+            float(self.min_video_density),
+            float(self.max_video_density),
+            float(self.adaptive_temperature),
+            float(self.adaptive_target_mass),
+            bool(self.strict),
+            bool(self.write_report),
+            bool(self.timing),
+            str(self.run_tag),
+            self.compile_backend,
+        )
 
 
 @dataclass(frozen=True)
