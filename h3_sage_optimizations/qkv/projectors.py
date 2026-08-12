@@ -80,7 +80,9 @@ class DenseFusedQKVProjector:
 class SparseFusedQKVProjector:
     """Guard the sparse ConvRot projector and fall back for auto requests."""
 
-    name = "h3_fused_qkv_sparse_sage"
+    # Preserve the historical marker consumed by the shared-block compiler.
+    # Provider/status identity remains QKV_SPARSE_CONVROT_INT8 in the resolver.
+    name = "h3_fused_qkv"
     qk_format = "sparge_block_int8"
 
     def __init__(self, required=False, tensor_core=None):
