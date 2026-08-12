@@ -14,6 +14,9 @@ from .plan import (
     FUSED_QKV_OFF,
     MLP_MEMORY_AUTO,
     MLP_MEMORY_EPILOGUE,
+    MLP_MEMORY_LEGACY_BF16,
+    MLP_MEMORY_LEGACY_CONVROT_REQUIRED,
+    MLP_MEMORY_LEGACY_NATIVE,
     MLP_MEMORY_OFF,
     MemoryRequest,
     SparseRequest,
@@ -26,6 +29,31 @@ from .status import (
 )
 
 DEFAULT_CHUNK_ROWS = 2048
+
+MLP_EXECUTION_AUTO = "auto"
+MLP_EXECUTION_BF16 = "chunked_bf16"
+MLP_EXECUTION_NATIVE = "chunked_native"
+MLP_EXECUTION_CONVROT = "convrot_two_slice"
+MLP_EXECUTION_OPTIONS = (
+    MLP_EXECUTION_AUTO,
+    MLP_EXECUTION_BF16,
+    MLP_EXECUTION_NATIVE,
+    MLP_EXECUTION_CONVROT,
+)
+
+
+def _resolve_mlp_request(mlp_memory, mlp_execution):
+    """Translate the optional exact-provider override into one plan request."""
+
+    if mlp_execution == MLP_EXECUTION_AUTO:
+        return mlp_memory
+    if mlp_execution == MLP_EXECUTION_BF16:
+        return MLP_MEMORY_LEGACY_BF16
+    if mlp_execution == MLP_EXECUTION_NATIVE:
+        return MLP_MEMORY_LEGACY_NATIVE
+    if mlp_execution == MLP_EXECUTION_CONVROT:
+        return MLP_MEMORY_LEGACY_CONVROT_REQUIRED
+    raise ValueError("unknown MLP execution override %r" % mlp_execution)
 
 
 class MiniMaxH3SageMemoryOptimizer(io.ComfyNode):
@@ -103,6 +131,31 @@ class MiniMaxH3SageMemoryOptimizer(io.ComfyNode):
                         "TensorWise INT8 MLP weights."
                     ),
                 ),
+                io.Combo.Input(
+                    "mlp_execution",
+                    display_name="Explicit MLP execution override",
+                    options=list(MLP_EXECUTION_OPTIONS),
+                    default=MLP_EXECUTION_AUTO,
+                    advanced=True,
+                    tooltip=(
+                        "auto follows MLP memory optimization. Explicit values "
+                        "restore the former BF16, native, or required ConvRot "
+                        "two-slice execution modes and take precedence over the "
+                        "ordinary MLP selector."
+                    ),
+                ),
+                io.Boolean.Input(
+                    "strict",
+                    display_name="Error instead of specialized fallback",
+                    default=False,
+                    advanced=True,
+                    tooltip=(
+                        "When enabled, fused_qkv=auto becomes a required fused "
+                        "request, and runtime MLP acquisition/provider failures "
+                        "raise instead of falling back. QKV optimization set to "
+                        "off remains off."
+                    ),
+                ),
                 io.Int.Input(
                     "chunk_rows",
                     display_name="MLP chunk rows",
@@ -139,6 +192,8 @@ class MiniMaxH3SageMemoryOptimizer(io.ComfyNode):
         attention=ATTENTION_AUTO,
         fused_qkv=FUSED_QKV_AUTO,
         mlp_memory=MLP_MEMORY_AUTO,
+        mlp_execution=MLP_EXECUTION_AUTO,
+        strict=False,
         chunk_rows=DEFAULT_CHUNK_ROWS,
         prefer_held_weights=True,
     ):
@@ -153,9 +208,12 @@ class MiniMaxH3SageMemoryOptimizer(io.ComfyNode):
             MemoryRequest(
                 attention=attention,
                 fused_qkv=fused_qkv,
-                mlp_memory=mlp_memory,
+                mlp_memory=_resolve_mlp_request(
+                    mlp_memory, mlp_execution
+                ),
                 chunk_rows=int(chunk_rows),
                 prefer_held_weights=bool(prefer_held_weights),
+                strict=bool(strict),
             )
         )
         patched = apply_plan(model, plan)
