@@ -5,5 +5,12 @@ not implement one.
 """
 
 from . import capture, layout, metrics, report
+from . import q_mask_sharing_sweep
 
-__all__ = ["capture", "layout", "metrics", "report"]
+__all__ = [
+    "capture",
+    "layout",
+    "metrics",
+    "report",
+    "q_mask_sharing_sweep",
+]
