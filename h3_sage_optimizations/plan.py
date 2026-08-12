@@ -8,7 +8,7 @@ import re
 
 PLAN_KEY = "minimax_h3_sage_optimization_plan"
 STATUS_KEY = "minimax_h3_sage_optimization_status"
-PLAN_VERSION = 5
+PLAN_VERSION = 6
 
 ATTENTION_AUTO = "auto"
 ATTENTION_EXISTING = "existing"
@@ -23,9 +23,9 @@ MLP_MEMORY_AUTO = "auto"
 MLP_MEMORY_EPILOGUE = "epilogue_prototype"
 MLP_MEMORY_OFF = "off"
 
-# Internal-only values used by deprecated compatibility nodes. They preserve
-# old serialized workflow behavior without adding these implementation details
-# to the two production node schemas.
+# Internal values used by explicit advanced controls and the monolithic
+# experimental node. They retain the established activation-memory semantics
+# without making weight-layout names part of the ordinary production UI.
 MLP_MEMORY_LEGACY_BF16 = "legacy_bf16"
 MLP_MEMORY_LEGACY_NATIVE = "legacy_native"
 MLP_MEMORY_LEGACY_CONVROT_REQUIRED = "legacy_convrot_2slice_required"
@@ -59,6 +59,7 @@ class MemoryRequest:
     mlp_memory: str = MLP_MEMORY_AUTO
     chunk_rows: int = 2048
     prefer_held_weights: bool = True
+    strict: bool = False
 
     def __post_init__(self):
         if self.attention not in ATTENTION_REQUESTS:
@@ -69,6 +70,10 @@ class MemoryRequest:
             raise ValueError("unknown MLP memory request %r" % self.mlp_memory)
         if int(self.chunk_rows) <= 0:
             raise ValueError("chunk_rows must be positive")
+        if bool(self.strict) and self.fused_qkv == FUSED_QKV_OFF:
+            # Strict still applies to an explicit MLP path, so this combination
+            # is valid. Do not treat disabled QKV optimization as an error.
+            pass
 
     @property
     def signature(self):
@@ -78,6 +83,7 @@ class MemoryRequest:
             self.mlp_memory,
             int(self.chunk_rows),
             bool(self.prefer_held_weights),
+            bool(self.strict),
         )
 
 
