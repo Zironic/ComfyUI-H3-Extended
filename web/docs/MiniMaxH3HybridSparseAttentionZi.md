@@ -1,36 +1,21 @@
 # MiniMax H3 Hybrid Sparse Attention — Deprecated Compatibility
 
-This node exists only so older saved workflows can load while migrating to:
+This node remains registered so saved workflows continue to load. New workflows should use:
 
-1. **MiniMax H3 Sage Memory Optimizer**
-2. **MiniMax H3 Sparse Sage Attention**
+```text
+MiniMax H3 Sage Memory Optimizer
+MiniMax H3 Sparse Sage Attention
+```
 
-It translates the former combined fixed-density controls into the new immutable Memory and Sparse requests. The execution implementation is shared with the new nodes.
+The compatibility node translates every meaningful former control into the new immutable plan:
 
-## Supported compatibility behavior
+- `mode` becomes the fused-QKV request owned by the Memory Optimizer;
+- `activation` and `chunk_rows` become the MLP request;
+- `video_budget`, fixed/adaptive routing, minimum/maximum densities, temperature, and target mass become the Sparse Sage routing request;
+- `strict` preserves required specialized paths and strict packed-layout handling;
+- `run_tag` and `timing` preserve structural report generation and optional deferred CUDA timing;
+- `compile_backend=inductor` preserves the shared-block compile request and its original fixed/fused-QKV/ConvRot constraints.
 
-- `sage128` maps to standard H3 QKV into Sparse Sage.
-- `sage128_fused_qkv` maps to fused QKV when compatible.
-- legacy BF16 and native chunked MLP modes are preserved through internal compatibility requests;
-- legacy ConvRot two-slice mode is required when `strict` is enabled and may use the production auto fallback when `strict` is disabled;
-- `video_budget` maps to the new fixed-density Video KV budget.
+The old widget IDs, order, defaults, and serialized node ID are retained. The adapter does not contain a second attention or MLP implementation; it calls the same apply path as the two production nodes.
 
-## Unsupported legacy features
-
-The compatibility adapter intentionally does not reproduce:
-
-- `adaptive_budget` routing;
-- shared Inductor block compilation;
-- legacy timing report directories and run tags.
-
-Adaptive routing and shared compilation require manual migration or the old experimental implementation. Legacy `timing` and `run_tag` values are accepted for workflow loading but ignored, with a visible status warning.
-
-## Migration
-
-Replace this one node with the two production nodes. Set:
-
-- **QKV projection optimization** according to the former `mode`;
-- **MLP memory optimization** according to the former `activation`;
-- **Video KV budget** to the former `video_budget`.
-
-The two replacement nodes may appear in either order.
+Adaptive routing remains eager-only. Shared Inductor compilation requires fixed routing, `sage128_fused_qkv`, and `mlp_chunked_convrot_2slice`, matching the former node's validation.
