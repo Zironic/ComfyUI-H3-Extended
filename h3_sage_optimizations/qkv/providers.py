@@ -12,6 +12,7 @@ from ..plan import (
     MLP_MEMORY_LEGACY_CONVROT_REQUIRED,
     MLP_MEMORY_LEGACY_NATIVE,
     MLP_MEMORY_OFF,
+    MLP_MEMORY_STRICT_AUTO,
     MLP_MEMORY_STRICT_BF16,
     MLP_MEMORY_STRICT_NATIVE,
 )
@@ -123,6 +124,26 @@ def _convrot_compatible(inventory):
     )
 
 
+def _generic_resolution(*, native, strict, reason):
+    if native:
+        mode = (
+            "mlp_chunked_native_strict"
+            if strict
+            else "mlp_chunked_native"
+        )
+    else:
+        mode = (
+            "mlp_chunked_bf16_strict"
+            if strict
+            else "mlp_chunked_bf16"
+        )
+    return MLPProviderResolution(
+        MLP_GENERIC_CHUNKED,
+        mode,
+        reason,
+    )
+
+
 def resolve_mlp_provider(inventory, *, request):
     if request == MLP_MEMORY_OFF:
         return MLPProviderResolution(
@@ -141,16 +162,31 @@ def resolve_mlp_provider(inventory, *, request):
 
     compatible = _convrot_compatible(inventory)
 
+    if request == MLP_MEMORY_STRICT_AUTO:
+        if compatible:
+            return MLPProviderResolution(
+                MLP_CONVROT_INT8_TWO_SLICE,
+                "mlp_chunked_convrot_2slice_strict",
+                "strict automatic selection uses ConvRot two-slice execution",
+            )
+        labels = sorted(
+            set(inventory.labels("fc1")) | set(inventory.labels("fc2"))
+        )
+        return _generic_resolution(
+            native=True,
+            strict=True,
+            reason=(
+                "strict automatic selection preserves the model's formats: %s"
+                % (", ".join(labels) or "unknown")
+            ),
+        )
+
     if request in (MLP_MEMORY_LEGACY_BF16, MLP_MEMORY_STRICT_BF16):
         strict = request == MLP_MEMORY_STRICT_BF16
-        return MLPProviderResolution(
-            MLP_GENERIC_CHUNKED,
-            (
-                "mlp_chunked_bf16_strict"
-                if strict
-                else "mlp_chunked_bf16"
-            ),
-            (
+        return _generic_resolution(
+            native=False,
+            strict=strict,
+            reason=(
                 "explicit strict BF16 SwiGLU chunking"
                 if strict
                 else "explicit BF16 SwiGLU chunking"
@@ -159,14 +195,10 @@ def resolve_mlp_provider(inventory, *, request):
 
     if request in (MLP_MEMORY_LEGACY_NATIVE, MLP_MEMORY_STRICT_NATIVE):
         strict = request == MLP_MEMORY_STRICT_NATIVE
-        return MLPProviderResolution(
-            MLP_GENERIC_CHUNKED,
-            (
-                "mlp_chunked_native_strict"
-                if strict
-                else "mlp_chunked_native"
-            ),
-            (
+        return _generic_resolution(
+            native=True,
+            strict=strict,
+            reason=(
                 "explicit strict native chunked MLP"
                 if strict
                 else "explicit native chunked MLP"
@@ -214,9 +246,11 @@ def resolve_mlp_provider(inventory, *, request):
     labels = sorted(
         set(inventory.labels("fc1")) | set(inventory.labels("fc2"))
     )
-    return MLPProviderResolution(
-        MLP_GENERIC_CHUNKED,
-        "mlp_chunked_native",
-        "generic token chunking preserves the model's own linear formats: %s"
-        % (", ".join(labels) or "unknown"),
+    return _generic_resolution(
+        native=True,
+        strict=False,
+        reason=(
+            "generic token chunking preserves the model's own linear formats: %s"
+            % (", ".join(labels) or "unknown")
+        ),
     )
