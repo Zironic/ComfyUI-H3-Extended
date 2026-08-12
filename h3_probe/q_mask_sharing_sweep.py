@@ -80,32 +80,29 @@ def execution_density_for_q_tiles(
 
 
 def _new_accumulator(q_tiles):
-    return {
-        int(q_tile): {"sum": 0.0, "count": 0, "max": 0.0}
-        for q_tile in q_tiles
-    }
+    # Retain only tiny [head_chunk, query] density tensors on-device. Converting
+    # every statistic to Python inside the sweep would force hundreds of CUDA
+    # synchronizations during an already-expensive diagnostic run.
+    return {int(q_tile): [] for q_tile in q_tiles}
 
 
 def _accumulate(accumulator, q_tile, density):
-    values = density.detach().float()
-    bucket = accumulator[int(q_tile)]
-    bucket["sum"] += float(values.sum())
-    bucket["count"] += int(values.numel())
-    bucket["max"] = max(bucket["max"], float(values.max()))
+    accumulator[int(q_tile)].append(density.detach())
 
 
 def _finish(accumulator):
-    return {
-        str(q_tile): {
-            "mean": (
-                bucket["sum"] / bucket["count"]
-                if bucket["count"]
-                else 0.0
-            ),
-            "max": bucket["max"],
+    out = {}
+    for q_tile, chunks in accumulator.items():
+        if not chunks:
+            out[str(q_tile)] = {"mean": 0.0, "max": 0.0}
+            continue
+        values = torch.cat(chunks, dim=0).float()
+        stats = torch.stack((values.mean(), values.max())).detach().cpu()
+        out[str(q_tile)] = {
+            "mean": float(stats[0]),
+            "max": float(stats[1]),
         }
-        for q_tile, bucket in accumulator.items()
-    }
+    return out
 
 
 def measure_q_mask_sharing(
@@ -158,44 +155,45 @@ def measure_q_mask_sharing(
     scale = q.shape[-1] ** -0.5
     head_chunk = max(1, int(head_chunk))
 
-    for h0 in range(0, heads, head_chunk):
-        h1 = min(heads, h0 + head_chunk)
-        qh = q[0, h0:h1, evaluated_start:evaluated_end, :].float()
-        route_scores = torch.einsum(
-            "hqd,hbd->hqb", qh, pooled[h0:h1]
-        ) * scale
+    with torch.no_grad():
+        for h0 in range(0, heads, head_chunk):
+            h1 = min(heads, h0 + head_chunk)
+            qh = q[0, h0:h1, evaluated_start:evaluated_end, :].float()
+            route_scores = torch.einsum(
+                "hqd,hbd->hqb", qh, pooled[h0:h1]
+            ) * scale
 
-        for frac in budgets:
-            keep_blocks = max(
-                1,
-                min(n_blocks, int(math.ceil(float(frac) * n_blocks))),
-            )
-            routed_idx = torch.topk(
-                route_scores,
-                k=keep_blocks,
-                dim=-1,
-            ).indices
-            routed_blocks = torch.zeros(
-                route_scores.shape,
-                dtype=torch.bool,
-                device=route_scores.device,
-            )
-            routed_blocks.scatter_(2, routed_idx, True)
-            logical_video_keep = routed_blocks.index_select(2, ids)
+            for frac in budgets:
+                keep_blocks = max(
+                    1,
+                    min(n_blocks, int(math.ceil(float(frac) * n_blocks))),
+                )
+                routed_idx = torch.topk(
+                    route_scores,
+                    k=keep_blocks,
+                    dim=-1,
+                ).indices
+                routed_blocks = torch.zeros(
+                    route_scores.shape,
+                    dtype=torch.bool,
+                    device=route_scores.device,
+                )
+                routed_blocks.scatter_(2, routed_idx, True)
+                logical_video_keep = routed_blocks.index_select(2, ids)
 
-            sweep = execution_density_for_q_tiles(
-                logical_video_keep,
-                seq_len=layout.seq_len,
-                video_range=(v0, v1),
-                q_tiles=q_tiles,
-                kv_tile=sage_kv_tile,
-                aligned_start=evaluated_start,
-                aligned_end=evaluated_end,
-            )
-            for q_tile, density in sweep.items():
-                _accumulate(accumulators[frac], q_tile, density)
+                sweep = execution_density_for_q_tiles(
+                    logical_video_keep,
+                    seq_len=layout.seq_len,
+                    video_range=(v0, v1),
+                    q_tiles=q_tiles,
+                    kv_tile=sage_kv_tile,
+                    aligned_start=evaluated_start,
+                    aligned_end=evaluated_end,
+                )
+                for q_tile, density in sweep.items():
+                    _accumulate(accumulators[frac], q_tile, density)
 
-        del route_scores
+            del route_scores
 
     return {
         float(frac): _finish(accumulators[frac])
@@ -221,6 +219,19 @@ def _analyze_routing_with_q_mask_sweep(
     sage_q_tile=128,
     sage_kv_tile=64,
 ):
+    normalized_geometry = str(execution_geometry or "logical").strip().lower()
+    prepared_for_run = prepared
+    if normalized_geometry == "sage_sparse" and prepared_for_run is None:
+        # The stock analyzer also needs this object. Build it once and share it
+        # with both passes rather than mean-pooling all video keys twice.
+        prepared_for_run = moba3d.prepare_video_router(
+            k,
+            layout,
+            block_t=block_t,
+            block_h=block_h,
+            block_w=block_w,
+        )
+
     result = _ORIGINAL_ANALYZE_ROUTING(
         q,
         k,
@@ -233,7 +244,7 @@ def _analyze_routing_with_q_mask_sweep(
         block_w=block_w,
         budgets=budgets,
         head_chunk=head_chunk,
-        prepared=prepared,
+        prepared=prepared_for_run,
         execution_geometry=execution_geometry,
         sage_q_tile=sage_q_tile,
         sage_kv_tile=sage_kv_tile,
@@ -257,7 +268,7 @@ def _analyze_routing_with_q_mask_sweep(
         block_h=block_h,
         block_w=block_w,
         budgets=budgets,
-        prepared=prepared,
+        prepared=prepared_for_run,
         head_chunk=head_chunk,
         sage_q_tile=sage_q_tile,
         sage_kv_tile=sage_kv_tile,
