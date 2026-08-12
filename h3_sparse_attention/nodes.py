@@ -4,9 +4,13 @@ from comfy_api.latest import ComfyExtension, io, ui
 
 try:
     from ..h3_sage_optimizations.apply import apply_plan
-    from ..h3_sage_optimizations.environment import RuntimeEnvironment
     from ..h3_sage_optimizations.plan import (
         ATTENTION_EXISTING,
+        COMPILE_INDUCTOR,
+        COMPILE_OFF,
+        DENSITY_ADAPTIVE_BUDGET,
+        DENSITY_FIXED,
+        DENSITY_MODES,
         FUSED_QKV_AUTO,
         FUSED_QKV_OFF,
         FUSED_QKV_REQUIRED,
@@ -25,9 +29,13 @@ try:
     )
 except ImportError:
     from h3_sage_optimizations.apply import apply_plan
-    from h3_sage_optimizations.environment import RuntimeEnvironment
     from h3_sage_optimizations.plan import (
         ATTENTION_EXISTING,
+        COMPILE_INDUCTOR,
+        COMPILE_OFF,
+        DENSITY_ADAPTIVE_BUDGET,
+        DENSITY_FIXED,
+        DENSITY_MODES,
         FUSED_QKV_AUTO,
         FUSED_QKV_OFF,
         FUSED_QKV_REQUIRED,
@@ -59,10 +67,6 @@ ACTIVATION_MODES = (
     MODE_CONVROT_2SLICE,
     MODE_NATIVE,
 )
-
-DENSITY_FIXED = "fixed"
-DENSITY_ADAPTIVE_BUDGET = "adaptive_budget"
-DENSITY_MODES = (DENSITY_FIXED, DENSITY_ADAPTIVE_BUDGET)
 
 DEFAULT_CHUNK_ROWS = 2048
 MIN_CHUNK_ROWS = 256
@@ -114,10 +118,9 @@ class MiniMaxH3HybridSparseAttention(io.ComfyNode):
             category="model/patch/minimax/compatibility",
             description=(
                 "Deprecated compatibility adapter for saved workflows. It "
-                "translates the former combined fixed-density Sparse Sage, "
-                "fused-QKV, and MLP controls into the new Memory Optimizer and "
-                "Sparse Sage requests. Adaptive routing and shared compilation "
-                "must be migrated manually."
+                "translates every meaningful former Sparse Sage, fused-QKV, "
+                "MLP, adaptive-routing, reporting, and shared-compilation "
+                "control into the new composable requests."
             ),
             search_aliases=[
                 "H3 Hybrid Sparse",
@@ -147,8 +150,8 @@ class MiniMaxH3HybridSparseAttention(io.ComfyNode):
                     max=1.0,
                     step=0.01,
                     tooltip=(
-                        "Requested pure-video KV tile fraction. The production "
-                        "fixed-density route rounds up to a whole tile count."
+                        "Requested pure-video KV tile fraction. Fixed and "
+                        "adaptive routing use the same quantized global budget."
                     ),
                 ),
                 io.Boolean.Input(
@@ -157,9 +160,8 @@ class MiniMaxH3HybridSparseAttention(io.ComfyNode):
                     default=True,
                     advanced=True,
                     tooltip=(
-                        "When enabled, an explicitly requested fused-QKV or "
-                        "ConvRot two-slice path must pass preflight. When "
-                        "disabled, incompatible specialized paths may fall back."
+                        "Require explicitly selected fused-QKV and ConvRot "
+                        "two-slice paths and strict packed-layout validation."
                     ),
                 ),
                 io.Combo.Input(
@@ -180,33 +182,33 @@ class MiniMaxH3HybridSparseAttention(io.ComfyNode):
                 ),
                 io.String.Input(
                     "run_tag",
-                    display_name="Legacy run tag (ignored)",
+                    display_name="Report run tag",
                     default="hybrid50",
                     advanced=True,
                 ),
                 io.Boolean.Input(
                     "timing",
-                    display_name="Legacy timing reports (ignored)",
+                    display_name="Include deferred CUDA timing",
                     default=True,
                     advanced=True,
                 ),
                 io.Combo.Input(
                     "compile_backend",
-                    display_name="Legacy compile backend",
-                    options=["off", "inductor"],
-                    default="off",
+                    display_name="Shared block compilation",
+                    options=[COMPILE_OFF, COMPILE_INDUCTOR],
+                    default=COMPILE_OFF,
                     advanced=True,
                 ),
                 io.Combo.Input(
                     "density_mode",
-                    display_name="Legacy density mode",
+                    display_name="Routing policy",
                     options=list(DENSITY_MODES),
                     default=DENSITY_FIXED,
                     advanced=True,
                 ),
                 io.Float.Input(
                     "min_video_density",
-                    display_name="Legacy adaptive minimum",
+                    display_name="Minimum video density",
                     default=0.05,
                     min=0.01,
                     max=1.0,
@@ -215,7 +217,7 @@ class MiniMaxH3HybridSparseAttention(io.ComfyNode):
                 ),
                 io.Float.Input(
                     "max_video_density",
-                    display_name="Legacy adaptive maximum",
+                    display_name="Maximum video density",
                     default=0.50,
                     min=0.01,
                     max=1.0,
@@ -224,7 +226,7 @@ class MiniMaxH3HybridSparseAttention(io.ComfyNode):
                 ),
                 io.Float.Input(
                     "adaptive_temperature",
-                    display_name="Legacy adaptive temperature",
+                    display_name="Adaptive temperature",
                     default=1.0,
                     min=0.05,
                     max=20.0,
@@ -233,7 +235,7 @@ class MiniMaxH3HybridSparseAttention(io.ComfyNode):
                 ),
                 io.Float.Input(
                     "adaptive_target_mass",
-                    display_name="Legacy adaptive target mass",
+                    display_name="Adaptive target mass",
                     default=0.80,
                     min=0.05,
                     max=1.0,
@@ -256,18 +258,13 @@ class MiniMaxH3HybridSparseAttention(io.ComfyNode):
         chunk_rows=DEFAULT_CHUNK_ROWS,
         run_tag="hybrid50",
         timing=True,
-        compile_backend="off",
+        compile_backend=COMPILE_OFF,
         density_mode=DENSITY_FIXED,
         min_video_density=0.05,
         max_video_density=0.50,
         adaptive_temperature=1.0,
         adaptive_target_mass=0.80,
     ):
-        del min_video_density
-        del max_video_density
-        del adaptive_temperature
-        del adaptive_target_mass
-
         if not enabled:
             return io.NodeOutput(
                 model,
@@ -278,7 +275,7 @@ class MiniMaxH3HybridSparseAttention(io.ComfyNode):
                 ),
             )
 
-        if compile_backend not in ("off", "inductor"):
+        if compile_backend not in (COMPILE_OFF, COMPILE_INDUCTOR):
             raise ValueError(
                 "unknown compile backend %r" % compile_backend
             )
@@ -293,7 +290,9 @@ class MiniMaxH3HybridSparseAttention(io.ComfyNode):
                 % chunk_rows
             )
 
-        if compile_backend == "inductor":
+        # Preserve the former node's early validation order so invalid compile
+        # requests fail before any CUDA or Sparse Sage dependency preflight.
+        if compile_backend == COMPILE_INDUCTOR:
             if density_mode != DENSITY_FIXED:
                 raise ValueError(
                     "Inductor shared-block compilation currently requires "
@@ -307,18 +306,6 @@ class MiniMaxH3HybridSparseAttention(io.ComfyNode):
                 raise ValueError(
                     "Inductor requires mlp_chunked_convrot_2slice activation"
                 )
-            raise ValueError(
-                "The deprecated compatibility adapter does not support shared "
-                "Inductor compilation. Migrate the workflow to the two "
-                "production nodes."
-            )
-
-        if density_mode != DENSITY_FIXED:
-            raise ValueError(
-                "The deprecated compatibility adapter supports fixed density "
-                "only. Replace this node with the new Sparse Sage node before "
-                "using or redesigning adaptive routing."
-            )
 
         plan = read_plan(model)
         plan = plan.with_memory(
@@ -330,26 +317,26 @@ class MiniMaxH3HybridSparseAttention(io.ComfyNode):
             )
         )
         plan = plan.with_sparse(
-            SparseRequest(video_budget=float(video_budget))
+            SparseRequest(
+                video_budget=float(video_budget),
+                density_mode=str(density_mode),
+                min_video_density=float(min_video_density),
+                max_video_density=float(max_video_density),
+                adaptive_temperature=float(adaptive_temperature),
+                adaptive_target_mass=float(adaptive_target_mass),
+                strict=bool(strict),
+                # The former combined node always wrote structural reports;
+                # timing only controlled inclusion of deferred CUDA events.
+                write_report=True,
+                timing=bool(timing),
+                run_tag=str(run_tag),
+                compile_backend=str(compile_backend),
+            )
         )
         patched = apply_plan(model, plan)
-
-        warnings = []
-        if timing:
-            warnings.append(
-                "Legacy timing/report generation is ignored by the production "
-                "compatibility path."
-            )
-        if str(run_tag) != "hybrid50":
-            warnings.append(
-                "Legacy run_tag=%r is ignored." % str(run_tag)
-            )
-
         return io.NodeOutput(
             patched,
-            ui=ui.PreviewText(
-                format_legacy_status(patched, warnings=warnings)
-            ),
+            ui=ui.PreviewText(format_legacy_status(patched)),
         )
 
 
