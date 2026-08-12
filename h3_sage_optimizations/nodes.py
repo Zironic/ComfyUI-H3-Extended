@@ -9,6 +9,7 @@ from .plan import (
     FUSED_QKV_AUTO,
     FUSED_QKV_OFF,
     MLP_MEMORY_AUTO,
+    MLP_MEMORY_EPILOGUE,
     MLP_MEMORY_OFF,
     MemoryRequest,
     SparseRequest,
@@ -58,12 +59,18 @@ class MiniMaxH3SageMemoryOptimizer(io.ComfyNode):
                 ),
                 io.Combo.Input(
                     "mlp_memory",
-                    options=[MLP_MEMORY_AUTO, MLP_MEMORY_OFF],
+                    options=[
+                        MLP_MEMORY_AUTO,
+                        MLP_MEMORY_EPILOGUE,
+                        MLP_MEMORY_OFF,
+                    ],
                     default=MLP_MEMORY_AUTO,
                     tooltip=(
-                        "auto uses ConvRot feature tiling when compatible and "
-                        "otherwise performs generic token chunking through "
-                        "the model's existing Comfy quantized linear format."
+                        "auto uses the established ConvRot two-slice path when "
+                        "compatible and otherwise generic token chunking. "
+                        "epilogue_prototype tests fused fc1+SwiGLU and "
+                        "fc2+gated-residual kernels on compatible ConvRot-256 "
+                        "TensorWise INT8 MLP weights."
                     ),
                 ),
                 io.Int.Input(

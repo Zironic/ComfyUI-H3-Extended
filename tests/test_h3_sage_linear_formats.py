@@ -7,11 +7,13 @@ from types import SimpleNamespace
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(_HERE))
 
+from h3_sage_optimizations.plan import MLP_MEMORY_EPILOGUE  # noqa: E402
 from h3_sage_optimizations.qkv.formats import (  # noqa: E402
     describe_linear,
     inspect_h3_linears,
 )
 from h3_sage_optimizations.qkv.providers import (  # noqa: E402
+    MLP_CONVROT_INT8_EPILOGUE,
     MLP_CONVROT_INT8_TWO_SLICE,
     MLP_GENERIC_CHUNKED,
     QKV_DENSE_CONVROT_INT8,
@@ -105,7 +107,14 @@ def main():
     )
     check(
         mlp.provider_id == MLP_CONVROT_INT8_TWO_SLICE,
-        "compatible ConvRot MLP selects two-slice execution",
+        "auto keeps the established two-slice MLP path",
+    )
+    prototype = resolve_mlp_provider(
+        convrot_inventory, request=MLP_MEMORY_EPILOGUE
+    )
+    check(
+        prototype.provider_id == MLP_CONVROT_INT8_EPILOGUE,
+        "explicit request selects the MLP epilogue prototype",
     )
 
     plain_inventory = inspect_h3_linears(
@@ -145,6 +154,19 @@ def main():
         )
     else:
         raise AssertionError("required fused QKV accepted BF16")
+
+    try:
+        resolve_mlp_provider(
+            plain_inventory,
+            request=MLP_MEMORY_EPILOGUE,
+        )
+    except RuntimeError as exc:
+        check(
+            "MLP epilogue prototype" in str(exc),
+            "prototype fails before installing on incompatible weights",
+        )
+    else:
+        raise AssertionError("MLP epilogue prototype accepted BF16")
     print("\nall H3 Sage linear-format tests passed")
 
 

@@ -8,6 +8,7 @@ sys.path.insert(0, os.path.dirname(_HERE))
 
 from h3_sage_optimizations.plan import (  # noqa: E402
     FUSED_QKV_AUTO,
+    MLP_MEMORY_EPILOGUE,
     H3SageOptimizationPlan,
     MemoryRequest,
     SparseRequest,
@@ -52,6 +53,11 @@ def main():
         memory.fused_qkv == FUSED_QKV_AUTO
         and memory.mlp_memory == "auto",
         "format-aware QKV and MLP selection default to auto",
+    )
+    prototype = MemoryRequest(mlp_memory=MLP_MEMORY_EPILOGUE)
+    check(
+        prototype.mlp_memory == "epilogue_prototype",
+        "the epilogue prototype is an explicit plan request",
     )
     check(
         first.with_memory(memory) == first,

@@ -7,6 +7,7 @@ import torch
 import comfy.model_management
 
 from .chunks import iter_mod_chunks, validate_mod_segments
+from .convrot_epilogue import ConvRotEpilogueMLP
 from .linear import (
     ConvRotTwoSliceMLP,
     HeldMLP,
@@ -53,7 +54,9 @@ def make_forward(block, layer_index, config, original_forward=None):
     """Build an unbound replacement for one ``DiTBlock.forward``."""
 
     original_forward = original_forward or block.forward
-    if config.convrot_2slice and isinstance(block.mlp, torch.nn.Module):
+    if (
+        config.convrot_2slice or config.convrot_epilogue
+    ) and isinstance(block.mlp, torch.nn.Module):
         bind_convrot_mlp(block.mlp)
 
     def _forward(
@@ -151,7 +154,29 @@ def make_forward(block, layer_index, config, original_forward=None):
         held = None
         held_error = None
         use_convrot = False
-        if config.convrot_2slice:
+        use_epilogue = False
+        if config.convrot_epilogue:
+            try:
+                held = ConvRotEpilogueMLP(block.mlp, x[:1])
+                held.__enter__()
+                use_epilogue = True
+            except Exception as exc:
+                held = None
+                if config.strict:
+                    raise
+                held_error = "%s: %s" % (
+                    type(exc).__name__,
+                    exc,
+                )
+                held, generic_error = _open_generic_held(
+                    block, x, config
+                )
+                if generic_error is not None:
+                    held_error = (
+                        "%s; generic held fallback unavailable: %s"
+                        % (held_error, generic_error)
+                    )
+        elif config.convrot_2slice:
             try:
                 held = ConvRotTwoSliceMLP(block.mlp, x[:1])
                 held.__enter__()
@@ -213,6 +238,35 @@ def make_forward(block, layer_index, config, original_forward=None):
                         shift_mlp[chunk.mod_row],
                         scale_mlp[chunk.mod_row],
                     )
+
+                if use_epilogue:
+                    residual = x[chunk.start : chunk.stop]
+                    path = held.fc1_swiglu_fc2_gated_(
+                        h,
+                        residual,
+                        gate_mlp[chunk.mod_row],
+                        stage_factory=lambda name: timed_stage(
+                            transformer_options, name
+                        ),
+                    )
+                    if stats is not None:
+                        stats.record_path(path)
+                    notify_activation(
+                        "mlp_epilogue_residual_ready",
+                        layer_index,
+                        transformer_options,
+                        chunk_index=chunk_index,
+                        path=path,
+                        output_shape=tuple(residual.shape),
+                    )
+                    del h, residual
+                    notify_activation(
+                        "mlp_chunk_gated",
+                        layer_index,
+                        transformer_options,
+                        chunk_index=chunk_index,
+                    )
+                    continue
 
                 expanded = None
                 if use_convrot:

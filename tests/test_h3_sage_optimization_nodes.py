@@ -63,6 +63,10 @@ def main():
         "safe format-aware selection is the production default",
     )
     check(
+        mlp.options == ["auto", "epilogue_prototype", "off"],
+        "the prototype is explicit and does not replace auto",
+    )
+    check(
         sparse.node_id == "MiniMaxH3SparseSageAttentionZi",
         "Sparse Sage has a stable production node id",
     )

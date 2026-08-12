@@ -7,7 +7,7 @@ import math
 
 PLAN_KEY = "minimax_h3_sage_optimization_plan"
 STATUS_KEY = "minimax_h3_sage_optimization_status"
-PLAN_VERSION = 2
+PLAN_VERSION = 3
 
 ATTENTION_AUTO = "auto"
 ATTENTION_EXISTING = "existing"
@@ -19,8 +19,13 @@ FUSED_QKV_REQUIRED = "required"
 FUSED_QKV_REQUESTS = (FUSED_QKV_AUTO, FUSED_QKV_OFF, FUSED_QKV_REQUIRED)
 
 MLP_MEMORY_AUTO = "auto"
+MLP_MEMORY_EPILOGUE = "epilogue_prototype"
 MLP_MEMORY_OFF = "off"
-MLP_MEMORY_REQUESTS = (MLP_MEMORY_AUTO, MLP_MEMORY_OFF)
+MLP_MEMORY_REQUESTS = (
+    MLP_MEMORY_AUTO,
+    MLP_MEMORY_EPILOGUE,
+    MLP_MEMORY_OFF,
+)
 
 DENSITY_FIXED = "fixed"
 
