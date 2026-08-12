@@ -14,7 +14,7 @@ The node inspects the actual QKV, `fc1`, and `fc2` weight layouts and selects a 
   - `epilogue_prototype`: opt into the experimental ConvRot `fc1+SwiGLU` and `fc2+gated-residual` kernels.
   - `off`: leave the H3 MLP forward unchanged.
 
-The status text shown after execution reports the selected attention backend, QKV provider, MLP provider, and fallback reason.
+The status text shown after execution reports the selected attention backend, QKV provider, MLP provider, compile state, and fallback reason.
 
 ## Advanced controls
 
@@ -22,8 +22,20 @@ The status text shown after execution reports the selected attention backend, QK
   - `auto`: select the prepared dense Sage backend supported by the current GPU.
   - `existing`: preserve the incoming dense attention implementation.
   - This setting is ignored when the Sparse Sage node is also present.
+- **Explicit MLP execution override**
+  - `auto`: follow the main MLP memory selector.
+  - `chunked_bf16`: preserve the former explicit BF16 SwiGLU chunking path.
+  - `chunked_native`: preserve the former native Comfy activation/linear path.
+  - `convrot_two_slice`: require the established ConvRot-256 two-slice provider and fail during preflight when the loaded MLP format is incompatible.
+  - An explicit override takes precedence over the main MLP selector.
+- **Error instead of specialized fallback**
+  - With `QKV projection optimization=auto`, convert the request into required fused QKV so incompatible formats or hardware fail during preflight instead of silently using standard QKV.
+  - QKV explicitly set to `off` remains off.
+  - Explicit ConvRot two-slice and epilogue MLP requests are already fail-closed. Generic BF16/native execution retains its safe Comfy fallback behavior.
 - **MLP chunk rows**: maximum token rows in one MLP chunk. Larger chunks may be faster but require more activation memory.
 - **Hold weights across chunks**: acquire `fc1` and `fc2` once for all chunks when the effective Comfy weight handles are safe to retain. Unsafe reusable cast-buffer combinations fall back automatically.
+
+These controls preserve the meaningful `mode`, `activation`, `strict`, and `chunk_rows` behavior of the former combined experiment without putting QKV or MLP implementation choices on the Sparse node.
 
 ## Composition
 
