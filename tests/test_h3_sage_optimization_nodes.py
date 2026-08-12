@@ -19,6 +19,12 @@ comfy.options.enable_args_parsing()
 from h3_sage_optimizations.nodes import (  # noqa: E402
     MiniMaxH3SageMemoryOptimizer,
     MiniMaxH3SparseSageAttention,
+    _resolve_mlp_request,
+)
+from h3_sage_optimizations.plan import (  # noqa: E402
+    MLP_MEMORY_LEGACY_BF16,
+    MLP_MEMORY_LEGACY_CONVROT_REQUIRED,
+    MLP_MEMORY_LEGACY_NATIVE,
 )
 
 
@@ -50,10 +56,12 @@ def main():
             "attention",
             "fused_qkv",
             "mlp_memory",
+            "mlp_execution",
+            "strict",
             "chunk_rows",
             "prefer_held_weights",
         ],
-        "memory optimizer preserves its serialized input ids",
+        "memory optimizer exposes all meaningful execution controls",
     )
     check(
         {
@@ -61,8 +69,14 @@ def main():
             for item in memory.inputs
             if getattr(item, "advanced", False)
         }
-        == {"attention", "chunk_rows", "prefer_held_weights"},
-        "implementation controls are advanced while QKV and MLP remain visible",
+        == {
+            "attention",
+            "mlp_execution",
+            "strict",
+            "chunk_rows",
+            "prefer_held_weights",
+        },
+        "explicit provider and fallback controls are advanced",
     )
     check(
         input_by_id(memory, "attention").display_name
@@ -80,6 +94,15 @@ def main():
         "MLP control has a user-facing label",
     )
     check(
+        input_by_id(memory, "mlp_execution").options
+        == ["auto", "chunked_bf16", "chunked_native", "convrot_two_slice"],
+        "former explicit MLP execution choices are available under Advanced",
+    )
+    check(
+        input_by_id(memory, "strict").default is False,
+        "safe fallback remains the ordinary production default",
+    )
+    check(
         input_by_id(memory, "prefer_held_weights").display_name
         == "Hold weights across chunks",
         "held-weight policy is named descriptively",
@@ -95,6 +118,15 @@ def main():
     check(
         fused.default == "auto" and mlp.default == "auto",
         "safe format-aware selection is the production default",
+    )
+    check(
+        _resolve_mlp_request("auto", "chunked_bf16")
+        == MLP_MEMORY_LEGACY_BF16
+        and _resolve_mlp_request("auto", "chunked_native")
+        == MLP_MEMORY_LEGACY_NATIVE
+        and _resolve_mlp_request("auto", "convrot_two_slice")
+        == MLP_MEMORY_LEGACY_CONVROT_REQUIRED,
+        "advanced MLP overrides preserve the established execution modes",
     )
 
     check(
