@@ -47,7 +47,12 @@ def main():
                 "reason": "preserves TensorCoreFP8Layout",
                 "chunk_rows": 2048,
             },
-            "sparse": {"video_budget": 0.5},
+            "sparse": {
+                "video_budget": 0.5,
+                "density_mode": "fixed",
+                "reporting_enabled": False,
+            },
+            "compile": {"state": "off", "reason": "disabled"},
         }
     )
     memory = format_memory_status(model)
@@ -62,15 +67,50 @@ def main():
         "50.0%" in sparse
         and "rounded up to a whole KV-tile count" in sparse
         and "mixed boundary tiles remain dense" in sparse,
-        "Sparse status explains requested versus effective density",
+        "fixed Sparse status explains requested versus effective density",
     )
-    legacy = format_legacy_status(
-        model, warnings=("Legacy timing is ignored.",)
+
+    adaptive_model = model_with_status(
+        {
+            "attention": {"selected": "sparse_sage"},
+            "fused_qkv": {"provider": "convrot_int8_sparse_sage"},
+            "mlp": {"provider": "off"},
+            "sparse": {
+                "video_budget": 0.5,
+                "density_mode": "adaptive_budget",
+                "min_video_density": 0.1,
+                "max_video_density": 0.5,
+                "adaptive_temperature": 1.0,
+                "adaptive_target_mass": 0.8,
+                "reporting_enabled": True,
+                "timing": True,
+                "run_tag": "adaptive50",
+            },
+            "compile": {
+                "state": "pending",
+                "reason": "waiting for Memory Optimizer",
+            },
+        }
+    )
+    adaptive = format_sparse_status(adaptive_model)
+    check(
+        "adaptive_budget" in adaptive
+        and "10.0%–50.0%" in adaptive
+        and "target mass 80.0%" in adaptive,
+        "adaptive status surfaces rails and score controls",
     )
     check(
+        "Maximum density equals the target budget" in adaptive
+        and "Reports enabled with deferred CUDA timing" in adaptive
+        and "Shared compilation: pending" in adaptive,
+        "adaptive status warns about constrained routing and reports diagnostics",
+    )
+
+    legacy = format_legacy_status(adaptive_model)
+    check(
         "Deprecated compatibility node" in legacy
-        and "Legacy timing is ignored." in legacy,
-        "legacy status carries migration and ignored-option warnings",
+        and "adaptive_budget" in legacy,
+        "legacy status carries migration guidance and resolved sparse details",
     )
     print("\nall H3 Sage status tests passed")
 
