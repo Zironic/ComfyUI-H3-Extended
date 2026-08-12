@@ -4,8 +4,9 @@ This package is the extraction boundary for two composable model-patch nodes:
 
 - **MiniMax H3 Sage Memory Optimizer** owns prepared dense Sage selection,
   format-aware fused QKV selection, and chunked/tiled MLP execution.
-- **MiniMax H3 Sparse Sage Attention** owns only fixed-density target-video
-  routing and Sparse Sage execution.
+- **MiniMax H3 Sparse Sage Attention** owns target-video routing, Sparse Sage
+  execution, packed-layout policy, sparse diagnostics, and optional shared
+  fixed-route compilation.
 
 Unknown models are exact pass-throughs. H3-specific model inspection happens
 before cloning, CUDA probing, weight inspection, or patch installation.
@@ -25,7 +26,34 @@ The package preserves the checkpoint's existing linear layouts.
 
 The attention carrier format is independent from the checkpoint weight format:
 dense Sage consumes per-thread INT8 Q/K carriers, while Sparse Sage consumes
-128Q x 64KV block carriers plus routing summaries.
+architecture-specific block carriers plus routing summaries.
+
+## Sparse routing and diagnostics
+
+The production Sparse node keeps `video_budget` as its primary control and
+places every other meaningful former sparse setting under Advanced:
+
+- fixed or adaptive-budget routing;
+- minimum/maximum per-row video density;
+- adaptive temperature and target mass;
+- strict packed-layout validation;
+- structural reports, deferred CUDA timing, and report run tags;
+- shared Inductor block compilation.
+
+Adaptive routing preserves the fixed route's exact aggregate block count while
+redistributing K between head/query rows. Non-video context and mixed boundary
+tiles remain dense. The production adaptive maximum defaults to `1.0`, avoiding
+the old `video_budget=0.50` plus `max_video_density=0.50` configuration that left
+no room for upward redistribution.
+
+Reports are opt-in on the production node. The deprecated combined adapter
+preserves its historical behavior of always writing structural reports while
+using the old `timing` toggle only to include or omit deferred CUDA events.
+
+Shared compilation remains fixed-route-only and requires the completed two-node
+plan to resolve fused Sparse QKV plus the established ConvRot two-slice MLP. A
+Sparse-first compile request remains pending until a compatible Memory Optimizer
+is applied, preserving node-order independence.
 
 ## MLP epilogue prototype
 
@@ -54,9 +82,9 @@ forward, so `Memory -> Sparse` and `Sparse -> Memory` converge on the same
 configuration. Conflicting duplicate instances fail rather than silently making
 the last node win.
 
-The new apply path no longer delegates to `h3_memory_optimizer.patch.apply`.
-It installs only the selected attention patch, the selected MLP patch, and the
-runtime layout context required by Sparse Sage.
+The apply path does not delegate to `h3_memory_optimizer.patch.apply`. It
+installs only the selected attention patch, selected MLP patch, sparse runtime,
+optional report listener, and optional shared compiler required by the plan.
 
-Shared Inductor compilation, adaptive-density controls, timing, run tags, Sol,
-AdaLN precompute, and FirstBlockCache are outside the two production schemas.
+Sol, AdaLN precompute, FirstBlockCache, adaptive compilation, and stock
+`TorchCompileModel` composition remain outside the production nodes.
