@@ -1,21 +1,57 @@
-# MiniMax H3 Hybrid Sparse Attention — Deprecated Compatibility
+# MiniMax H3 Hybrid Sparse Attention — Experimental
 
-This node remains registered so saved workflows continue to load. New workflows should use:
+This is the full monolithic H3 optimization experiment. It intentionally remains in **ComfyUI-H3-Extended** after the two production nodes move into the dedicated H3 Sage Optimizations repository.
+
+Use this node when testing combinations that the production nodes deliberately do not expose:
+
+- fixed or adaptive Sparse Sage routing;
+- standard or fused QKV projection;
+- explicit BF16, native, or ConvRot two-slice MLP execution;
+- timing reports and named run directories;
+- shared Inductor compilation of the 50 main H3 blocks.
+
+## Do not combine with the production nodes
+
+This node owns the entire experimental attention-and-MLP transaction. Do not place **MiniMax H3 Sage Memory Optimizer** or **MiniMax H3 Sparse Sage Attention** on the same model branch. The node reports a clear error when it detects the production optimization plan.
+
+## Density allocation
+
+### `fixed`
+
+Every pure target-video head/query row retains the requested `video_budget` fraction of its target-video KV blocks. Non-video context and mixed boundary tiles remain dense.
+
+### `adaptive_budget`
+
+The same aggregate target-video block budget is redistributed between head/query rows according to omitted coarse attention mass. `min_video_density`, `max_video_density`, `adaptive_temperature`, and `adaptive_target_mass` control that allocation.
+
+Adaptive routing currently runs in eager mode. Shared Inductor compilation supports fixed density only.
+
+## Shared Inductor compilation
+
+`compile_backend=inductor` requires all of the following:
+
+- `density_mode=fixed`;
+- `mode=sage128_fused_qkv`;
+- `activation=mlp_chunked_convrot_2slice`;
+- compatible ConvRot-256 TensorWise-INT8 H3 weights.
+
+Do not combine the shared compiler with ComfyUI's `TorchCompileModel` node.
+
+## Reports
+
+When `timing` is enabled, reports are written under:
 
 ```text
-MiniMax H3 Sage Memory Optimizer
-MiniMax H3 Sparse Sage Attention
+<Comfy output>/h3_hybrid_sparse/<run_tag>/
 ```
 
-The compatibility node translates every meaningful former control into the new immutable plan:
+The run tag is part of the experimental report identity, so use distinct tags for materially different configurations.
 
-- `mode` becomes the fused-QKV request owned by the Memory Optimizer;
-- `activation` and `chunk_rows` become the MLP request;
-- `video_budget`, fixed/adaptive routing, minimum/maximum densities, temperature, and target mass become the Sparse Sage routing request;
-- `strict` preserves required specialized paths and strict packed-layout handling;
-- `run_tag` and `timing` preserve structural report generation and optional deferred CUDA timing;
-- `compile_backend=inductor` preserves the shared-block compile request and its original fixed/fused-QKV/ConvRot constraints.
+## Production alternative
 
-The old widget IDs, order, defaults, and serialized node ID are retained. The adapter does not contain a second attention or MLP implementation; it calls the same apply path as the two production nodes.
+For ordinary use, prefer the two production nodes:
 
-Adaptive routing remains eager-only. Shared Inductor compilation requires fixed routing, `sage128_fused_qkv`, and `mlp_chunked_convrot_2slice`, matching the former node's validation.
+1. **MiniMax H3 Sage Memory Optimizer**
+2. **MiniMax H3 Sparse Sage Attention**
+
+Those nodes intentionally omit the monolithic experiment's combined execution surface.
