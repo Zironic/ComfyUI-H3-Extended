@@ -6,13 +6,23 @@ MODE_BF16 = "mlp_chunked_bf16"
 MODE_NATIVE = "mlp_chunked_native"
 MODE_CONVROT_2SLICE = "mlp_chunked_convrot_2slice"
 MODE_CONVROT_EPILOGUE = "mlp_chunked_convrot_epilogue"
+
+# Internal aliases used by the split Memory node to preserve the old strict
+# fallback policy without adding duplicate choices to legacy public combos.
+MODE_BF16_STRICT = "mlp_chunked_bf16_strict"
+MODE_NATIVE_STRICT = "mlp_chunked_native_strict"
+
 MODES = (
     MODE_BF16,
     MODE_NATIVE,
     MODE_CONVROT_2SLICE,
     MODE_CONVROT_EPILOGUE,
 )
-IMPLEMENTED_MODES = frozenset(MODES)
+STRICT_MODES = (
+    MODE_BF16_STRICT,
+    MODE_NATIVE_STRICT,
+)
+IMPLEMENTED_MODES = frozenset(MODES + STRICT_MODES)
 DEFAULT_MODE = MODE_NATIVE
 
 MIN_CHUNK_ROWS = 256
@@ -34,6 +44,10 @@ class ActivationMemoryConfig:
     ``mlp_chunked_convrot_epilogue`` is the experimental two-slice path whose
     fc1 kernel stores the activated SwiGLU carrier and whose fc2 kernel applies
     the gate while accumulating directly into the residual tensor.
+
+    The strict BF16/native aliases execute the same arithmetic but force the
+    existing held-weight/provider error paths to raise instead of selecting an
+    ordinary module fallback.
     """
 
     mode: str = DEFAULT_MODE
@@ -48,6 +62,8 @@ class ActivationMemoryConfig:
                 "activation-memory mode %r is not implemented (available: %s)"
                 % (self.mode, ", ".join(sorted(IMPLEMENTED_MODES)))
             )
+        if self.mode in STRICT_MODES and not self.strict:
+            object.__setattr__(self, "strict", True)
         if not (MIN_CHUNK_ROWS <= int(self.chunk_rows) <= MAX_CHUNK_ROWS):
             raise ValueError(
                 "chunk_rows must be between %d and %d, got %r"
@@ -65,7 +81,7 @@ class ActivationMemoryConfig:
 
     @property
     def native_swiglu(self):
-        return self.mode == MODE_NATIVE
+        return self.mode in (MODE_NATIVE, MODE_NATIVE_STRICT)
 
     @property
     def convrot_2slice(self):
