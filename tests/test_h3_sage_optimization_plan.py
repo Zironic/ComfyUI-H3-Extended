@@ -10,6 +10,7 @@ from h3_sage_optimizations.plan import (  # noqa: E402
     COMPILE_INDUCTOR,
     DENSITY_ADAPTIVE_BUDGET,
     FUSED_QKV_AUTO,
+    FUSED_QKV_REQUIRED,
     MLP_MEMORY_EPILOGUE,
     H3SageOptimizationPlan,
     MemoryRequest,
@@ -53,8 +54,19 @@ def main():
     )
     check(
         memory.fused_qkv == FUSED_QKV_AUTO
-        and memory.mlp_memory == "auto",
-        "format-aware QKV and MLP selection default to auto",
+        and memory.mlp_memory == "auto"
+        and memory.strict is False,
+        "format-aware QKV and MLP selection default to safe fallback",
+    )
+    strict_memory = MemoryRequest(strict=True)
+    check(
+        strict_memory.fused_qkv == FUSED_QKV_REQUIRED
+        and strict_memory.strict,
+        "strict Memory mode canonicalizes fused auto into a required request",
+    )
+    check(
+        MemoryRequest(fused_qkv="off", strict=True).fused_qkv == "off",
+        "strict mode does not re-enable explicitly disabled QKV optimization",
     )
     prototype = MemoryRequest(mlp_memory=MLP_MEMORY_EPILOGUE)
     check(
