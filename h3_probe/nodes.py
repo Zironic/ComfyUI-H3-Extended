@@ -78,12 +78,11 @@ class MiniMaxH3AttentionProbe(io.ComfyNode):
 
 
 class MiniMaxH3Moba3DProbe(io.ComfyNode):
-    """Simulate the H3 team's publicly described MoBA-style 3D routing.
+    """Simulate H3 sparse routing and characterize production-like tile masks.
 
-    Measurement only: non-video context remains dense, target-video keys are
-    grouped in 3D blocks and represented by mean-pooled post-RoPE keys. Each
-    query token routes independently, and Q/K/V are used to compare the exact
-    masked-and-renormalized sparse output with dense attention.
+    Exact sparse-output snapshots remain selective, while the experiment branch
+    also records lightweight direct-tile router dynamics across consecutive
+    conditional denoising evaluations for HASTE/static-topology analysis.
     """
 
     @classmethod
@@ -92,36 +91,36 @@ class MiniMaxH3Moba3DProbe(io.ComfyNode):
             node_id="MiniMaxH3Moba3DProbeZi",
             display_name="MiniMax H3 MoBA 3D Probe (Zi)",
             category="model/patch/minimax",
-            description="Probe-only simulation of MiniMax's disclosed H3 sparse-attention idea: video-only 3D candidate blocks, per-query-token mean-pooled routing, dense non-video context, exact sparse-vs-dense output error, and optional sampler-latent convergence measurements. Does not alter inference and is intentionally expensive.",
+            description="Sparse-attention characterization probe. Selected layers/steps run exact sparse-vs-dense output measurements; when attention capture is enabled, a lightweight production-like direct tile router is also tracked across every conditional denoising evaluation to measure Q/K drift, mask reuse, static topology and layer/head budget sensitivity. Does not alter inference.",
             inputs=[
                 io.Model.Input("model"),
                 io.Boolean.Input("enabled", default=True),
                 io.String.Input("run_tag", default="h3_moba3d", tooltip="Output prefix under output/h3_probe/."),
-                io.String.Input("layers", default="auto", tooltip="DiT layers: auto or comma-separated indices."),
-                io.String.Input("steps", default="auto", tooltip="Denoising steps: auto or comma-separated indices."),
-                io.Int.Input("query_time_positions", default=3, min=1, max=16, tooltip="Video query-frame positions sampled across the clip."),
-                io.Int.Input("query_spatial_positions", default=2, min=1, max=8, tooltip="Query regions sampled within each selected latent frame."),
-                io.Int.Input("query_block", default=64, min=16, max=512, step=16, tooltip="Number of query tokens evaluated in each sampled region. Every token routes independently; larger values make the probe substantially slower."),
-                io.Int.Input("block_t", default=1, min=1, max=16, tooltip="3D candidate block extent in latent time."),
-                io.Int.Input("block_h", default=4, min=1, max=32, tooltip="3D candidate block extent in video patch rows."),
-                io.Int.Input("block_w", default=4, min=1, max=32, tooltip="3D candidate block extent in video patch columns."),
-                io.String.Input("video_budgets", default="10,20,30,40", tooltip="Percent of video blocks retained independently per query token and head, e.g. 10,20,30,40."),
-                io.Boolean.Input("include_audio_query", default=True, tooltip="Also test audio queries routing into video blocks."),
+                io.String.Input("layers", default="auto", tooltip="Layers for expensive exact sparse-output snapshots only: auto or comma-separated indices. Lightweight router dynamics still observe all H3 attention layers."),
+                io.String.Input("steps", default="auto", tooltip="Denoising steps for expensive exact sparse-output snapshots only. Lightweight router dynamics still observe every conditional denoising evaluation."),
+                io.Int.Input("query_time_positions", default=3, min=1, max=16, tooltip="Video query-frame positions sampled across the clip for exact output-error calibration."),
+                io.Int.Input("query_spatial_positions", default=2, min=1, max=8, tooltip="Query regions per sampled frame for exact output-error calibration."),
+                io.Int.Input("query_block", default=64, min=16, max=512, step=16, tooltip="Number of query tokens evaluated in each expensive exact snapshot region. Every logical token routes independently; larger values make the exact probe substantially slower."),
+                io.Int.Input("block_t", default=1, min=1, max=16, tooltip="Logical 3D candidate block extent in latent time for the original fine-grained router probe."),
+                io.Int.Input("block_h", default=4, min=1, max=32, tooltip="Logical 3D candidate block extent in video patch rows."),
+                io.Int.Input("block_w", default=4, min=1, max=32, tooltip="Logical 3D candidate block extent in video patch columns."),
+                io.String.Input("video_budgets", default="20,30,40,50,60,70", tooltip="Video-KV retention percentages evaluated in exact snapshots. The direct 128x64 calibration uses these same budgets for per-layer/head sensitivity curves."),
+                io.Boolean.Input("include_audio_query", default=True, tooltip="Also test audio queries in the legacy logical probe. Head-budget calibration ignores non-video Q records because the production router leaves them dense."),
                 io.Boolean.Input("include_text_query", default=False),
-                io.Boolean.Input("capture_uncond", default=False),
+                io.Boolean.Input("capture_uncond", default=False, tooltip="Also characterize the unconditional/negative branch. Static-topology analysis is cleanest with the default conditional-only capture."),
                 io.Boolean.Input(
                     "capture_latent_dynamics",
                     default=True,
-                    tooltip="Measure target-video sampler x/x0 changes between every denoising callback at H3's 1x2x2 patch granularity, plus distance from explicit first/last keyframes. Adds moderate probe overhead but does not alter sampling.",
+                    tooltip="Measure target-video sampler x/x0 changes between denoising callbacks at H3's 1x2x2 patch granularity, plus distance from explicit first/last keyframes.",
                 ),
                 io.Boolean.Input(
                     "capture_attention",
                     default=True,
-                    tooltip="Capture attention routing records; disable to keep only sampler latent dynamics and raw maps.",
+                    tooltip="Enable sparse-attention characterization. On this experiment branch this includes lightweight direct-tile router dynamics on every conditional step plus selective exact sparse-output snapshots.",
                 ),
-                io.Combo.Input("execution_geometry", options=["logical", "sage_sparse"], default="logical", tooltip="Report logical per-token masks or coarsen them to globally aligned Sparse-Sage Q/KV tiles."),
-                io.Int.Input("sage_q_tile", default=128, min=1, max=4096, tooltip="Global packed-sequence Q tile size for sage_sparse execution."),
-                io.Int.Input("sage_kv_tile", default=64, min=1, max=4096, tooltip="Global packed-sequence KV tile size for sage_sparse execution."),
+                io.Combo.Input("execution_geometry", options=["logical", "sage_sparse"], default="sage_sparse", tooltip="Use sage_sparse for production-like direct 128x64 calibration and the Q-mask sharing sweep; logical retains only the fine per-token router metrics."),
+                io.Int.Input("sage_q_tile", default=128, min=1, max=4096, tooltip="Global packed-sequence Q tile size. SM89 Sparse Sage uses 128."),
+                io.Int.Input("sage_kv_tile", default=64, min=1, max=4096, tooltip="Global packed-sequence KV tile size. SM89 Sparse Sage uses 64."),
             ],
             outputs=[io.Model.Output()],
         )
@@ -131,7 +130,7 @@ class MiniMaxH3Moba3DProbe(io.ComfyNode):
                 query_spatial_positions, query_block, block_t, block_h, block_w,
                 video_budgets, include_audio_query, include_text_query,
                 capture_uncond, capture_latent_dynamics=True,
-                capture_attention=True, execution_geometry="logical",
+                capture_attention=True, execution_geometry="sage_sparse",
                 sage_q_tile=128, sage_kv_tile=64) -> io.NodeOutput:
         if not enabled:
             return io.NodeOutput(model)
@@ -169,7 +168,7 @@ class MiniMaxH3Moba3DProbe(io.ComfyNode):
             comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, "h3_moba3d_probe",
             moba_capture.make_wrapper(session), m.model_options, is_model_options=True)
         logging.info(
-            "[H3 MoBA3D probe] armed: tag=%s layers=%s steps=%s block=%dx%dx%d budgets=%s execution=%s q_tile=%d kv_tile=%d latent_dynamics=%s attention=%s",
+            "[H3 MoBA3D probe] armed: tag=%s exact_layers=%s exact_steps=%s block=%dx%dx%d budgets=%s execution=%s q_tile=%d kv_tile=%d router_dynamics=all_conditional_steps latent_dynamics=%s attention=%s",
             run_tag, layers, steps, block_t, block_h, block_w, video_budgets,
             execution_geometry, sage_q_tile, sage_kv_tile,
             capture_latent_dynamics, capture_attention,
