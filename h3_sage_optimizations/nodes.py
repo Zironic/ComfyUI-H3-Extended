@@ -6,6 +6,10 @@ from .apply import apply_plan
 from .plan import (
     ATTENTION_AUTO,
     ATTENTION_EXISTING,
+    COMPILE_BACKENDS,
+    COMPILE_OFF,
+    DENSITY_FIXED,
+    DENSITY_MODES,
     FUSED_QKV_AUTO,
     FUSED_QKV_OFF,
     MLP_MEMORY_AUTO,
@@ -162,7 +166,7 @@ class MiniMaxH3SageMemoryOptimizer(io.ComfyNode):
 
 
 class MiniMaxH3SparseSageAttention(io.ComfyNode):
-    """Approximate fixed-density Sparse Sage routing only."""
+    """Sparse Sage routing with optional adaptive, reporting, and compile controls."""
 
     @classmethod
     def define_schema(cls):
@@ -171,10 +175,12 @@ class MiniMaxH3SparseSageAttention(io.ComfyNode):
             display_name="MiniMax H3 Sparse Sage Attention (Zi)",
             category="model/patch/minimax",
             description=(
-                "H3-only fixed-density Sparse Sage attention. Unknown models "
-                "pass through unchanged. Non-video context and mixed boundary "
-                "tiles remain dense; Video KV budget controls retained pure "
-                "target-video KV tiles."
+                "H3-only Sparse Sage attention. Unknown models pass through "
+                "unchanged. Non-video context and mixed boundary tiles remain "
+                "dense; Video KV budget controls retained pure target-video "
+                "KV tiles. Advanced controls preserve the meaningful routing, "
+                "validation, diagnostics, and compilation behavior of the "
+                "former combined node."
             ),
             search_aliases=[
                 "H3 sparse",
@@ -183,6 +189,7 @@ class MiniMaxH3SparseSageAttention(io.ComfyNode):
                 "Sparse Sage",
                 "Sparge",
                 "H3 acceleration",
+                "H3 adaptive attention",
             ],
             inputs=[
                 io.Model.Input("model"),
@@ -211,13 +218,149 @@ class MiniMaxH3SparseSageAttention(io.ComfyNode):
                         "route while still using the Sparse Sage execution path."
                     ),
                 ),
+                io.Combo.Input(
+                    "density_mode",
+                    display_name="Routing policy",
+                    options=list(DENSITY_MODES),
+                    default=DENSITY_FIXED,
+                    advanced=True,
+                    tooltip=(
+                        "fixed gives every pure-video head/query row the same "
+                        "quantized K. adaptive_budget preserves the same global "
+                        "block count but redistributes K between rows according "
+                        "to pooled Q/K attention estimates."
+                    ),
+                ),
+                io.Float.Input(
+                    "min_video_density",
+                    display_name="Minimum video density",
+                    default=0.05,
+                    min=0.01,
+                    max=1.0,
+                    step=0.01,
+                    advanced=True,
+                    tooltip=(
+                        "Adaptive lower rail for each pure-video head/query row. "
+                        "It must not exceed Video KV budget."
+                    ),
+                ),
+                io.Float.Input(
+                    "max_video_density",
+                    display_name="Maximum video density",
+                    default=1.0,
+                    min=0.01,
+                    max=1.0,
+                    step=0.01,
+                    advanced=True,
+                    tooltip=(
+                        "Adaptive upper rail for each pure-video head/query row. "
+                        "It must be at least Video KV budget. A maximum equal to "
+                        "the budget leaves no room to move blocks above target."
+                    ),
+                ),
+                io.Float.Input(
+                    "adaptive_temperature",
+                    display_name="Adaptive temperature",
+                    default=1.0,
+                    min=0.05,
+                    max=20.0,
+                    step=0.05,
+                    advanced=True,
+                    tooltip=(
+                        "Temperature applied to pooled Q/K scores before "
+                        "estimating each row's block demand."
+                    ),
+                ),
+                io.Float.Input(
+                    "adaptive_target_mass",
+                    display_name="Adaptive target mass",
+                    default=0.80,
+                    min=0.05,
+                    max=1.0,
+                    step=0.01,
+                    advanced=True,
+                    tooltip=(
+                        "Coarse cumulative video-attention mass used to estimate "
+                        "each row's unconstrained K before exact budget balancing."
+                    ),
+                ),
+                io.Boolean.Input(
+                    "strict",
+                    display_name="Strict packed-layout validation",
+                    default=True,
+                    advanced=True,
+                    tooltip=(
+                        "Require a valid H3 packed-token layout for Sparse Sage. "
+                        "Disable only for diagnostics; the sparse backend still "
+                        "cannot route an unknown layout safely."
+                    ),
+                ),
+                io.Boolean.Input(
+                    "write_report",
+                    display_name="Write sparse report",
+                    default=False,
+                    advanced=True,
+                    tooltip=(
+                        "Write per-request JSON and text reports containing "
+                        "effective density, route distributions, and selected "
+                        "providers. Enabling CUDA timing also enables reports."
+                    ),
+                ),
+                io.Boolean.Input(
+                    "timing",
+                    display_name="Include deferred CUDA timing",
+                    default=False,
+                    advanced=True,
+                    tooltip=(
+                        "Record request-scoped deferred CUDA events in the sparse "
+                        "report. Stage timings overlap and are not additive."
+                    ),
+                ),
+                io.String.Input(
+                    "run_tag",
+                    display_name="Report run tag",
+                    default="sparse50",
+                    advanced=True,
+                    tooltip=(
+                        "Prefix used for report directories. Use 1-64 ASCII "
+                        "letters, digits, underscores, or hyphens."
+                    ),
+                ),
+                io.Combo.Input(
+                    "compile_backend",
+                    display_name="Shared block compilation",
+                    options=list(COMPILE_BACKENDS),
+                    default=COMPILE_OFF,
+                    advanced=True,
+                    tooltip=(
+                        "inductor compiles one shared CUDA tensor program for all "
+                        "50 H3 blocks. It requires fixed routing plus an upstream "
+                        "Memory Optimizer that resolves fused Sparse QKV and the "
+                        "ConvRot two-slice MLP. When this Sparse node appears "
+                        "first, the request remains pending until that Memory "
+                        "Optimizer is applied. Do not combine with TorchCompileModel."
+                    ),
+                ),
             ],
             outputs=[io.Model.Output()],
         )
 
     @classmethod
     def execute(
-        cls, model, enabled=True, video_budget=0.5
+        cls,
+        model,
+        enabled=True,
+        video_budget=0.5,
+        density_mode=DENSITY_FIXED,
+        min_video_density=0.05,
+        max_video_density=1.0,
+        adaptive_temperature=1.0,
+        adaptive_target_mass=0.80,
+        strict=True,
+        write_report=False,
+        timing=False,
+        run_tag="sparse50",
+        compile_backend=COMPILE_OFF,
     ):
         if not enabled:
             return io.NodeOutput(
@@ -229,7 +372,19 @@ class MiniMaxH3SparseSageAttention(io.ComfyNode):
                 ),
             )
         plan = read_plan(model).with_sparse(
-            SparseRequest(video_budget=float(video_budget))
+            SparseRequest(
+                video_budget=float(video_budget),
+                density_mode=str(density_mode),
+                min_video_density=float(min_video_density),
+                max_video_density=float(max_video_density),
+                adaptive_temperature=float(adaptive_temperature),
+                adaptive_target_mass=float(adaptive_target_mass),
+                strict=bool(strict),
+                write_report=bool(write_report),
+                timing=bool(timing),
+                run_tag=str(run_tag),
+                compile_backend=str(compile_backend),
+            )
         )
         patched = apply_plan(model, plan)
         return io.NodeOutput(
