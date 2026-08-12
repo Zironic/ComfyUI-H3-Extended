@@ -20,6 +20,16 @@ import torch
 
 DEFAULT_BUDGETS = (0.10, 0.20, 0.30, 0.40)
 
+# Sparse Sage's executable closure is characterized on this fixed matrix.  The
+# 128Q x 64KV point is the production control; smaller tiles only describe how
+# much density/error is recovered by finer mask sharing.
+EXECUTION_Q_TILES = (128, 64, 32, 16, 8)
+EXECUTION_KV_TILES = (64, 32, 16)
+EXECUTION_ERROR_GEOMETRIES = frozenset(
+    ((128, 64), (64, 32), (32, 32), (16, 32),
+     (64, 16), (32, 16), (16, 16))
+)
+
 
 def parse_budgets(spec):
     """Normalize a budget string or numeric iterable to sorted fractions.
@@ -328,6 +338,10 @@ def analyze_routing(
     else:
         evaluated_start, evaluated_end = qs, qe
         execution_q_tiles = None
+    execution_matrix_q_tiles = tuple(
+        q_tile for q_tile in EXECUTION_Q_TILES
+        if evaluated_start % q_tile == 0
+    ) if execution_geometry == "sage_sparse" else ()
     q_eval_all = q[0, :, evaluated_start:evaluated_end, :]
 
     accum = {
@@ -346,6 +360,14 @@ def analyze_routing(
             "executable_rel_l2": [],
             "executable_mean_abs": [],
             "executable_max_abs": [],
+            "executable_matrix": {
+                (q_tile, kv_tile): {
+                    "density": [],
+                    "rel_l2": [],
+                }
+                for q_tile in execution_matrix_q_tiles
+                for kv_tile in EXECUTION_KV_TILES
+            },
         }
         for frac in budgets
     }
@@ -427,6 +449,7 @@ def analyze_routing(
             bucket["oracle_max_abs"].append(oracle_max_abs.detach().cpu())
 
             if execution_geometry == "sage_sparse":
+                configured_geometry = (sage_q_tile, sage_kv_tile)
                 executable_keep, _execution_meta = _execution_mask(
                     routed_keep_all,
                     evaluated_start,
@@ -456,6 +479,46 @@ def analyze_routing(
                 bucket["executable_max_abs"].append(
                     executable_max_abs.detach().cpu()
                 )
+
+                # Characterize the complete executable Q x KV closure while
+                # the logical route, dense probabilities, values, and dense
+                # output are already live.  Density-only geometries avoid the
+                # masked output/error pass; the production control reuses the
+                # executable calculation above when it is the configured ABI.
+                for geometry, matrix_bucket in bucket["executable_matrix"].items():
+                    q_tile, kv_tile = geometry
+                    if geometry == configured_geometry:
+                        geometry_keep = executable_keep
+                        geometry_rel_l2 = executable_rel_l2
+                    else:
+                        geometry_keep, _ = _execution_mask(
+                            routed_keep_all,
+                            evaluated_start,
+                            evaluated_end,
+                            layout.seq_len,
+                            (v0, v1),
+                            q_tile,
+                            kv_tile,
+                            evaluated_start,
+                            evaluated_end,
+                        )
+                        geometry_rel_l2 = None
+
+                    matrix_bucket["density"].append(
+                        geometry_keep.float().mean(-1).detach().cpu()
+                    )
+                    if geometry in EXECUTION_ERROR_GEOMETRIES:
+                        if geometry_rel_l2 is None:
+                            _exec_mass, geometry_out = _renormalized_masked_output(
+                                probs, vh, geometry_keep
+                            )
+                            geometry_rel_l2, _mean_abs, _max_abs = _per_head_error(
+                                geometry_out, dense_out
+                            )
+                            del _exec_mass, geometry_out
+                        matrix_bucket["rel_l2"].append(
+                            geometry_rel_l2.detach().cpu()
+                        )
 
             del (
                 routed_blocks,
@@ -544,6 +607,47 @@ def analyze_routing(
                     "executable_worst_heads": _worst_heads(executable_rel_l2),
                 }
             )
+
+            # Keep the closure matrix as JSON-native scalars/lists.  In
+            # particular, do not retain masks, probabilities, values, or model
+            # outputs after this budget is finished.
+            executable_matrix = {}
+            for (q_tile, kv_tile), matrix_bucket in bucket["executable_matrix"].items():
+                matrix_density = torch.cat(matrix_bucket["density"], dim=0)
+                key = "%dx%d" % (q_tile, kv_tile)
+                entry = {
+                    "q_tile": int(q_tile),
+                    "kv_tile": int(kv_tile),
+                    "executable_density_mean": float(matrix_density.mean()),
+                    "executable_density_max": float(matrix_density.max()),
+                }
+                if (q_tile, kv_tile) in EXECUTION_ERROR_GEOMETRIES:
+                    matrix_rel_l2 = torch.cat(matrix_bucket["rel_l2"], dim=0)
+                    entry.update(
+                        {
+                            "executable_rel_l2_mean_head": float(matrix_rel_l2.mean()),
+                            "executable_rel_l2_max_head": float(matrix_rel_l2.max()),
+                            "executable_head_rel_l2": [
+                                float(x) for x in matrix_rel_l2.tolist()
+                            ],
+                        }
+                    )
+                executable_matrix[key] = entry
+
+            row["executable_q_kv_matrix"] = executable_matrix
+            # This is the old single-KV compatibility view, now derived from
+            # the matrix rather than rerouting Q=1/2/4 candidates.
+            row["executable_q_tile_density_sweep"] = {
+                str(q_tile): {
+                    "mean": executable_matrix["%dx64" % q_tile][
+                        "executable_density_mean"
+                    ],
+                    "max": executable_matrix["%dx64" % q_tile][
+                        "executable_density_max"
+                    ],
+                }
+                for q_tile in execution_matrix_q_tiles
+            }
         else:
             row["executable_metrics"] = None
         row.update(_threshold_heads(rel_l2))
@@ -571,6 +675,10 @@ def analyze_routing(
     if execution_geometry == "sage_sparse":
         result.update(
             {
+                "execution_q_tile_density_sweep_kv_tile": 64,
+                "execution_q_tile_density_sweep": list(execution_matrix_q_tiles),
+                "execution_q_kv_matrix_q_tiles": list(execution_matrix_q_tiles),
+                "execution_q_kv_matrix_kv_tiles": list(EXECUTION_KV_TILES),
                 "requested_q_range": [int(qs), int(qe)],
                 "evaluated_q_range": [int(evaluated_start), int(evaluated_end)],
             }

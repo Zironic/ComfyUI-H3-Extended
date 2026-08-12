@@ -15,6 +15,10 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(_HERE))
 sys.path.insert(0, os.path.abspath(os.path.join(_HERE, "..", "..", "..")))
 
+sys.argv = [sys.argv[0], "--cpu"]
+import comfy.options  # noqa: E402
+comfy.options.enable_args_parsing()
+
 from h3_probe import moba3d, q_mask_sharing_sweep  # noqa: E402
 
 
@@ -53,19 +57,19 @@ def test_exact_union_curve():
 def test_sweep_sizes():
     check(
         q_mask_sharing_sweep.q_tile_sweep_sizes(128)
-        == (128, 64, 32, 16, 8, 4, 2, 1),
-        "SM89 Q=128 produces the intended complete sharing ladder",
+        == (128, 64, 32, 16, 8),
+        "SM89 Q=128 produces the supported executable Q rows",
     )
 
 
 def test_probe_wrapper_attaches_sweep():
     layout = SimpleNamespace(
-        seq_len=8,
-        video_range=(0, 8),
-        video_shape=(1, 2, 4),
+        seq_len=32,
+        video_range=(0, 32),
+        video_shape=(1, 4, 8),
     )
     torch.manual_seed(41)
-    q = torch.randn(1, 2, 8, 4)
+    q = torch.randn(1, 2, 32, 4)
     k = torch.randn_like(q)
     v = torch.randn_like(q)
 
@@ -75,31 +79,44 @@ def test_probe_wrapper_attaches_sweep():
         v,
         layout,
         0,
-        8,
+        32,
         block_t=1,
         block_h=1,
         block_w=1,
         budgets=(0.5,),
         head_chunk=1,
         execution_geometry="sage_sparse",
-        sage_q_tile=8,
-        sage_kv_tile=1,
+        sage_q_tile=128,
+        sage_kv_tile=64,
     )
 
     row = result["budgets"][0]
-    sweep = row.get("executable_q_tile_density_sweep")
-    check(sweep is not None,
-          "sage_sparse probe records contain the Q-sharing density sweep")
-    check(list(sweep) == ["8", "4", "2", "1"],
-          "record preserves the Q-sharing ladder in descending execution size")
-    check(result["execution_q_tile_density_sweep"] == [8, 4, 2, 1],
-          "record metadata identifies all tested Q-sharing sizes")
-    check(result["execution_q_tile_density_sweep_kv_tile"] == 1,
-          "record metadata identifies the fixed KV granularity")
+    matrix = row.get("executable_q_kv_matrix")
+    check(matrix is not None, "sage_sparse probe records contain the Q x KV matrix")
+    check(len(matrix) == 15, "matrix contains all 15 supported Q x KV geometries")
+    check(not any(key.startswith(("1x", "2x", "4x")) for key in matrix),
+          "matrix does not compute legacy Q=1/2/4 geometries")
 
-    means = [sweep[str(q_tile)]["mean"] for q_tile in (1, 2, 4, 8)]
-    check(all(a <= b + 1e-7 for a, b in zip(means, means[1:])),
-          "executable density cannot increase as Q-mask sharing gets finer")
+    exact = {"128x64", "64x32", "32x32", "16x32", "64x16", "32x16", "16x16"}
+    check(
+        {key for key, value in matrix.items() if "executable_head_rel_l2" in value}
+        == exact,
+        "exact executable errors exist only for the seven requested geometries",
+    )
+    check(
+        matrix["128x64"]["executable_rel_l2_mean_head"]
+        == row["executable_sparse_output_rel_l2_mean_head"],
+        "128x64 matrix control reuses the existing executable metrics",
+    )
+    check(
+        len(matrix["128x64"]["executable_head_rel_l2"]) == 2,
+        "head error arrays aggregate across head chunks",
+    )
+    check(
+        matrix["128x64"]["executable_density_max"]
+        >= matrix["128x64"]["executable_density_mean"],
+        "density arrays aggregate across head chunks",
+    )
 
 
 def main():
