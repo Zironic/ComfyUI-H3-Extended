@@ -29,6 +29,8 @@ MLP_MEMORY_OFF = "off"
 MLP_MEMORY_LEGACY_BF16 = "legacy_bf16"
 MLP_MEMORY_LEGACY_NATIVE = "legacy_native"
 MLP_MEMORY_LEGACY_CONVROT_REQUIRED = "legacy_convrot_2slice_required"
+MLP_MEMORY_STRICT_BF16 = "strict_bf16"
+MLP_MEMORY_STRICT_NATIVE = "strict_native"
 
 MLP_MEMORY_REQUESTS = (
     MLP_MEMORY_AUTO,
@@ -37,6 +39,8 @@ MLP_MEMORY_REQUESTS = (
     MLP_MEMORY_LEGACY_BF16,
     MLP_MEMORY_LEGACY_NATIVE,
     MLP_MEMORY_LEGACY_CONVROT_REQUIRED,
+    MLP_MEMORY_STRICT_BF16,
+    MLP_MEMORY_STRICT_NATIVE,
 )
 
 DENSITY_FIXED = "fixed"
@@ -71,12 +75,16 @@ class MemoryRequest:
         if int(self.chunk_rows) <= 0:
             raise ValueError("chunk_rows must be positive")
 
-        # Preserve the former strict mode's most important preflight behavior:
-        # requesting fused QKV may not silently become standard QKV. Keeping the
-        # canonical value in the immutable plan also makes status and duplicate
-        # detection accurately report the fail-closed request.
-        if bool(self.strict) and self.fused_qkv == FUSED_QKV_AUTO:
-            object.__setattr__(self, "fused_qkv", FUSED_QKV_REQUIRED)
+        # Canonicalize fail-closed requests inside the immutable plan so
+        # provider resolution, status, duplicate detection, and node order all
+        # observe the same effective configuration.
+        if bool(self.strict):
+            if self.fused_qkv == FUSED_QKV_AUTO:
+                object.__setattr__(self, "fused_qkv", FUSED_QKV_REQUIRED)
+            if self.mlp_memory == MLP_MEMORY_LEGACY_BF16:
+                object.__setattr__(self, "mlp_memory", MLP_MEMORY_STRICT_BF16)
+            elif self.mlp_memory == MLP_MEMORY_LEGACY_NATIVE:
+                object.__setattr__(self, "mlp_memory", MLP_MEMORY_STRICT_NATIVE)
 
     @property
     def signature(self):
