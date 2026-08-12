@@ -1,146 +1,137 @@
-"""Deprecated compatibility adapter for the former combined H3 node."""
+"""Experimental combined H3 Sparse Sage, fused-QKV, and MLP node.
 
+This node intentionally remains the full experimental surface in H3-Extended.
+The two production nodes use the smaller format-aware plan implementation; this
+node keeps adaptive routing, timing reports, run tags, and shared Inductor
+compilation for development workflows.
+"""
+
+import os
+
+import folder_paths
 from comfy_api.latest import ComfyExtension, io, ui
 
 try:
-    from ..h3_sage_optimizations.apply import apply_plan
-    from ..h3_sage_optimizations.plan import (
-        ATTENTION_EXISTING,
-        COMPILE_INDUCTOR,
-        COMPILE_OFF,
-        DENSITY_ADAPTIVE_BUDGET,
+    from ..h3_activation_memory.config import (
+        DEFAULT_CHUNK_ROWS,
+        DEFAULT_MODE,
+        MIN_CHUNK_ROWS,
+        MODE_CONVROT_2SLICE,
+    )
+    from ..h3_attention.hybrid import (
         DENSITY_FIXED,
         DENSITY_MODES,
-        FUSED_QKV_AUTO,
-        FUSED_QKV_OFF,
-        FUSED_QKV_REQUIRED,
-        MLP_MEMORY_AUTO,
-        MLP_MEMORY_LEGACY_BF16,
-        MLP_MEMORY_LEGACY_CONVROT_REQUIRED,
-        MLP_MEMORY_LEGACY_NATIVE,
-        MLP_MEMORY_OFF,
-        MemoryRequest,
-        SparseRequest,
-        read_plan,
+        HybridSparseBackend,
+        HybridSparseConfig,
+        HybridStatsCollector,
+        IMPLEMENTED_MODES,
+        MODE_SAGE128_FUSED_QKV,
+        preflight_sparse_sage,
     )
-    from ..h3_sage_optimizations.status import (
-        format_disabled_status,
-        format_legacy_status,
+    from ..h3_memory_optimizer.attention import (
+        ATTENTION_EXISTING,
+        AttentionDecision,
+        RuntimeEnvironment,
     )
+    from ..h3_memory_optimizer.config import (
+        ACTIVATION_MODES,
+        MemoryOptimizerConfig,
+    )
+    from ..h3_memory_optimizer.patch import apply
+    from ..h3_runtime.compile_compat import request_shared_block_compile
 except ImportError:
-    from h3_sage_optimizations.apply import apply_plan
-    from h3_sage_optimizations.plan import (
-        ATTENTION_EXISTING,
-        COMPILE_INDUCTOR,
-        COMPILE_OFF,
-        DENSITY_ADAPTIVE_BUDGET,
+    from h3_activation_memory.config import (
+        DEFAULT_CHUNK_ROWS,
+        DEFAULT_MODE,
+        MIN_CHUNK_ROWS,
+        MODE_CONVROT_2SLICE,
+    )
+    from h3_attention.hybrid import (
         DENSITY_FIXED,
         DENSITY_MODES,
-        FUSED_QKV_AUTO,
-        FUSED_QKV_OFF,
-        FUSED_QKV_REQUIRED,
-        MLP_MEMORY_AUTO,
-        MLP_MEMORY_LEGACY_BF16,
-        MLP_MEMORY_LEGACY_CONVROT_REQUIRED,
-        MLP_MEMORY_LEGACY_NATIVE,
-        MLP_MEMORY_OFF,
-        MemoryRequest,
-        SparseRequest,
-        read_plan,
+        HybridSparseBackend,
+        HybridSparseConfig,
+        HybridStatsCollector,
+        IMPLEMENTED_MODES,
+        MODE_SAGE128_FUSED_QKV,
+        preflight_sparse_sage,
     )
-    from h3_sage_optimizations.status import (
-        format_disabled_status,
-        format_legacy_status,
+    from h3_memory_optimizer.attention import (
+        ATTENTION_EXISTING,
+        AttentionDecision,
+        RuntimeEnvironment,
+    )
+    from h3_memory_optimizer.config import (
+        ACTIVATION_MODES,
+        MemoryOptimizerConfig,
+    )
+    from h3_memory_optimizer.patch import apply
+    from h3_runtime.compile_compat import request_shared_block_compile
+
+ATTENTION_HYBRID = "hybrid_sparse"
+PRODUCTION_PLAN_KEY = "minimax_h3_sage_optimization_plan"
+
+
+def _output_root():
+    return os.path.join(
+        folder_paths.get_output_directory(),
+        "h3_hybrid_sparse",
     )
 
-MODE_SAGE128 = "sage128"
-MODE_SAGE128_FUSED_QKV = "sage128_fused_qkv"
-IMPLEMENTED_MODES = (MODE_SAGE128, MODE_SAGE128_FUSED_QKV)
 
-ACTIVATION_OFF = "off"
-MODE_BF16 = "mlp_chunked_bf16"
-MODE_NATIVE = "mlp_chunked_native"
-MODE_CONVROT_2SLICE = "mlp_chunked_convrot_2slice"
-ACTIVATION_MODES = (
-    ACTIVATION_OFF,
-    MODE_BF16,
-    MODE_CONVROT_2SLICE,
-    MODE_NATIVE,
-)
+def _reject_production_plan(model):
+    """Keep the monolithic experiment separate from the production patches."""
 
-DEFAULT_CHUNK_ROWS = 2048
-MIN_CHUNK_ROWS = 256
-
-
-def _memory_request(mode, activation, strict, chunk_rows):
-    if mode == MODE_SAGE128:
-        fused_qkv = FUSED_QKV_OFF
-    elif mode == MODE_SAGE128_FUSED_QKV:
-        fused_qkv = FUSED_QKV_REQUIRED if strict else FUSED_QKV_AUTO
-    else:
-        raise ValueError("unknown Hybrid Sparse mode %r" % mode)
-
-    if activation == ACTIVATION_OFF:
-        mlp_memory = MLP_MEMORY_OFF
-    elif activation == MODE_BF16:
-        mlp_memory = MLP_MEMORY_LEGACY_BF16
-    elif activation == MODE_NATIVE:
-        mlp_memory = MLP_MEMORY_LEGACY_NATIVE
-    elif activation == MODE_CONVROT_2SLICE:
-        mlp_memory = (
-            MLP_MEMORY_LEGACY_CONVROT_REQUIRED
-            if strict
-            else MLP_MEMORY_AUTO
+    options = getattr(model, "model_options", {}) or {}
+    if options.get(PRODUCTION_PLAN_KEY) is not None:
+        raise ValueError(
+            "MiniMax H3 Hybrid Sparse Attention is the monolithic experimental "
+            "node and cannot be combined with MiniMax H3 Sage Memory Optimizer "
+            "or MiniMax H3 Sparse Sage Attention on the same model branch. Use "
+            "either this experimental node or the two production nodes."
         )
-    else:
-        raise ValueError("unknown legacy activation mode %r" % activation)
-
-    return MemoryRequest(
-        attention=ATTENTION_EXISTING,
-        fused_qkv=fused_qkv,
-        mlp_memory=mlp_memory,
-        chunk_rows=int(chunk_rows),
-        prefer_held_weights=True,
-    )
 
 
 class MiniMaxH3HybridSparseAttention(io.ComfyNode):
-    """Translate the former combined node into the two production requests."""
+    """Full experimental H3 sparse-attention and memory-optimization surface."""
 
     @classmethod
     def define_schema(cls):
         return io.Schema(
             node_id="MiniMaxH3HybridSparseAttentionZi",
             display_name=(
-                "MiniMax H3 Hybrid Sparse Attention "
-                "(Deprecated Compatibility)"
+                "MiniMax H3 Hybrid Sparse Attention (Experimental)"
             ),
-            category="model/patch/minimax/compatibility",
+            category="model/patch/minimax/experiments",
             description=(
-                "Deprecated compatibility adapter for saved workflows. It "
-                "translates every meaningful former Sparse Sage, fused-QKV, "
-                "MLP, adaptive-routing, reporting, and shared-compilation "
-                "control into the new composable requests."
+                "Full experimental H3 Sparse Sage node. It retains fixed and "
+                "adaptive routing, optional fused QKV, chunked/tiled MLP modes, "
+                "timing reports, run tags, and shared Inductor compilation. "
+                "Do not combine it with the two production H3 Sage nodes."
             ),
             search_aliases=[
                 "H3 Hybrid Sparse",
-                "old H3 sparse",
-                "legacy H3 sparse",
-                "MiniMax H3 sparse compatibility",
+                "H3 adaptive sparse",
+                "H3 sparse experiment",
+                "H3 compiled sparse",
+                "MiniMax experimental sparse",
             ],
-            is_deprecated=True,
             inputs=[
                 io.Model.Input("model"),
                 io.Boolean.Input(
                     "enabled",
                     display_name="Enable",
                     default=True,
+                    tooltip=(
+                        "When disabled, this node is an exact pass-through. It "
+                        "does not remove patches already applied upstream."
+                    ),
                 ),
                 io.Combo.Input(
                     "mode",
-                    display_name="Legacy attention mode",
+                    display_name="Attention mode",
                     options=list(IMPLEMENTED_MODES),
-                    default=MODE_SAGE128,
+                    default="sage128",
                 ),
                 io.Float.Input(
                     "video_budget",
@@ -150,25 +141,22 @@ class MiniMaxH3HybridSparseAttention(io.ComfyNode):
                     max=1.0,
                     step=0.01,
                     tooltip=(
-                        "Requested pure-video KV tile fraction. Fixed and "
-                        "adaptive routing use the same quantized global budget."
+                        "Fixed: fraction retained by every pure-video row. "
+                        "Adaptive budget: target mean fraction across all "
+                        "pure-video head/query rows."
                     ),
                 ),
                 io.Boolean.Input(
                     "strict",
-                    display_name="Require legacy specialized paths",
+                    display_name="Strict experimental paths",
                     default=True,
                     advanced=True,
-                    tooltip=(
-                        "Require explicitly selected fused-QKV and ConvRot "
-                        "two-slice paths and strict packed-layout validation."
-                    ),
                 ),
                 io.Combo.Input(
                     "activation",
-                    display_name="Legacy MLP mode",
+                    display_name="MLP execution",
                     options=list(ACTIVATION_MODES),
-                    default=MODE_NATIVE,
+                    default=DEFAULT_MODE,
                     advanced=True,
                 ),
                 io.Int.Input(
@@ -188,27 +176,38 @@ class MiniMaxH3HybridSparseAttention(io.ComfyNode):
                 ),
                 io.Boolean.Input(
                     "timing",
-                    display_name="Include deferred CUDA timing",
+                    display_name="Write timing reports",
                     default=True,
                     advanced=True,
                 ),
                 io.Combo.Input(
                     "compile_backend",
                     display_name="Shared block compilation",
-                    options=[COMPILE_OFF, COMPILE_INDUCTOR],
-                    default=COMPILE_OFF,
+                    options=["off", "inductor"],
+                    default="off",
                     advanced=True,
+                    tooltip=(
+                        "Compile one shared tensor program for all 50 main H3 "
+                        "blocks. The current program requires fixed density, "
+                        "fused QKV, and ConvRot two-slice MLP. Do not combine "
+                        "with TorchCompileModel."
+                    ),
                 ),
                 io.Combo.Input(
                     "density_mode",
-                    display_name="Routing policy",
+                    display_name="Density allocation",
                     options=list(DENSITY_MODES),
                     default=DENSITY_FIXED,
                     advanced=True,
+                    tooltip=(
+                        "adaptive_budget preserves the fixed route's aggregate "
+                        "block count while redistributing blocks between "
+                        "head/query rows."
+                    ),
                 ),
                 io.Float.Input(
                     "min_video_density",
-                    display_name="Minimum video density",
+                    display_name="Adaptive minimum density",
                     default=0.05,
                     min=0.01,
                     max=1.0,
@@ -217,7 +216,7 @@ class MiniMaxH3HybridSparseAttention(io.ComfyNode):
                 ),
                 io.Float.Input(
                     "max_video_density",
-                    display_name="Maximum video density",
+                    display_name="Adaptive maximum density",
                     default=0.50,
                     min=0.01,
                     max=1.0,
@@ -232,6 +231,10 @@ class MiniMaxH3HybridSparseAttention(io.ComfyNode):
                     max=20.0,
                     step=0.05,
                     advanced=True,
+                    tooltip=(
+                        "Temperature applied to pooled QK scores before "
+                        "cumulative-mass demand estimation."
+                    ),
                 ),
                 io.Float.Input(
                     "adaptive_target_mass",
@@ -241,6 +244,11 @@ class MiniMaxH3HybridSparseAttention(io.ComfyNode):
                     max=1.0,
                     step=0.01,
                     advanced=True,
+                    tooltip=(
+                        "Coarse video-attention mass used to estimate each "
+                        "row's unconstrained demand before exact budget "
+                        "balancing."
+                    ),
                 ),
             ],
             outputs=[io.Model.Output()],
@@ -251,92 +259,118 @@ class MiniMaxH3HybridSparseAttention(io.ComfyNode):
         cls,
         model,
         enabled=True,
-        mode=MODE_SAGE128,
+        mode="sage128",
         video_budget=0.5,
         strict=True,
-        activation=MODE_NATIVE,
+        activation=DEFAULT_MODE,
         chunk_rows=DEFAULT_CHUNK_ROWS,
         run_tag="hybrid50",
         timing=True,
-        compile_backend=COMPILE_OFF,
+        compile_backend="off",
         density_mode=DENSITY_FIXED,
         min_video_density=0.05,
         max_video_density=0.50,
         adaptive_temperature=1.0,
         adaptive_target_mass=0.80,
-    ):
+    ) -> io.NodeOutput:
         if not enabled:
-            return io.NodeOutput(
-                model,
-                ui=ui.PreviewText(
-                    format_disabled_status(
-                        "MiniMax H3 Hybrid Sparse compatibility adapter"
-                    )
-                ),
-            )
-
-        if compile_backend not in (COMPILE_OFF, COMPILE_INDUCTOR):
+            return io.NodeOutput(model)
+        _reject_production_plan(model)
+        if compile_backend not in ("off", "inductor"):
             raise ValueError(
                 "unknown compile backend %r" % compile_backend
             )
-        if not MIN_CHUNK_ROWS <= int(chunk_rows) <= 16384:
-            raise ValueError(
-                "chunk_rows must be between %d and 16384, got %r"
-                % (MIN_CHUNK_ROWS, chunk_rows)
-            )
-        if int(chunk_rows) % 256:
-            raise ValueError(
-                "chunk_rows must be a multiple of 256, got %r"
-                % chunk_rows
-            )
 
-        # Preserve the former node's early validation order so invalid compile
-        # requests fail before any CUDA or Sparse Sage dependency preflight.
-        if compile_backend == COMPILE_INDUCTOR:
-            if density_mode != DENSITY_FIXED:
+        hybrid_config = HybridSparseConfig(
+            mode=mode,
+            video_budget=float(video_budget),
+            density_mode=str(density_mode),
+            min_video_density=float(min_video_density),
+            max_video_density=float(max_video_density),
+            adaptive_temperature=float(adaptive_temperature),
+            adaptive_target_mass=float(adaptive_target_mass),
+            strict=bool(strict),
+            run_tag=str(run_tag),
+            timing=bool(timing),
+        )
+        optimizer_config = MemoryOptimizerConfig(
+            attention=ATTENTION_EXISTING,
+            activation=activation,
+            chunk_rows=int(chunk_rows),
+            activation_strict=bool(strict),
+        )
+
+        if compile_backend == "inductor":
+            if hybrid_config.density_mode != DENSITY_FIXED:
                 raise ValueError(
                     "Inductor shared-block compilation currently requires "
-                    "fixed density_mode"
+                    "fixed density_mode; adaptive_budget remains available "
+                    "in eager mode"
                 )
-            if mode != MODE_SAGE128_FUSED_QKV:
+            if hybrid_config.mode != MODE_SAGE128_FUSED_QKV:
                 raise ValueError(
                     "Inductor requires the sage128_fused_qkv attention mode"
                 )
-            if activation != MODE_CONVROT_2SLICE:
+            if optimizer_config.activation != MODE_CONVROT_2SLICE:
                 raise ValueError(
                     "Inductor requires mlp_chunked_convrot_2slice activation"
                 )
 
-        plan = read_plan(model)
-        plan = plan.with_memory(
-            _memory_request(
-                mode,
-                activation,
-                bool(strict),
-                int(chunk_rows),
+        collector = HybridStatsCollector(
+            _output_root(),
+            hybrid_config.run_tag,
+        )
+        environment = RuntimeEnvironment.detect()
+        kernel_spec = preflight_sparse_sage(
+            cuda_available=lambda: environment.cuda_available,
+            capability_getter=lambda: environment.capability,
+        )
+        backend = HybridSparseBackend(
+            hybrid_config,
+            kernel_spec=kernel_spec,
+            collector=collector,
+        )
+        decision = AttentionDecision(
+            requested=ATTENTION_HYBRID,
+            selected=ATTENTION_HYBRID,
+            backend=backend,
+            adapter=ATTENTION_HYBRID,
+            reason=(
+                "explicit portable Sparse Sage experiment (%s)"
+                % hybrid_config.density_mode
+            ),
+            environment=environment,
+            projector=backend.projector,
+        )
+
+        patched = model.clone()
+        if compile_backend == "inductor":
+            request_shared_block_compile(patched)
+        apply(
+            patched,
+            config=optimizer_config,
+            decision=decision,
+        )
+
+        status = (
+            "Experimental Hybrid Sparse armed: mode=%s, density=%s, "
+            "video budget=%.1f%%, MLP=%s, compile=%s"
+            % (
+                hybrid_config.mode,
+                hybrid_config.density_mode,
+                hybrid_config.video_budget * 100.0,
+                optimizer_config.activation,
+                compile_backend,
             )
         )
-        plan = plan.with_sparse(
-            SparseRequest(
-                video_budget=float(video_budget),
-                density_mode=str(density_mode),
-                min_video_density=float(min_video_density),
-                max_video_density=float(max_video_density),
-                adaptive_temperature=float(adaptive_temperature),
-                adaptive_target_mass=float(adaptive_target_mass),
-                strict=bool(strict),
-                # The former combined node always wrote structural reports;
-                # timing only controlled inclusion of deferred CUDA events.
-                write_report=True,
-                timing=bool(timing),
-                run_tag=str(run_tag),
-                compile_backend=str(compile_backend),
+        if hybrid_config.timing:
+            status += "\nReports: %s (run tag %s)" % (
+                _output_root(),
+                hybrid_config.run_tag,
             )
-        )
-        patched = apply_plan(model, plan)
         return io.NodeOutput(
             patched,
-            ui=ui.PreviewText(format_legacy_status(patched)),
+            ui=ui.PreviewText(status),
         )
 
 
