@@ -31,9 +31,10 @@ The status text shown after execution reports the selected attention backend, QK
 - **Error instead of specialized fallback**
   - With `QKV projection optimization=auto`, convert the request into required fused QKV so incompatible formats or hardware fail during preflight instead of silently using standard QKV.
   - QKV explicitly set to `off` remains off.
-  - Explicit ConvRot two-slice and epilogue MLP requests are already fail-closed. Generic BF16/native execution retains its safe Comfy fallback behavior.
+  - Automatic, BF16, and native MLP selection use internal strict execution modes that preserve the selected arithmetic but raise on held-weight/provider failures rather than switching to ordinary module calls.
+  - Explicit ConvRot two-slice and epilogue requests are already fail-closed.
 - **MLP chunk rows**: maximum token rows in one MLP chunk. Larger chunks may be faster but require more activation memory.
-- **Hold weights across chunks**: acquire `fc1` and `fc2` once for all chunks when the effective Comfy weight handles are safe to retain. Unsafe reusable cast-buffer combinations fall back automatically.
+- **Hold weights across chunks**: acquire `fc1` and `fc2` once for all chunks when the effective Comfy weight handles are safe to retain. Unsafe reusable cast-buffer combinations fall back automatically unless strict mode is enabled.
 
 These controls preserve the meaningful `mode`, `activation`, `strict`, and `chunk_rows` behavior of the former combined experiment without putting QKV or MLP implementation choices on the Sparse node.
 
