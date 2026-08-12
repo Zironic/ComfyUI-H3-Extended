@@ -70,10 +70,13 @@ class MemoryRequest:
             raise ValueError("unknown MLP memory request %r" % self.mlp_memory)
         if int(self.chunk_rows) <= 0:
             raise ValueError("chunk_rows must be positive")
-        if bool(self.strict) and self.fused_qkv == FUSED_QKV_OFF:
-            # Strict still applies to an explicit MLP path, so this combination
-            # is valid. Do not treat disabled QKV optimization as an error.
-            pass
+
+        # Preserve the former strict mode's most important preflight behavior:
+        # requesting fused QKV may not silently become standard QKV. Keeping the
+        # canonical value in the immutable plan also makes status and duplicate
+        # detection accurately report the fail-closed request.
+        if bool(self.strict) and self.fused_qkv == FUSED_QKV_AUTO:
+            object.__setattr__(self, "fused_qkv", FUSED_QKV_REQUIRED)
 
     @property
     def signature(self):
