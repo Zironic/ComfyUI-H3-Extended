@@ -102,8 +102,31 @@ def main():
         "Sparse Sage has a stable production node id",
     )
     check(
-        sparse_ids == ["model", "enabled", "video_budget"],
-        "Sparse Sage contains no QKV or MLP controls",
+        sparse_ids == [
+            "model",
+            "enabled",
+            "video_budget",
+            "density_mode",
+            "min_video_density",
+            "max_video_density",
+            "adaptive_temperature",
+            "adaptive_target_mass",
+            "strict",
+            "write_report",
+            "timing",
+            "run_tag",
+            "compile_backend",
+        ],
+        "Sparse Sage exposes every meaningful former sparse control",
+    )
+    check(
+        {
+            item.id
+            for item in sparse.inputs
+            if getattr(item, "advanced", False)
+        }
+        == set(sparse_ids[3:]),
+        "all optional routing, validation, reporting, and compile controls are advanced",
     )
     budget = input_by_id(sparse, "video_budget")
     check(
@@ -117,9 +140,21 @@ def main():
         "Sparse budget tooltip explains quantization and dense context",
     )
     check(
+        input_by_id(sparse, "density_mode").options
+        == ["fixed", "adaptive_budget"]
+        and input_by_id(sparse, "max_video_density").default == 1.0,
+        "adaptive routing is available with room to redistribute by default",
+    )
+    check(
+        input_by_id(sparse, "timing").default is False
+        and input_by_id(sparse, "write_report").default is False
+        and input_by_id(sparse, "compile_backend").default == "off",
+        "diagnostics and shared compilation remain opt-in",
+    )
+    check(
         "Sparse Sage" in sparse.search_aliases
-        and "Sparge" in sparse.search_aliases,
-        "Sparse node publishes search aliases",
+        and "H3 adaptive attention" in sparse.search_aliases,
+        "Sparse node publishes fixed and adaptive search aliases",
     )
 
     marker = object()
