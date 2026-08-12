@@ -85,10 +85,15 @@ class SparseFusedQKVProjector:
 
     def __init__(self, required=False, tensor_core=None):
         try:
-            from ..h3_attention.hybrid.fused_qkv import (
+            # This module is two package levels below the custom-node root:
+            # <root>.h3_sage_optimizations.qkv.projectors.  Climb to <root>
+            # before importing the sibling h3_attention package.
+            from ...h3_attention.hybrid.fused_qkv import (
                 FusedQKVProjector as Implementation,
             )
-        except ImportError:
+        except (ImportError, ValueError):
+            # Preserve support for direct top-level imports used by local test
+            # harnesses and by the eventual standalone extraction layout.
             from h3_attention.hybrid.fused_qkv import (
                 FusedQKVProjector as Implementation,
             )
