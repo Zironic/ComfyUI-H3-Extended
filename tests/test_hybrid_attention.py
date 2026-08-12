@@ -19,6 +19,7 @@ import comfy.options  # noqa: E402
 comfy.options.enable_args_parsing()
 
 from h3_attention.hybrid import (  # noqa: E402
+    DENSITY_ADAPTIVE_BUDGET,
     DeferredCudaTiming,
     HybridSparseBackend,
     HybridSparseConfig,
@@ -29,12 +30,14 @@ from h3_attention.hybrid import (  # noqa: E402
     SparseSageExecutor,
     SparseTileRouter,
     load_sparse_sage_spec,
+    resolve_density_plan,
     resolve_sparse_sage_spec,
 )
 from h3_runtime.context import RUNTIME_KEY, RuntimeSnapshot  # noqa: E402
 from h3_sparse_attention.nodes import MiniMaxH3HybridSparseAttention  # noqa: E402
 from h3_attention.hybrid.report import render  # noqa: E402
 from h3_attention.hybrid.sparse_sage import (  # noqa: E402
+    _empty_fp8_like_with_oom_retry,
     _load_qattn_surface,
     quantize_qk,
 )
@@ -275,6 +278,70 @@ def backend(kernel=None, collector=None, budget=0.5):
         v_preparer=fake_v_preparer,
         qk_quantizer=quantize_qk,
     ), kernel
+
+
+def test_adaptive_budget_raises_effective_maximum():
+    print("adaptive budget above configured maximum")
+    partial = HybridSparseConfig(
+        video_budget=0.75,
+        density_mode=DENSITY_ADAPTIVE_BUDGET,
+        min_video_density=0.25,
+        max_video_density=0.50,
+    )
+    partial_plan = resolve_density_plan(partial, partial.video_budget, pure_kv=4)
+    check(partial_plan.target == 3 and partial_plan.maximum == 3,
+          "an above-maximum budget raises the quantized adaptive rail")
+
+    config = HybridSparseConfig(
+        video_budget=1.0,
+        density_mode=DENSITY_ADAPTIVE_BUDGET,
+        min_video_density=0.25,
+        max_video_density=0.50,
+    )
+    plan = resolve_density_plan(config, config.video_budget, pure_kv=4)
+    check(plan.target == 4, "adaptive target honors a 100% requested budget")
+    check(plan.maximum == 4, "effective maximum is raised to the quantized target")
+    check(plan.target == plan.maximum == 4,
+          "100% adaptive routing has no lower effective maximum rail")
+
+
+def test_fp8_allocation_oom_retry():
+    print("FP8 allocation OOM retry")
+    reference = SimpleNamespace(device=torch.device("cuda", 0))
+    recovered = object()
+    first_oom = torch.OutOfMemoryError("synthetic first allocation failure")
+    second_oom = torch.OutOfMemoryError("synthetic retry failure")
+
+    with mock.patch(
+        "h3_attention.hybrid.sparse_sage.torch.empty_like",
+        side_effect=(first_oom, recovered),
+    ) as allocate, mock.patch(
+        "h3_attention.hybrid.sparse_sage.torch.cuda.synchronize"
+    ) as synchronize, mock.patch(
+        "h3_attention.hybrid.sparse_sage.torch.cuda.empty_cache"
+    ) as empty_cache:
+        result = _empty_fp8_like_with_oom_retry(reference)
+    check(result is recovered and allocate.call_count == 2,
+          "failed FP8 allocation is retried exactly once")
+    synchronize.assert_called_once_with(reference.device)
+    empty_cache.assert_called_once_with()
+    check(True, "retry synchronizes the device and clears cached pool backing")
+
+    with mock.patch(
+        "h3_attention.hybrid.sparse_sage.torch.empty_like",
+        side_effect=(first_oom, second_oom),
+    ) as allocate, mock.patch(
+        "h3_attention.hybrid.sparse_sage.torch.cuda.synchronize"
+    ), mock.patch(
+        "h3_attention.hybrid.sparse_sage.torch.cuda.empty_cache"
+    ):
+        try:
+            _empty_fp8_like_with_oom_retry(reference)
+        except torch.OutOfMemoryError as exc:
+            check(exc is second_oom and allocate.call_count == 2,
+                  "a genuine OOM propagates after the single retry")
+        else:
+            raise AssertionError("the second allocation OOM must propagate")
 
 
 def test_prepare_execute_lifetime():
@@ -753,6 +820,8 @@ def optional_cuda_numerical():
 def main():
     test_kernel_spec_resolution()
     test_architecture_specific_carriers_and_abis()
+    test_adaptive_budget_raises_effective_maximum()
+    test_fp8_allocation_oom_retry()
     test_prepare_execute_lifetime()
     test_strict_errors()
     test_dependency_and_disabled_node()

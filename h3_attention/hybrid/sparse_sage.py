@@ -13,6 +13,15 @@ class SparseSageError(RuntimeError):
     pass
 
 
+def _empty_fp8_like_with_oom_retry(reference):
+    try:
+        return torch.empty_like(reference, dtype=torch.float8_e4m3fn)
+    except torch.OutOfMemoryError:
+        torch.cuda.synchronize(reference.device)
+        torch.cuda.empty_cache()
+        return torch.empty_like(reference, dtype=torch.float8_e4m3fn)
+
+
 @dataclass(frozen=True)
 class SparseSageKernelSpec:
     """The complete ABI contract for one Sparse Sage architecture."""
@@ -92,7 +101,7 @@ class SparseSageKernelSpec:
         transposed = torch.empty((b, h, dim, padded), dtype=v.dtype, device=v.device)
         fused.transpose_pad_permute_cuda(v, transposed, 1)
         try:
-            v_fp8 = torch.empty_like(transposed, dtype=torch.float8_e4m3fn)
+            v_fp8 = _empty_fp8_like_with_oom_retry(transposed)
             v_scale = torch.empty((b, h, dim), dtype=torch.float32, device=v.device)
             fused.scale_fuse_quant_cuda(
                 transposed, v_fp8, v_scale, sequence, self.v_quant_bound, 1

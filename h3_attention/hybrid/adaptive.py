@@ -48,7 +48,10 @@ def resolve_density_plan(config, video_budget, pure_kv):
             "adaptive_target_mass must be finite and in (0, 1]"
         )
     minimum = min(pure_kv, max(1, math.ceil(minimum_density * pure_kv)))
-    maximum = min(pure_kv, max(1, math.ceil(maximum_density * pure_kv)))
+    maximum = min(
+        pure_kv,
+        max(target, 1, math.ceil(maximum_density * pure_kv)),
+    )
     if not minimum <= target <= maximum:
         raise AdaptiveDensityError(
             "quantized adaptive target %d lies outside quantized rails [%d, %d]"

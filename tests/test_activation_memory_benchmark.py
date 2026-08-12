@@ -37,6 +37,17 @@ def test_tiled_cases_are_prepacked_once_per_chunk():
     )
 
 
+def test_epilogue_cases_are_prepacked_once_per_chunk_and_parser_accepts_mode():
+    args = bench.build_parser().parse_args(["--swiglu-modes", "convrot_epilogue"])
+    assert args.swiglu_modes == "convrot_epilogue"
+    cases = bench.iter_cases((128, 256), ("bf16", "convrot_epilogue"), ("off", "on"))
+    epilogue_cases = tuple(case for case in cases if case["swiglu_mode"] == "convrot_epilogue")
+    assert epilogue_cases == (
+        {"chunk_rows": 128, "swiglu_mode": "convrot_epilogue", "held_mode": "prepacked"},
+        {"chunk_rows": 256, "swiglu_mode": "convrot_epilogue", "held_mode": "prepacked"},
+    )
+
+
 def test_tiled_mode_rejects_non_bf16_before_building_modules():
     args = bench.build_parser().parse_args(["--swiglu-modes", "tiled_convrot"])
     with mock.patch.object(bench, "build_checkpoint_mlp") as build:
@@ -47,6 +58,59 @@ def test_tiled_mode_rejects_non_bf16_before_building_modules():
         else:
             raise AssertionError("tiled ConvRot must reject non-BF16 compute")
         build.assert_not_called()
+
+
+def test_epilogue_mode_rejects_non_bf16_before_building_modules():
+    args = bench.build_parser().parse_args(["--swiglu-modes", "convrot_epilogue"])
+    with mock.patch.object(bench, "build_checkpoint_mlp") as build:
+        try:
+            bench.run_actual({}, args, torch.device("cpu"), torch.float16)
+        except ValueError as exc:
+            assert "convrot_epilogue" in str(exc)
+            assert "--dtype bf16" in str(exc)
+        else:
+            raise AssertionError("ConvRot epilogue must reject non-BF16 compute")
+        build.assert_not_called()
+
+
+def test_epilogue_mode_requires_checkpoint():
+    try:
+        bench.main(["--swiglu-modes", "convrot_epilogue"])
+    except ValueError as exc:
+        assert "--checkpoint" in str(exc)
+    else:
+        raise AssertionError("ConvRot epilogue must reject synthetic mode")
+
+
+def test_epilogue_dispatch_uses_residual_clone_and_stage_labels():
+    activation = torch.arange(24, dtype=torch.bfloat16).reshape(6, 4)
+    residual = torch.ones_like(activation)
+    gate = torch.full((4,), 2, dtype=torch.bfloat16)
+    original_residual = residual.clone()
+    calls = []
+    stage_names = []
+
+    class FakeSession:
+        def fc1_swiglu_fc2_gated_(self, x, destination, current_gate, stage_factory):
+            calls.append((tuple(x.shape), destination.data_ptr()))
+            stage_names.extend(("mlp_fc1", "mlp_swiglu_fc2"))
+            with stage_factory("mlp_fc1"):
+                activated = x + 1
+            with stage_factory("mlp_swiglu_fc2"):
+                destination.add_(activated * current_gate)
+            return "held_convrot_epilogue_prototype"
+
+    output, path, fc1_ms, fc2_ms = bench.run_convrot_epilogue_case(
+        FakeSession(), activation, residual, gate, 2, torch.device("cpu")
+    )
+    expected = original_residual + (activation + 1) * gate
+    assert path == "held_convrot_epilogue_prototype"
+    assert torch.equal(output, expected)
+    assert torch.equal(residual, original_residual)
+    assert len(calls) == 3
+    assert all(destination_ptr != residual.data_ptr() for _, destination_ptr in calls)
+    assert stage_names == ["mlp_fc1", "mlp_swiglu_fc2"] * 3
+    assert fc1_ms >= 0 and fc2_ms >= 0
 
 
 def test_feature_tile_packing_shape_and_bytes():

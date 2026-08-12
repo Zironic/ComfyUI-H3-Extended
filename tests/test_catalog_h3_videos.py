@@ -11,11 +11,15 @@ import h3_test_tempfile as tempfile  # noqa: E402
 from benchmarks import catalog_h3_videos as catalog
 
 
-def prompt_graph(vector=None, active_sampler="res_multistep"):
+def prompt_graph(vector=None, active_sampler="res_multistep", combined=False):
     sampler = {"class_type": "SamplerCustomAdvanced", "inputs": {
         "noise": ["noise", 0], "guider": ["guider", 0], "sampler": ["ks", 0],
         "sigmas": ["sched", 0], "latent_image": ["latent", 0],
     }}
+    if combined:
+        sampler = {"class_type": "SamplerCustomAdvanced", "inputs": {
+            **sampler["inputs"], "sampler": ["combined", 0], "sigmas": ["combined", 1],
+        }}
     if vector:
         sampler = {"class_type": "SamplerCustomAdvanced", "inputs": {
             **sampler["inputs"], "sampler": ["vec", 0],
@@ -26,6 +30,10 @@ def prompt_graph(vector=None, active_sampler="res_multistep"):
         "ks": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": active_sampler}},
         "vec": {"class_type": "MiniMaxH3VectorAccelSamplerZi", "inputs": vector or {}},
         "sched": {"class_type": "BasicScheduler", "inputs": {"scheduler": "normal", "steps": 20}},
+        "combined": {"class_type": "MiniMaxH3SamplerSchedulerZi", "inputs": {
+            "model": ["model", 0], "sampler_name": "res_multistep",
+            "scheduler": "beta", "steps": 11, "denoise": 1.0,
+        }},
         "noise": {"class_type": "RandomNoise", "inputs": {"noise_seed": 42}},
         "guider": {"class_type": "BasicGuider", "inputs": {"model": ["model", 0]}},
         "latent": {"class_type": "EmptyLatent", "inputs": {}},
@@ -63,6 +71,19 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(row["classification"], "vector")
         self.assertEqual(row["vector_settings"]["embedded_video_tolerance"], 0.05)
         self.assertIn("vec", row["node_settings"])
+
+    def test_combined_sampler_scheduler_settings_are_preserved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "h3_00082.mp4"
+            path.write_bytes(b"not media")
+            with patch.object(catalog, "probe_tags", return_value={"prompt": json.dumps(prompt_graph(combined=True))}):
+                row = catalog.catalog_file(path, "ffprobe")
+        self.assertEqual(row["status"], "ok")
+        self.assertEqual(row["active_sampler"]["source_kind"], "MiniMaxH3SamplerSchedulerZi")
+        self.assertEqual(row["sampler_method"], "res_multistep")
+        self.assertEqual(row["scheduler"], "beta")
+        self.assertEqual(row["scheduler_steps"], 11)
+        self.assertEqual(row["classification"], "stock")
 
     def test_vector_native_20_is_not_stock_res(self):
         vector = {"method": "linear_velocity", "evaluation_profile": "native_20"}

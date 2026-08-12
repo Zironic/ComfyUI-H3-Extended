@@ -1,6 +1,7 @@
-"""ComfyUI node that constructs the H3 vector sampler."""
+"""ComfyUI nodes for standard and experimental H3 sampling."""
 
 import comfy.samplers
+import torch
 from comfy_api.latest import ComfyExtension, io
 
 from .config import (
@@ -20,10 +21,67 @@ from .config import (
 from .fingerprint import configuration_fingerprint
 from .repairability import PROFILE_ROOT
 from .sampler import sample_vector_accel
+from .schedules import CONTINUOUS_SCHEDULE_FAMILIES, continuous_schedule_family
 
 
 def _profile_names():
     return sorted(path.name for path in PROFILE_ROOT.glob("*.json") if path.is_file())
+
+
+class MiniMaxH3SamplerScheduler(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="MiniMaxH3SamplerSchedulerZi",
+            display_name="MiniMax H3 Sampler + Scheduler (Zi)",
+            category="H3-Extender/Sampling",
+            description="Builds a standard ComfyUI sampler and its sigma schedule in one node.",
+            inputs=[
+                io.Model.Input("model"),
+                io.Combo.Input(
+                    "sampler_name",
+                    options=comfy.samplers.SAMPLER_NAMES,
+                    default="res_multistep",
+                ),
+                io.Combo.Input(
+                    "scheduler",
+                    options=[*comfy.samplers.SCHEDULER_NAMES, *CONTINUOUS_SCHEDULE_FAMILIES],
+                    default="simple",
+                ),
+                io.Int.Input("steps", default=20, min=1, max=10000),
+                io.Float.Input(
+                    "denoise",
+                    default=1.0,
+                    min=0.0,
+                    max=1.0,
+                    step=0.01,
+                    tooltip="Below 1.0, starts partway through a longer schedule while returning the requested number of steps.",
+                ),
+            ],
+            outputs=[io.Sampler.Output(), io.Sigmas.Output()],
+        )
+
+    @classmethod
+    def execute(cls, model, sampler_name, scheduler, steps, denoise):
+        sampler = comfy.samplers.sampler_object(sampler_name)
+        if denoise <= 0.0:
+            return io.NodeOutput(sampler, torch.FloatTensor([]))
+
+        total_steps = steps if denoise >= 1.0 else int(steps / denoise)
+        model_sampling = model.get_model_object("model_sampling")
+        if scheduler in CONTINUOUS_SCHEDULE_FAMILIES:
+            source_sigmas = comfy.samplers.calculate_sigmas(
+                model_sampling, "simple", 20,
+            )
+            sigmas, _, _ = continuous_schedule_family(
+                source_sigmas, scheduler, total_steps,
+            )
+            sigmas = sigmas.cpu()
+        else:
+            sigmas = comfy.samplers.calculate_sigmas(
+                model_sampling, scheduler, total_steps,
+            ).cpu()
+        return io.NodeOutput(sampler, sigmas[-(steps + 1):])
 
 
 class MiniMaxH3VectorAccelSampler(io.ComfyNode):
@@ -188,7 +246,7 @@ class MiniMaxH3VectorAccelSampler(io.ComfyNode):
 
 class MiniMaxH3VectorAccelExtension(ComfyExtension):
     async def get_node_list(self):
-        return [MiniMaxH3VectorAccelSampler]
+        return [MiniMaxH3SamplerScheduler, MiniMaxH3VectorAccelSampler]
 
 
 async def comfy_entrypoint() -> MiniMaxH3VectorAccelExtension:

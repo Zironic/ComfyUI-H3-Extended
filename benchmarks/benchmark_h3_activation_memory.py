@@ -6,6 +6,7 @@ block's two MLP projections are read in that mode.
 """
 
 import argparse
+from contextlib import contextmanager
 import json
 import os
 import statistics
@@ -24,7 +25,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(_HERE, "..", "..", "..")))
 CHECKSUM_SAMPLES = 4096
 DEFAULT_CHUNKS = (2048, 4096, 8192, 16384)
 DEFAULT_SWIGLU_MODES = ("bf16", "native")
-ACTUAL_SWIGLU_MODES = DEFAULT_SWIGLU_MODES + ("tiled_convrot",)
+ACTUAL_SWIGLU_MODES = DEFAULT_SWIGLU_MODES + ("tiled_convrot", "convrot_epilogue")
 DEFAULT_HELD_MODES = ("off", "on")
 DEFAULT_FEATURE_TILE_WIDTH = 3584
 
@@ -75,7 +76,7 @@ def iter_cases(chunks=DEFAULT_CHUNKS, swiglu_modes=DEFAULT_SWIGLU_MODES, held_mo
     cases = []
     for chunk_rows in chunks:
         for swiglu_mode in swiglu_modes:
-            if swiglu_mode == "tiled_convrot":
+            if swiglu_mode in ("tiled_convrot", "convrot_epilogue"):
                 cases.append({
                     "chunk_rows": chunk_rows,
                     "swiglu_mode": swiglu_mode,
@@ -420,8 +421,74 @@ def run_tiled_convrot_case(ck, activation, chunk_rows, fc1, fc2, tiles, device, 
     return output, "tiled_convrot", fc1_ms, fc2_ms
 
 
-def run_actual_case(mlp, activation, chunk_rows, swiglu_mode, held_mode, device):
+@contextmanager
+def _stage_timer(name, stage_totals, stage_events, device):
+    if device.type == "cuda":
+        started = torch.cuda.Event(enable_timing=True)
+        finished = torch.cuda.Event(enable_timing=True)
+        started.record()
+        yield
+        finished.record()
+        stage_events[name].append((started, finished))
+    else:
+        started = time.perf_counter()
+        yield
+        stage_totals[name] += (time.perf_counter() - started) * 1000
+
+
+def run_convrot_epilogue_case(session, activation, residual, gate, chunk_rows, device):
+    """Run one prepacked ConvRot epilogue case over all activation chunks."""
+    if activation.dtype != torch.bfloat16 or residual.dtype != torch.bfloat16 or gate.dtype != torch.bfloat16:
+        raise ValueError("convrot_epilogue requires BF16 activation, residual, and gate")
+    if tuple(residual.shape) != tuple(activation.shape):
+        raise ValueError("convrot_epilogue residual shape must match activation")
+    if tuple(gate.shape) != (activation.shape[-1],):
+        raise ValueError("convrot_epilogue gate shape must match hidden width")
+
+    # The epilogue mutates its residual destination. Clone for every complete
+    # invocation so caller-owned deterministic inputs remain unchanged.
+    working_residual = residual.clone()
+    stage_totals = {"mlp_fc1": 0.0, "mlp_swiglu_fc2": 0.0}
+    stage_events = {"mlp_fc1": [], "mlp_swiglu_fc2": []}
+    path = None
+    for start in range(0, activation.shape[0], chunk_rows):
+        stop = min(activation.shape[0], start + chunk_rows)
+        current_path = session.fc1_swiglu_fc2_gated_(
+            activation[start:stop],
+            working_residual[start:stop],
+            gate,
+            stage_factory=lambda name: _stage_timer(name, stage_totals, stage_events, device),
+        )
+        if current_path != "held_convrot_epilogue_prototype":
+            raise RuntimeError("ConvRot epilogue silently fell back to %s" % current_path)
+        path = current_path
+    if path is None:
+        raise RuntimeError("ConvRot epilogue case produced no chunks")
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+        for name, events in stage_events.items():
+            stage_totals[name] = sum(start.elapsed_time(end) for start, end in events)
+    return working_residual, path, stage_totals["mlp_fc1"], stage_totals["mlp_swiglu_fc2"]
+
+
+def run_actual_case(
+    mlp,
+    activation,
+    chunk_rows,
+    swiglu_mode,
+    held_mode,
+    device,
+    epilogue_session=None,
+    residual=None,
+    gate=None,
+):
     """Run one actual-weight case; returns output, path, and stage timings."""
+    if swiglu_mode == "convrot_epilogue":
+        if epilogue_session is None or residual is None or gate is None:
+            raise ValueError("convrot_epilogue requires a prepacked session, residual, and gate")
+        return run_convrot_epilogue_case(
+            epilogue_session, activation, residual, gate, chunk_rows, device
+        )
     from h3_activation_memory.linear import HeldMLP, module_fc1, module_swiglu_fc2
 
     native = swiglu_mode == "native"
@@ -508,18 +575,52 @@ def run_actual_case(mlp, activation, chunk_rows, swiglu_mode, held_mode, device)
 
 def run_actual(loaded, args, device, dtype):
     swiglu_modes = parse_modes(args.swiglu_modes, ACTUAL_SWIGLU_MODES, "--swiglu-modes")
-    if "tiled_convrot" in swiglu_modes and dtype != torch.bfloat16:
-        raise ValueError("tiled_convrot requires --dtype bf16")
+    if any(mode in swiglu_modes for mode in ("tiled_convrot", "convrot_epilogue")) and dtype != torch.bfloat16:
+        raise ValueError("tiled_convrot and convrot_epilogue require --dtype bf16")
     mlp, hidden, ffn = build_checkpoint_mlp(
         loaded, dtype, hidden=args.hidden, ffn=args.ffn
     )
     torch.manual_seed(0)
     activation = torch.randn(args.seq, hidden, device=device, dtype=dtype)
+    residual = None
+    gate = None
+    epilogue_session = None
+    if "convrot_epilogue" in swiglu_modes:
+        from h3_activation_memory.convrot_epilogue import ConvRotEpilogueMLP
+
+        torch.manual_seed(1)
+        residual = torch.randn(args.seq, hidden, device=device, dtype=torch.bfloat16)
+        gate = torch.randn(hidden, device=device, dtype=torch.bfloat16)
+        # Acquire and prepack once, outside the timed warmup/measurement loops.
+        epilogue_session = ConvRotEpilogueMLP(mlp, activation[:1])
+    try:
+        if epilogue_session is not None:
+            epilogue_session.__enter__()
+        return _run_actual_impl(
+            loaded,
+            args,
+            device,
+            dtype,
+            mlp,
+            hidden,
+            ffn,
+            activation,
+            residual,
+            gate,
+            epilogue_session,
+        )
+    finally:
+        if epilogue_session is not None:
+            epilogue_session.__exit__(*sys.exc_info())
+
+
+def _run_actual_impl(loaded, args, device, dtype, mlp, hidden, ffn, activation, residual, gate, epilogue_session):
+    swiglu_modes = parse_modes(args.swiglu_modes, ACTUAL_SWIGLU_MODES, "--swiglu-modes")
     tiled_ck = None
     tiled_fc1 = None
     tiled_fc2 = None
     tiled_tiles = None
-    if "tiled_convrot" in swiglu_modes:
+    if any(mode in swiglu_modes for mode in ("tiled_convrot", "convrot_epilogue")):
         tiled = load_convrot_mlp(loaded, hidden=hidden, ffn=ffn)
         tiled_ck = _load_comfy_kitchen()
         tiled_fc1 = dict(tiled["fc1"])
@@ -552,6 +653,11 @@ def run_actual(loaded, args, device, dtype):
                 out, path, _, _ = run_tiled_convrot_case(
                     tiled_ck, activation, case["chunk_rows"], tiled_fc1, tiled_fc2, tiled_tiles, device
                 )
+            elif case["swiglu_mode"] == "convrot_epilogue":
+                out, path, _, _ = run_actual_case(
+                    mlp, activation, case["chunk_rows"], case["swiglu_mode"], case["held_mode"], device,
+                    epilogue_session, residual, gate,
+                )
             else:
                 out, path, _, _ = run_actual_case(mlp, activation, case["chunk_rows"], case["swiglu_mode"], case["held_mode"], device)
             del out
@@ -565,6 +671,11 @@ def run_actual(loaded, args, device, dtype):
                 out, path, fc1_ms, fc2_ms = run_tiled_convrot_case(
                     tiled_ck, activation, case["chunk_rows"], tiled_fc1, tiled_fc2, tiled_tiles, device
                 )
+            elif case["swiglu_mode"] == "convrot_epilogue":
+                out, path, fc1_ms, fc2_ms = run_actual_case(
+                    mlp, activation, case["chunk_rows"], case["swiglu_mode"], case["held_mode"], device,
+                    epilogue_session, residual, gate,
+                )
             else:
                 out, path, fc1_ms, fc2_ms = run_actual_case(mlp, activation, case["chunk_rows"], case["swiglu_mode"], case["held_mode"], device)
             samples.append((time.perf_counter() - started) * 1000)
@@ -572,7 +683,7 @@ def run_actual(loaded, args, device, dtype):
             stage_fc2.append(fc2_ms)
             paths.append(path)
             checksum = sampled_checksum(out)
-            if case["swiglu_mode"] == "tiled_convrot" and _ == args.iterations - 1:
+            if case["swiglu_mode"] in ("tiled_convrot", "convrot_epilogue") and _ == args.iterations - 1:
                 measured_output = out
             else:
                 del out
@@ -582,11 +693,11 @@ def run_actual(loaded, args, device, dtype):
         peak_allocated = torch.cuda.max_memory_allocated(device) - baseline_alloc if device.type == "cuda" else 0
         peak_reserved = torch.cuda.max_memory_reserved(device) if device.type == "cuda" else 0
         error_metrics = {}
-        if case["swiglu_mode"] == "tiled_convrot":
+        if case["swiglu_mode"] in ("tiled_convrot", "convrot_epilogue"):
             # Capture the measured peak first; reference/error work is outside
             # timing and must not contaminate the transient allocation report.
             if measured_output is None:
-                raise RuntimeError("tiled benchmark did not retain a measured output")
+                raise RuntimeError("ConvRot benchmark did not retain a measured output")
             delta_sq = 0.0
             reference_sq = 0.0
             max_abs = 0.0
@@ -608,16 +719,24 @@ def run_actual(loaded, args, device, dtype):
                     tiled_fc2["group_size"],
                     input_act="swiglu",
                 )
+                if case["swiglu_mode"] == "convrot_epilogue":
+                    reference = residual[start:stop] + reference * gate
                 reference_float = reference.float()
                 difference = measured_output[start:stop].float().sub_(reference_float)
                 delta_sq += float(torch.sum(difference * difference).item())
                 reference_sq += float(torch.sum(reference_float * reference_float).item())
                 max_abs = max(max_abs, float(difference.abs().max().item()))
                 del reference_expanded, reference, difference, reference_float
-            error_metrics = {
-                "relative_l2_vs_current_convrot": (delta_sq / max(reference_sq, 1e-8)) ** 0.5,
-                "max_abs_vs_current_convrot": max_abs,
-            }
+            if case["swiglu_mode"] == "convrot_epilogue":
+                error_metrics = {
+                    "relative_l2_vs_current_convrot_residual_gate": (delta_sq / max(reference_sq, 1e-8)) ** 0.5,
+                    "max_abs_vs_current_convrot_residual_gate": max_abs,
+                }
+            else:
+                error_metrics = {
+                    "relative_l2_vs_current_convrot": (delta_sq / max(reference_sq, 1e-8)) ** 0.5,
+                    "max_abs_vs_current_convrot": max_abs,
+                }
             del measured_output
         rows.append({
             **case,
@@ -636,7 +755,11 @@ def run_actual(loaded, args, device, dtype):
                 "feature_tile_count": len(tiled_tiles),
                 "prepared_tile_bytes": prepared_tile_bytes(tiled_tiles),
                 **error_metrics,
-            } if case["swiglu_mode"] == "tiled_convrot" else {}),
+            } if case["swiglu_mode"] == "tiled_convrot" else ({
+                "epilogue_reference": "residual + current ConvRot MLP output * gate",
+                "residual_gate_dtype": str(residual.dtype),
+                **error_metrics,
+            } if case["swiglu_mode"] == "convrot_epilogue" else {})),
         })
     return {
         "mode": "actual",
@@ -717,6 +840,8 @@ def main(argv=None):
         loaded = load_block_mlp_tensors(checkpoint, args.block_index)
         payload = run_actual(loaded, args, device, dtype)
     else:
+        if "convrot_epilogue" in parse_modes(args.swiglu_modes, ACTUAL_SWIGLU_MODES, "--swiglu-modes"):
+            raise ValueError("convrot_epilogue requires --checkpoint")
         payload = run_synthetic(args, device, dtype)
     text = json.dumps(payload, indent=2, sort_keys=True)
     print(text)

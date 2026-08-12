@@ -48,10 +48,9 @@ class HybridSparseConfig:
         if minimum > maximum:
             raise ValueError("min_video_density must not exceed max_video_density")
         if self.density_mode == DENSITY_ADAPTIVE_BUDGET:
-            if budget < minimum or budget > maximum:
+            if budget < minimum:
                 raise ValueError(
-                    "adaptive video_budget must lie between min_video_density "
-                    "and max_video_density"
+                    "adaptive video_budget must not be below min_video_density"
                 )
         temperature = float(self.adaptive_temperature)
         if not math.isfinite(temperature) or temperature <= 0.0:

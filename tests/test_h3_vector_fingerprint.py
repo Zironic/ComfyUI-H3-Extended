@@ -11,7 +11,7 @@ comfy.options.enable_args_parsing()
 
 from h3_vector_accel.config import SamplerConfig  # noqa: E402
 from h3_vector_accel.fingerprint import configuration_fingerprint, configuration_payload  # noqa: E402
-from h3_vector_accel.schedules import continuous_schedule  # noqa: E402
+from h3_vector_accel.schedules import continuous_schedule, continuous_schedule_family  # noqa: E402
 sys.argv = _ORIGINAL_ARGV
 
 class FingerprintTests(unittest.TestCase):
@@ -144,6 +144,55 @@ class FingerprintTests(unittest.TestCase):
                 linear_ends, sigmas, effective_sigmas=linear_sigmas,
             ),
         )
+
+    def test_arbitrary_continuous_schedule_families_preserve_contract(self):
+        sigmas = torch.linspace(20.0, 0.0, 21, dtype=torch.float64)
+        families = (
+            "geometric", "geometric_linear_ends",
+            "multiplicative_stride", "multiplicative_stride_linear_ends",
+        )
+        for family in families:
+            for steps in (7, 11, 15):
+                effective, coordinates, ratio = continuous_schedule_family(
+                    sigmas, family, steps,
+                )
+                self.assertEqual(effective.shape, (steps + 1,), (family, steps))
+                self.assertEqual(len(coordinates), steps, (family, steps))
+                self.assertEqual(effective.dtype, sigmas.dtype)
+                self.assertEqual(effective.device, sigmas.device)
+                self.assertTrue(torch.isfinite(effective).all())
+                self.assertTrue(torch.all(effective[:-1] > 0.0))
+                self.assertTrue(torch.all(effective[:-1] > effective[1:]))
+                self.assertEqual(float(effective[0]), float(sigmas[0]))
+                self.assertEqual(float(effective[-1]), 0.0)
+                self.assertTrue(torch.isfinite(torch.tensor(ratio)))
+                if family.endswith("_linear_ends"):
+                    self.assertTrue(torch.equal(effective[:3], sigmas[:3]))
+                    self.assertTrue(torch.equal(effective[-3:], sigmas[-3:]))
+
+        _, _, ratio = continuous_schedule_family(sigmas, "multiplicative_stride", 21)
+        self.assertGreater(ratio, 0.0)
+        self.assertLess(ratio, 1.0)
+
+    def test_linear_end_families_reject_overlapping_protected_endpoints(self):
+        sigmas = torch.linspace(20.0, 0.0, 21)
+        for family in ("geometric_linear_ends", "multiplicative_stride_linear_ends"):
+            for steps in (1, 2, 3, 4):
+                with self.assertRaisesRegex(ValueError, "at least 5 steps"):
+                    continuous_schedule_family(sigmas, family, steps)
+        with self.assertRaisesRegex(ValueError, "at least 2 steps"):
+            continuous_schedule_family(sigmas, "multiplicative_stride", 1)
+
+    def test_legacy_continuous_profiles_are_exact_11_step_aliases(self):
+        sigmas = torch.linspace(20.0, 0.0, 21, dtype=torch.float64)
+        for family in (
+            "geometric", "geometric_linear_ends",
+            "multiplicative_stride", "multiplicative_stride_linear_ends",
+        ):
+            legacy = continuous_schedule(sigmas, f"{family}_11")
+            arbitrary = continuous_schedule_family(sigmas, family, 11)
+            self.assertTrue(torch.equal(legacy[0], arbitrary[0]), family)
+            self.assertEqual(legacy[1:], arbitrary[1:], family)
 
     def test_multiplicative_stride_profiles_have_distinct_schedule_identities(self):
         sigmas = torch.linspace(20.0, 0.0, 21)

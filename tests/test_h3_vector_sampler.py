@@ -22,8 +22,8 @@ from h3_vector_accel.adaptive_res import IncrementalRES  # noqa: E402
 from h3_vector_accel.diagnostics import RunDiagnostics, current_callback_metadata  # noqa: E402
 from h3_vector_accel.predictor import Prediction  # noqa: E402
 from h3_vector_accel.sampler import sample_vector_accel  # noqa: E402
-from h3_vector_accel.schedules import continuous_schedule  # noqa: E402
-from h3_vector_accel.nodes import MiniMaxH3VectorAccelSampler  # noqa: E402
+from h3_vector_accel.schedules import CONTINUOUS_SCHEDULE_FAMILIES, continuous_schedule  # noqa: E402
+from h3_vector_accel.nodes import MiniMaxH3SamplerScheduler, MiniMaxH3VectorAccelSampler  # noqa: E402
 sys.argv = _ORIGINAL_ARGV
 
 
@@ -171,6 +171,61 @@ class SamplerTests(unittest.TestCase):
         sampler = output.result[0]
         self.assertEqual(sampler.h3_vector_config.method, "linear_velocity")
         self.assertEqual(len(sampler.h3_vector_fingerprint), 64)
+
+    def test_combined_sampler_scheduler_uses_comfy_registries_and_requested_steps(self):
+        schema = MiniMaxH3SamplerScheduler.define_schema()
+        inputs = {value.id: value for value in schema.inputs}
+        self.assertEqual(
+            [value.id for value in schema.inputs],
+            ["model", "sampler_name", "scheduler", "steps", "denoise"],
+        )
+        self.assertEqual(inputs["sampler_name"].options, comfy.samplers.SAMPLER_NAMES)
+        self.assertEqual(
+            inputs["scheduler"].options,
+            [*comfy.samplers.SCHEDULER_NAMES, *CONTINUOUS_SCHEDULE_FAMILIES],
+        )
+        self.assertEqual(inputs["sampler_name"].default, "res_multistep")
+        self.assertEqual(inputs["scheduler"].default, "simple")
+
+        model_sampling = object()
+        model = mock.Mock()
+        model.get_model_object.return_value = model_sampling
+        selected_sampler = object()
+        source = torch.tensor([5.0, 4.0, 3.0, 2.0, 1.0, 0.0])
+        with mock.patch.object(comfy.samplers, "sampler_object", return_value=selected_sampler) as sampler_object, \
+                mock.patch.object(comfy.samplers, "calculate_sigmas", return_value=source) as calculate_sigmas:
+            output = MiniMaxH3SamplerScheduler.execute(
+                model, "res_multistep", "beta", 2, 0.5,
+            )
+
+        self.assertIs(output.result[0], selected_sampler)
+        self.assertTrue(torch.equal(output.result[1], source[-3:]))
+        sampler_object.assert_called_once_with("res_multistep")
+        calculate_sigmas.assert_called_once_with(model_sampling, "beta", 4)
+
+    def test_combined_sampler_scheduler_builds_arbitrary_custom_steps(self):
+        model_sampling = object()
+        model = mock.Mock()
+        model.get_model_object.return_value = model_sampling
+        source = torch.linspace(1.0, 0.0, 21)
+        with mock.patch.object(comfy.samplers, "sampler_object", return_value=object()), \
+                mock.patch.object(comfy.samplers, "calculate_sigmas", return_value=source) as calculate_sigmas:
+            output = MiniMaxH3SamplerScheduler.execute(
+                model, "res_multistep", "multiplicative_stride", 13, 1.0,
+            )
+        self.assertEqual(output.result[1].shape, (14,))
+        self.assertTrue(torch.all(output.result[1][:-1] > output.result[1][1:]))
+        self.assertEqual(float(output.result[1][-1]), 0.0)
+        calculate_sigmas.assert_called_once_with(model_sampling, "simple", 20)
+
+    def test_combined_sampler_scheduler_zero_denoise_returns_empty_sigmas(self):
+        with mock.patch.object(comfy.samplers, "sampler_object", return_value=object()), \
+                mock.patch.object(comfy.samplers, "calculate_sigmas") as calculate_sigmas:
+            output = MiniMaxH3SamplerScheduler.execute(
+                mock.Mock(), "euler", "simple", 20, 0.0,
+            )
+        self.assertEqual(output.result[1].numel(), 0)
+        calculate_sigmas.assert_not_called()
 
     def test_node_exposes_res_benchmark_without_changing_widget_order(self):
         schema = MiniMaxH3VectorAccelSampler.define_schema()

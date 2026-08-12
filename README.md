@@ -26,10 +26,21 @@ can be loaded at the same time:
 | `MiniMaxH3Ref2VExperimentHarnessZi` | MiniMax H3 Ref2V Experiment Harness (Zi) |
 | `MiniMaxH3MaskedRef2VCacheZi` | MiniMax H3 Masked Ref2V Cache (Zi) |
 | `MiniMaxH3HybridSparseAttentionZi` | MiniMax H3 Hybrid Sparse Attention (Zi) |
+| `MiniMaxH3SamplerSchedulerZi` | MiniMax H3 Sampler + Scheduler (Zi) |
 | `MiniMaxH3VectorAccelSamplerZi` | MiniMax H3 Vector Accel Sampler (Zi) |
 
 Existing workflows still point at the stock ids; re-add the `(Zi)` nodes to use
 this copy.
+
+`MiniMaxH3SamplerSchedulerZi` combines the standard ComfyUI sampler and basic
+scheduler selectors. Connect its `sampler` and `sigmas` outputs directly to
+`SamplerCustomAdvanced`; its sampler and scheduler lists follow ComfyUI's live
+registries, and `steps` is not tied to a named H3 evaluation profile. The custom
+`geometric`, `geometric_linear_ends`, `multiplicative_stride`, and
+`multiplicative_stride_linear_ends` scheduler families use `steps` as their true
+NFE while retaining the 20-step simple H3 trajectory as their coordinate frame.
+The protected linear-end families require at least five steps; full
+`multiplicative_stride` requires at least two.
 
 ## Vector acceleration sampler
 
