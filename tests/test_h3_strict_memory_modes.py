@@ -2,20 +2,22 @@
 
 import os
 import sys
-from types import SimpleNamespace
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(_HERE))
 
 from h3_activation_memory.config import (  # noqa: E402
     ActivationMemoryConfig,
+    MODE_BF16,
     MODE_BF16_STRICT,
+    MODE_NATIVE,
     MODE_NATIVE_STRICT,
 )
 from h3_sage_optimizations.plan import (  # noqa: E402
     FUSED_QKV_REQUIRED,
     MLP_MEMORY_LEGACY_BF16,
     MLP_MEMORY_LEGACY_NATIVE,
+    MLP_MEMORY_STRICT_AUTO,
     MLP_MEMORY_STRICT_BF16,
     MLP_MEMORY_STRICT_NATIVE,
     MemoryRequest,
@@ -47,6 +49,7 @@ def check(value, message):
 
 
 def main():
+    strict_auto = MemoryRequest(strict=True)
     strict_bf16 = MemoryRequest(
         mlp_memory=MLP_MEMORY_LEGACY_BF16,
         strict=True,
@@ -56,20 +59,32 @@ def main():
         strict=True,
     )
     check(
-        strict_bf16.fused_qkv == FUSED_QKV_REQUIRED
-        and strict_bf16.mlp_memory == MLP_MEMORY_STRICT_BF16,
-        "strict BF16 canonicalizes fused QKV and MLP fallback policy",
+        strict_auto.fused_qkv == FUSED_QKV_REQUIRED
+        and strict_auto.mlp_memory == MLP_MEMORY_STRICT_AUTO,
+        "strict automatic selection canonicalizes QKV and MLP fallback policy",
+    )
+    check(
+        strict_bf16.mlp_memory == MLP_MEMORY_STRICT_BF16,
+        "strict BF16 execution has a distinct immutable request",
     )
     check(
         strict_native.mlp_memory == MLP_MEMORY_STRICT_NATIVE,
         "strict native execution has a distinct immutable request",
     )
 
+    automatic = resolve_mlp_provider(
+        Inventory(), request=strict_auto.mlp_memory
+    )
     bf16 = resolve_mlp_provider(
         Inventory(), request=strict_bf16.mlp_memory
     )
     native = resolve_mlp_provider(
         Inventory(), request=strict_native.mlp_memory
+    )
+    check(
+        automatic.provider_id == MLP_GENERIC_CHUNKED
+        and automatic.activation_mode == MODE_NATIVE_STRICT,
+        "strict auto preserves non-ConvRot formats through fail-closed native chunking",
     )
     check(
         bf16.provider_id == MLP_GENERIC_CHUNKED
@@ -91,12 +106,14 @@ def main():
         strict=False,
     )
     check(
-        bf16_config.strict,
-        "strict BF16 mode forces ActivationMemoryConfig strictness",
+        bf16_config.mode == MODE_BF16 and bf16_config.strict,
+        "strict BF16 alias normalizes to the canonical mode and forces strictness",
     )
     check(
-        native_config.strict and native_config.native_swiglu,
-        "strict native mode preserves native SwiGLU and forces strictness",
+        native_config.mode == MODE_NATIVE
+        and native_config.strict
+        and native_config.native_swiglu,
+        "strict native alias normalizes without breaking native SwiGLU",
     )
     print("\nall strict Memory-mode tests passed")
 
