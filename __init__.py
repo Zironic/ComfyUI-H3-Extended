@@ -71,7 +71,7 @@ NODE_CATEGORIES = {
     "MiniMaxH3SageMemoryOptimizerZi": "H3-Extender/Model Patches",
     "MiniMaxH3SparseSageAttentionZi": "H3-Extender/Model Patches",
     "MiniMaxH3SolEngineZi": "H3-Extender/Experiments",
-    "MiniMaxH3HybridSparseAttentionZi": "H3-Extender/Experiments",
+    "MiniMaxH3HybridSparseAttentionZi": "H3-Extender/Compatibility",
     "MiniMaxH3AttentionProbeZi": "H3-Extender/Diagnostics",
     "MiniMaxH3Ref2VExperimentHarnessZi": "H3-Extender/Experiments",
     "MiniMaxH3LongFormRef2VZi": "H3-Extender/Experiments",
@@ -98,7 +98,9 @@ def _categorized_node(node):
     class CategorizedNode(node):
         @classmethod
         def define_schema(cls):
-            return _replace_schema_category(super().define_schema(), category)
+            return _replace_schema_category(
+                super().define_schema(), category
+            )
 
     CategorizedNode.__name__ = node.__name__
     CategorizedNode.__qualname__ = node.__qualname__
@@ -129,7 +131,10 @@ class H3ExtendedExtension(ComfyExtension):
             MiniMaxH3VectorAccelExtension(),
             MiniMaxH3DiagnosticsExtension(),
         ):
-            nodes.extend(_categorized_node(node) for node in await ext.get_node_list())
+            nodes.extend(
+                _categorized_node(node)
+                for node in await ext.get_node_list()
+            )
         return nodes
 
 

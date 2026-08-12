@@ -7,7 +7,7 @@ import math
 
 PLAN_KEY = "minimax_h3_sage_optimization_plan"
 STATUS_KEY = "minimax_h3_sage_optimization_status"
-PLAN_VERSION = 3
+PLAN_VERSION = 4
 
 ATTENTION_AUTO = "auto"
 ATTENTION_EXISTING = "existing"
@@ -21,10 +21,21 @@ FUSED_QKV_REQUESTS = (FUSED_QKV_AUTO, FUSED_QKV_OFF, FUSED_QKV_REQUIRED)
 MLP_MEMORY_AUTO = "auto"
 MLP_MEMORY_EPILOGUE = "epilogue_prototype"
 MLP_MEMORY_OFF = "off"
+
+# Internal-only values used by deprecated compatibility nodes. They preserve
+# old serialized workflow behavior without adding these implementation details
+# to the two production node schemas.
+MLP_MEMORY_LEGACY_BF16 = "legacy_bf16"
+MLP_MEMORY_LEGACY_NATIVE = "legacy_native"
+MLP_MEMORY_LEGACY_CONVROT_REQUIRED = "legacy_convrot_2slice_required"
+
 MLP_MEMORY_REQUESTS = (
     MLP_MEMORY_AUTO,
     MLP_MEMORY_EPILOGUE,
     MLP_MEMORY_OFF,
+    MLP_MEMORY_LEGACY_BF16,
+    MLP_MEMORY_LEGACY_NATIVE,
+    MLP_MEMORY_LEGACY_CONVROT_REQUIRED,
 )
 
 DENSITY_FIXED = "fixed"

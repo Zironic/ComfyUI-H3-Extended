@@ -8,6 +8,9 @@ from ..plan import (
     FUSED_QKV_OFF,
     FUSED_QKV_REQUIRED,
     MLP_MEMORY_EPILOGUE,
+    MLP_MEMORY_LEGACY_BF16,
+    MLP_MEMORY_LEGACY_CONVROT_REQUIRED,
+    MLP_MEMORY_LEGACY_NATIVE,
     MLP_MEMORY_OFF,
 )
 
@@ -18,7 +21,7 @@ QKV_SPARSE_CONVROT_INT8 = "convrot_int8_sparse_sage"
 MLP_OFF = "off"
 MLP_GENERIC_CHUNKED = "generic_chunked_quantized"
 MLP_CONVROT_INT8_TWO_SLICE = "convrot_int8_two_slice"
-MLP_CONVROT_INT8_EPILOGUE = "convrot_int8_epilogue_prototype"
+MLP_CONVROT_INT8_EPILOGUE = "convrot_int8_epilogue"
 
 
 @dataclass(frozen=True)
@@ -108,9 +111,11 @@ def resolve_qkv_provider(
     )
 
 
-def _convrot_mlp_compatible(inventory):
-    return bool(
-        inventory.homogeneous("fc1")
+def _convrot_compatible(inventory):
+    return (
+        bool(inventory.fc1)
+        and bool(inventory.fc2)
+        and inventory.homogeneous("fc1")
         and inventory.homogeneous("fc2")
         and inventory.mlp_convrot_int8_256
     )
@@ -123,30 +128,60 @@ def resolve_mlp_provider(inventory, *, request):
         )
 
     if not inventory.fc1 or not inventory.fc2:
-        if request == MLP_MEMORY_EPILOGUE:
+        if request == MLP_MEMORY_LEGACY_CONVROT_REQUIRED:
             raise RuntimeError(
-                "MLP epilogue prototype requires an H3 MLP inventory"
+                "required legacy ConvRot two-slice MLP is unavailable: "
+                "the H3 model has no MLP inventory"
             )
         return MLPProviderResolution(
             MLP_OFF, "off", "the H3 model has no MLP inventory"
         )
 
-    compatible = _convrot_mlp_compatible(inventory)
+    compatible = _convrot_compatible(inventory)
+
+    if request == MLP_MEMORY_LEGACY_BF16:
+        return MLPProviderResolution(
+            MLP_GENERIC_CHUNKED,
+            "mlp_chunked_bf16",
+            "deprecated compatibility request preserves BF16 SwiGLU chunking",
+        )
+
+    if request == MLP_MEMORY_LEGACY_NATIVE:
+        return MLPProviderResolution(
+            MLP_GENERIC_CHUNKED,
+            "mlp_chunked_native",
+            "deprecated compatibility request preserves native chunked MLP",
+        )
+
+    if request == MLP_MEMORY_LEGACY_CONVROT_REQUIRED:
+        if not compatible:
+            labels = sorted(
+                set(inventory.labels("fc1")) | set(inventory.labels("fc2"))
+            )
+            raise RuntimeError(
+                "required legacy ConvRot two-slice MLP is unavailable for %s"
+                % (", ".join(labels) or "unknown formats")
+            )
+        return MLPProviderResolution(
+            MLP_CONVROT_INT8_TWO_SLICE,
+            "mlp_chunked_convrot_2slice",
+            "deprecated compatibility request preserves ConvRot two-slice execution",
+        )
+
     if request == MLP_MEMORY_EPILOGUE:
         if not compatible:
             labels = sorted(
-                set(inventory.labels("fc1"))
-                | set(inventory.labels("fc2"))
+                set(inventory.labels("fc1")) | set(inventory.labels("fc2"))
             )
             raise RuntimeError(
                 "MLP epilogue prototype requires homogeneous ConvRot-256 "
-                "TensorWise INT8 fc1/fc2 weights; found %s"
+                "TensorWise INT8 fc1/fc2 weights; got %s"
                 % (", ".join(labels) or "unknown")
             )
         return MLPProviderResolution(
             MLP_CONVROT_INT8_EPILOGUE,
             "mlp_chunked_convrot_epilogue",
-            "ConvRot-256 MLP uses fc1+SwiGLU and fc2+gated-residual epilogues",
+            "ConvRot-256 MLP uses fused fc1+SwiGLU and fc2+gated-residual epilogues",
         )
 
     if compatible:
