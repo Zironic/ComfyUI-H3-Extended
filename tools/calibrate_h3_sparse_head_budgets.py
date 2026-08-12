@@ -5,6 +5,10 @@ The MoBA3D probe on the q-mask-sharing experiment branch records exact direct
 those curves and redistributes one global average density budget across the
 observed (layer, head) pairs using greedy marginal error reduction.
 
+Only target-video query records are used.  Audio/text queries remain dense in
+the production router and would otherwise bias sensitivity estimates toward
+zero error.
+
 Usage:
 
     python custom_nodes/ComfyUI-H3-Extended/tools/calibrate_h3_sparse_head_budgets.py \
@@ -18,7 +22,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 from collections import defaultdict
 
@@ -44,11 +47,13 @@ def _load(paths):
 
 
 def collect_curves(payloads, aggregate="mean"):
-    """Return observed direct-tile error curves keyed by (layer, head)."""
+    """Return target-video direct-tile error curves keyed by (layer, head)."""
     raw = defaultdict(lambda: defaultdict(list))
     geometry = set()
     for _path, payload in payloads:
         for rec in payload.get("records", ()):
+            if rec.get("kind") != "video":
+                continue
             layer = int(rec["layer"])
             for row in rec.get("moba3d", {}).get("budgets", ()):
                 errors = row.get("direct_tile_head_rel_l2")
@@ -65,7 +70,8 @@ def collect_curves(payloads, aggregate="mean"):
                     raw[(layer, int(head))][budget].append(float(error))
     if not raw:
         raise ValueError(
-            "no direct_tile_head_rel_l2 data found; run the improved sage_sparse MoBA probe first"
+            "no target-video direct_tile_head_rel_l2 data found; run the improved "
+            "sage_sparse MoBA probe first"
         )
     if len(geometry) != 1:
         raise ValueError("probe inputs use different direct-tile geometries: %s" % sorted(geometry))
@@ -132,7 +138,7 @@ def calibrate(curves, target):
         right = maps[key][levels[index + 1]]
         delta_density = levels[index + 1] - levels[index]
         delta_error = left["error"] - right["error"]
-        # Highest positive error reduction per density wins.  Negative values
+        # Highest positive error reduction per density wins. Negative values
         # remain valid when noisy measurements force us to spend more budget.
         score = delta_error / max(delta_density, 1e-12)
         return score, delta_density, delta_error
@@ -195,11 +201,13 @@ def analyze(paths, target=0.5, aggregate="mean"):
     payloads = _load(paths)
     curves, geometry = collect_curves(payloads, aggregate=aggregate)
     calibrated = calibrate(curves, target)
-    baseline = uniform_baseline(curves, float(target) if float(target) <= 1 else float(target) / 100)
+    normalized_target = float(target) if float(target) <= 1 else float(target) / 100
+    baseline = uniform_baseline(curves, normalized_target)
     calibrated.update(
         {
             "inputs": [path for path, _payload in payloads],
             "aggregation": aggregate,
+            "query_kind": "video",
             "q_tile": int(geometry[0]),
             "kv_tile": int(geometry[1]),
             "uniform_baseline": baseline,
@@ -224,6 +232,7 @@ def render(result):
         "H3 layer/head sparse-budget calibration",
         "=" * 88,
         "geometry: %dQ x %dKV" % (result["q_tile"], result["kv_tile"]),
+        "queries: target-video only",
         "aggregate: %s" % result["aggregation"],
         "layer/head pairs: %d" % result["layer_heads"],
         "target average density: %s" % _pct(result["target_average_budget"]),
