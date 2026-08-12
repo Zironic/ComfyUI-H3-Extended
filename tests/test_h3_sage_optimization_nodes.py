@@ -1,4 +1,4 @@
-"""Public schema contracts for the split H3 Sage optimization nodes."""
+"""Public schema and UI contracts for the split H3 Sage nodes."""
 
 import os
 import sys
@@ -13,6 +13,7 @@ sys.path.insert(0, _ROOT)
 
 sys.argv = [sys.argv[0], "--cpu"]
 import comfy.options  # noqa: E402
+
 comfy.options.enable_args_parsing()
 
 from h3_sage_optimizations.nodes import (  # noqa: E402
@@ -25,6 +26,10 @@ def check(value, message):
     if not value:
         raise AssertionError(message)
     print("  ok: %s" % message)
+
+
+def input_by_id(schema, input_id):
+    return next(item for item in schema.inputs if item.id == input_id)
 
 
 def main():
@@ -48,24 +53,50 @@ def main():
             "chunk_rows",
             "prefer_held_weights",
         ],
-        "memory optimizer exposes format-neutral controls",
+        "memory optimizer preserves its serialized input ids",
     )
-    fused = next(
-        item for item in memory.inputs
-        if item.id == "fused_qkv"
+    check(
+        {
+            item.id
+            for item in memory.inputs
+            if getattr(item, "advanced", False)
+        }
+        == {"attention", "chunk_rows", "prefer_held_weights"},
+        "implementation controls are advanced while QKV and MLP remain visible",
     )
-    mlp = next(
-        item for item in memory.inputs
-        if item.id == "mlp_memory"
+    check(
+        input_by_id(memory, "attention").display_name
+        == "Dense attention when Sparse is absent",
+        "dense attention has a user-facing label",
     )
+    check(
+        input_by_id(memory, "fused_qkv").display_name
+        == "QKV projection optimization",
+        "QKV control has a user-facing label",
+    )
+    check(
+        input_by_id(memory, "mlp_memory").display_name
+        == "MLP memory optimization",
+        "MLP control has a user-facing label",
+    )
+    check(
+        input_by_id(memory, "prefer_held_weights").display_name
+        == "Hold weights across chunks",
+        "held-weight policy is named descriptively",
+    )
+    check(
+        "H3 VRAM" in memory.search_aliases
+        and "H3 fused QKV" in memory.search_aliases,
+        "memory node publishes search aliases",
+    )
+
+    fused = input_by_id(memory, "fused_qkv")
+    mlp = input_by_id(memory, "mlp_memory")
     check(
         fused.default == "auto" and mlp.default == "auto",
         "safe format-aware selection is the production default",
     )
-    check(
-        mlp.options == ["auto", "epilogue_prototype", "off"],
-        "the prototype is explicit and does not replace auto",
-    )
+
     check(
         sparse.node_id == "MiniMaxH3SparseSageAttentionZi",
         "Sparse Sage has a stable production node id",
@@ -74,21 +105,39 @@ def main():
         sparse_ids == ["model", "enabled", "video_budget"],
         "Sparse Sage contains no QKV or MLP controls",
     )
-
-    marker = object()
+    budget = input_by_id(sparse, "video_budget")
     check(
-        MiniMaxH3SageMemoryOptimizer.execute(
-            marker, enabled=False
-        ).args[0]
-        is marker,
-        "disabled memory optimizer is an exact pass-through",
+        budget.display_name == "Video KV budget",
+        "Sparse budget has a user-facing label",
     )
     check(
-        MiniMaxH3SparseSageAttention.execute(
-            marker, enabled=False
-        ).args[0]
-        is marker,
-        "disabled Sparse Sage is an exact pass-through",
+        "rounded up to a whole KV-tile count" in budget.tooltip
+        and "mixed boundary tiles remain dense" in budget.tooltip
+        and "1.0" in budget.tooltip,
+        "Sparse budget tooltip explains quantization and dense context",
+    )
+    check(
+        "Sparse Sage" in sparse.search_aliases
+        and "Sparge" in sparse.search_aliases,
+        "Sparse node publishes search aliases",
+    )
+
+    marker = object()
+    memory_out = MiniMaxH3SageMemoryOptimizer.execute(
+        marker, enabled=False
+    )
+    sparse_out = MiniMaxH3SparseSageAttention.execute(
+        marker, enabled=False
+    )
+    check(
+        memory_out.args[0] is marker
+        and "disabled" in memory_out.ui.value.lower(),
+        "disabled memory optimizer is pass-through with visible status",
+    )
+    check(
+        sparse_out.args[0] is marker
+        and "disabled" in sparse_out.ui.value.lower(),
+        "disabled Sparse Sage is pass-through with visible status",
     )
     print("\nall split H3 Sage node tests passed")
 

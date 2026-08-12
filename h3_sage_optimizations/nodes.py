@@ -1,6 +1,6 @@
 """Two composable public nodes for H3 Sage execution."""
 
-from comfy_api.latest import ComfyExtension, io
+from comfy_api.latest import ComfyExtension, io, ui
 
 from .apply import apply_plan
 from .plan import (
@@ -14,6 +14,11 @@ from .plan import (
     MemoryRequest,
     SparseRequest,
     read_plan,
+)
+from .status import (
+    format_disabled_status,
+    format_memory_status,
+    format_sparse_status,
 )
 
 DEFAULT_CHUNK_ROWS = 2048
@@ -34,31 +39,52 @@ class MiniMaxH3SageMemoryOptimizer(io.ComfyNode):
                 "QKV and MLP weight layouts, selecting a specialized fused or "
                 "tiled provider only when that exact format is supported."
             ),
+            search_aliases=[
+                "H3 VRAM",
+                "H3 memory",
+                "H3 fused QKV",
+                "H3 chunked MLP",
+                "MiniMax memory optimizer",
+                "Sage optimizer",
+            ],
             inputs=[
                 io.Model.Input("model"),
-                io.Boolean.Input("enabled", default=True),
+                io.Boolean.Input(
+                    "enabled",
+                    display_name="Enable",
+                    default=True,
+                    tooltip=(
+                        "When disabled, this node applies no new request and "
+                        "leaves all upstream model patches unchanged."
+                    ),
+                ),
                 io.Combo.Input(
                     "attention",
+                    display_name="Dense attention when Sparse is absent",
                     options=[ATTENTION_AUTO, ATTENTION_EXISTING],
                     default=ATTENTION_AUTO,
+                    advanced=True,
                     tooltip=(
                         "auto selects prepared dense Sage unless Sparse Sage "
                         "is also present. existing preserves incoming dense "
-                        "attention."
+                        "attention. This setting has no effect while the Sparse "
+                        "Sage node owns attention execution."
                     ),
                 ),
                 io.Combo.Input(
                     "fused_qkv",
+                    display_name="QKV projection optimization",
                     options=[FUSED_QKV_AUTO, FUSED_QKV_OFF],
                     default=FUSED_QKV_AUTO,
                     tooltip=(
                         "auto uses a fused provider only when the actual H3 "
                         "QKV weight format and resolved attention backend are "
-                        "compatible; otherwise it uses standard H3 QKV."
+                        "compatible; otherwise it safely uses standard H3 QKV."
                     ),
                 ),
                 io.Combo.Input(
                     "mlp_memory",
+                    display_name="MLP memory optimization",
                     options=[
                         MLP_MEMORY_AUTO,
                         MLP_MEMORY_EPILOGUE,
@@ -75,13 +101,27 @@ class MiniMaxH3SageMemoryOptimizer(io.ComfyNode):
                 ),
                 io.Int.Input(
                     "chunk_rows",
+                    display_name="MLP chunk rows",
                     default=DEFAULT_CHUNK_ROWS,
                     min=256,
                     max=65_536,
                     step=256,
+                    advanced=True,
+                    tooltip=(
+                        "Maximum token rows processed by one MLP chunk. Larger "
+                        "values may be faster but use more activation memory."
+                    ),
                 ),
                 io.Boolean.Input(
-                    "prefer_held_weights", default=True
+                    "prefer_held_weights",
+                    display_name="Hold weights across chunks",
+                    default=True,
+                    advanced=True,
+                    tooltip=(
+                        "Try to acquire fc1 and fc2 once for all chunks. The "
+                        "implementation validates reusable cast-buffer safety "
+                        "and falls back when holding both weights is unsafe."
+                    ),
                 ),
             ],
             outputs=[io.Model.Output()],
@@ -99,19 +139,26 @@ class MiniMaxH3SageMemoryOptimizer(io.ComfyNode):
         prefer_held_weights=True,
     ):
         if not enabled:
-            return io.NodeOutput(model)
+            return io.NodeOutput(
+                model,
+                ui=ui.PreviewText(
+                    format_disabled_status("MiniMax H3 Sage Memory Optimizer")
+                ),
+            )
         plan = read_plan(model).with_memory(
             MemoryRequest(
                 attention=attention,
                 fused_qkv=fused_qkv,
                 mlp_memory=mlp_memory,
                 chunk_rows=int(chunk_rows),
-                prefer_held_weights=bool(
-                    prefer_held_weights
-                ),
+                prefer_held_weights=bool(prefer_held_weights),
             )
         )
-        return io.NodeOutput(apply_plan(model, plan))
+        patched = apply_plan(model, plan)
+        return io.NodeOutput(
+            patched,
+            ui=ui.PreviewText(format_memory_status(patched)),
+        )
 
 
 class MiniMaxH3SparseSageAttention(io.ComfyNode):
@@ -126,21 +173,42 @@ class MiniMaxH3SparseSageAttention(io.ComfyNode):
             description=(
                 "H3-only fixed-density Sparse Sage attention. Unknown models "
                 "pass through unchanged. Non-video context and mixed boundary "
-                "tiles remain dense; video_budget controls retained pure "
+                "tiles remain dense; Video KV budget controls retained pure "
                 "target-video KV tiles."
             ),
+            search_aliases=[
+                "H3 sparse",
+                "H3 sparse attention",
+                "MiniMax sparse",
+                "Sparse Sage",
+                "Sparge",
+                "H3 acceleration",
+            ],
             inputs=[
                 io.Model.Input("model"),
-                io.Boolean.Input("enabled", default=True),
+                io.Boolean.Input(
+                    "enabled",
+                    display_name="Enable",
+                    default=True,
+                    tooltip=(
+                        "When disabled, this node applies no new sparse request "
+                        "and leaves all upstream model patches unchanged."
+                    ),
+                ),
                 io.Float.Input(
                     "video_budget",
+                    display_name="Video KV budget",
                     default=0.5,
                     min=0.01,
                     max=1.0,
                     step=0.01,
                     tooltip=(
-                        "Fraction of pure target-video KV tiles retained per "
-                        "head/query tile. 1.0 preserves the full video route."
+                        "Requested fraction of pure target-video KV tiles "
+                        "retained per head and query tile. The request is rounded "
+                        "up to a whole KV-tile count, so effective density depends "
+                        "on video geometry. Non-video context and mixed boundary "
+                        "tiles remain dense. 1.0 preserves the complete pure-video "
+                        "route while still using the Sparse Sage execution path."
                     ),
                 ),
             ],
@@ -152,11 +220,22 @@ class MiniMaxH3SparseSageAttention(io.ComfyNode):
         cls, model, enabled=True, video_budget=0.5
     ):
         if not enabled:
-            return io.NodeOutput(model)
+            return io.NodeOutput(
+                model,
+                ui=ui.PreviewText(
+                    format_disabled_status(
+                        "MiniMax H3 Sparse Sage Attention"
+                    )
+                ),
+            )
         plan = read_plan(model).with_sparse(
             SparseRequest(video_budget=float(video_budget))
         )
-        return io.NodeOutput(apply_plan(model, plan))
+        patched = apply_plan(model, plan)
+        return io.NodeOutput(
+            patched,
+            ui=ui.PreviewText(format_sparse_status(patched)),
+        )
 
 
 class MiniMaxH3SageOptimizationsExtension(ComfyExtension):
