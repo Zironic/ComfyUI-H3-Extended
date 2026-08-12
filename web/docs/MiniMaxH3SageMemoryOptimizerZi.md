@@ -17,7 +17,7 @@ The node uses two kernel-confidence buckets:
   - `epilogue_prototype`: request the bucket-2 `fc1+SwiGLU` and `fc2+gated-residual` Triton prototype. It is blocked unless `H3_SAGE_ENABLE_RESEARCH_KERNELS=1` is set for explicit kernel development.
   - `off`: leave the H3 MLP forward unchanged.
 
-The execution status records each selected provider's bucket and kernel basis.
+The provider resolver carries a candidate ID, while `KERNEL_POLICY.md` defines each candidate's bucket and kernel basis.
 
 ## Advanced controls
 
