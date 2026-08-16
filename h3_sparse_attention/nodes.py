@@ -1,10 +1,29 @@
 """Deprecated compatibility adapter for the former combined H3 node."""
 
+import os
+
+import folder_paths
+
 from comfy_api.latest import ComfyExtension, io, ui
 
 try:
+    from ..h3_attention.hybrid import (
+        DENSITY_ADAPTIVE_BUDGET,
+        HybridSparseBackend,
+        HybridSparseConfig,
+        HybridStatsCollector,
+        preflight_sparse_sage,
+    )
+    from ..h3_attention.hybrid.fused_qkv import TRITON_AVAILABLE
+    from ..h3_memory_optimizer.attention import (
+        ATTENTION_EXISTING as LEGACY_ATTENTION_EXISTING,
+        AttentionDecision,
+        RuntimeEnvironment,
+    )
+    from ..h3_memory_optimizer.config import MemoryOptimizerConfig
+    from ..h3_memory_optimizer.patch import apply as apply_legacy
     from ..h3_sage_optimizations.apply import apply_plan
-    from ..h3_sage_optimizations.environment import RuntimeEnvironment
+    from ..h3_sage_optimizations.model import get_h3_blocks
     from ..h3_sage_optimizations.plan import (
         ATTENTION_EXISTING,
         FUSED_QKV_AUTO,
@@ -19,13 +38,32 @@ try:
         SparseRequest,
         read_plan,
     )
+    from ..h3_sage_optimizations.qkv import (
+        inspect_h3_linears,
+        resolve_qkv_provider,
+    )
     from ..h3_sage_optimizations.status import (
         format_disabled_status,
         format_legacy_status,
     )
 except ImportError:
+    from h3_attention.hybrid import (
+        DENSITY_ADAPTIVE_BUDGET,
+        HybridSparseBackend,
+        HybridSparseConfig,
+        HybridStatsCollector,
+        preflight_sparse_sage,
+    )
+    from h3_attention.hybrid.fused_qkv import TRITON_AVAILABLE
+    from h3_memory_optimizer.attention import (
+        ATTENTION_EXISTING as LEGACY_ATTENTION_EXISTING,
+        AttentionDecision,
+        RuntimeEnvironment,
+    )
+    from h3_memory_optimizer.config import MemoryOptimizerConfig
+    from h3_memory_optimizer.patch import apply as apply_legacy
     from h3_sage_optimizations.apply import apply_plan
-    from h3_sage_optimizations.environment import RuntimeEnvironment
+    from h3_sage_optimizations.model import get_h3_blocks
     from h3_sage_optimizations.plan import (
         ATTENTION_EXISTING,
         FUSED_QKV_AUTO,
@@ -40,14 +78,25 @@ except ImportError:
         SparseRequest,
         read_plan,
     )
+    from h3_sage_optimizations.qkv import (
+        inspect_h3_linears,
+        resolve_qkv_provider,
+    )
     from h3_sage_optimizations.status import (
         format_disabled_status,
         format_legacy_status,
     )
 
+ATTENTION_HYBRID = "hybrid_sparse"
+
+
+def _output_root():
+    return os.path.join(folder_paths.get_output_directory(), "h3_hybrid_sparse")
+
 MODE_SAGE128 = "sage128"
 MODE_SAGE128_FUSED_QKV = "sage128_fused_qkv"
-IMPLEMENTED_MODES = (MODE_SAGE128, MODE_SAGE128_FUSED_QKV)
+MODE_AUTO = "auto"
+IMPLEMENTED_MODES = (MODE_AUTO, MODE_SAGE128, MODE_SAGE128_FUSED_QKV)
 
 ACTIVATION_OFF = "off"
 MODE_BF16 = "mlp_chunked_bf16"
@@ -69,7 +118,9 @@ MIN_CHUNK_ROWS = 256
 
 
 def _memory_request(mode, activation, strict, chunk_rows):
-    if mode == MODE_SAGE128:
+    if mode == MODE_AUTO:
+        fused_qkv = FUSED_QKV_AUTO
+    elif mode == MODE_SAGE128:
         fused_qkv = FUSED_QKV_OFF
     elif mode == MODE_SAGE128_FUSED_QKV:
         fused_qkv = FUSED_QKV_REQUIRED if strict else FUSED_QKV_AUTO
@@ -100,6 +151,20 @@ def _memory_request(mode, activation, strict, chunk_rows):
     )
 
 
+def _resolve_adaptive_mode(model, mode, environment, kernel_spec):
+    if mode != MODE_AUTO:
+        return mode
+    qkv = resolve_qkv_provider(
+        inspect_h3_linears(get_h3_blocks(model)),
+        request=FUSED_QKV_AUTO,
+        backend_kind="sparse_sage",
+        capability=environment.capability,
+        triton_available=TRITON_AVAILABLE,
+        sparse_spec=kernel_spec,
+    )
+    return MODE_SAGE128_FUSED_QKV if qkv.fused else MODE_SAGE128
+
+
 class MiniMaxH3HybridSparseAttention(io.ComfyNode):
     """Translate the former combined node into the two production requests."""
 
@@ -116,8 +181,9 @@ class MiniMaxH3HybridSparseAttention(io.ComfyNode):
                 "Deprecated compatibility adapter for saved workflows. It "
                 "translates the former combined fixed-density Sparse Sage, "
                 "fused-QKV, and MLP controls into the new Memory Optimizer and "
-                "Sparse Sage requests. Adaptive routing and shared compilation "
-                "must be migrated manually."
+                "Sparse Sage requests. Eager adaptive routing remains available "
+                "for legacy workflows; shared compilation still requires the "
+                "production fixed-density path."
             ),
             search_aliases=[
                 "H3 Hybrid Sparse",
@@ -135,9 +201,14 @@ class MiniMaxH3HybridSparseAttention(io.ComfyNode):
                 ),
                 io.Combo.Input(
                     "mode",
-                    display_name="Legacy attention mode",
+                    display_name="QKV projection mode",
                     options=list(IMPLEMENTED_MODES),
-                    default=MODE_SAGE128,
+                    default=MODE_AUTO,
+                    tooltip=(
+                        "auto prefers fused QKV only when the checkpoint "
+                        "format, GPU, Triton, and Sparse Sage ABI are "
+                        "compatible; otherwise it uses standard H3 QKV."
+                    ),
                 ),
                 io.Float.Input(
                     "video_budget",
@@ -249,7 +320,7 @@ class MiniMaxH3HybridSparseAttention(io.ComfyNode):
         cls,
         model,
         enabled=True,
-        mode=MODE_SAGE128,
+        mode=MODE_AUTO,
         video_budget=0.5,
         strict=True,
         activation=MODE_NATIVE,
@@ -263,11 +334,6 @@ class MiniMaxH3HybridSparseAttention(io.ComfyNode):
         adaptive_temperature=1.0,
         adaptive_target_mass=0.80,
     ):
-        del min_video_density
-        del max_video_density
-        del adaptive_temperature
-        del adaptive_target_mass
-
         if not enabled:
             return io.NodeOutput(
                 model,
@@ -313,12 +379,70 @@ class MiniMaxH3HybridSparseAttention(io.ComfyNode):
                 "production nodes."
             )
 
+        if density_mode == DENSITY_ADAPTIVE_BUDGET:
+            optimizer_config = MemoryOptimizerConfig(
+                attention=LEGACY_ATTENTION_EXISTING,
+                activation=activation,
+                chunk_rows=int(chunk_rows),
+                activation_strict=bool(strict),
+            )
+            environment = RuntimeEnvironment.detect()
+            kernel_spec = preflight_sparse_sage(
+                cuda_available=lambda: environment.cuda_available,
+                capability_getter=lambda: environment.capability,
+            )
+            resolved_mode = _resolve_adaptive_mode(
+                model, mode, environment, kernel_spec,
+            )
+            hybrid_config = HybridSparseConfig(
+                mode=resolved_mode,
+                video_budget=float(video_budget),
+                density_mode=str(density_mode),
+                min_video_density=float(min_video_density),
+                max_video_density=float(max_video_density),
+                adaptive_temperature=float(adaptive_temperature),
+                adaptive_target_mass=float(adaptive_target_mass),
+                strict=bool(strict),
+                run_tag=run_tag,
+                timing=bool(timing),
+            )
+            collector = HybridStatsCollector(
+                _output_root(), hybrid_config.run_tag
+            )
+            backend = HybridSparseBackend(
+                hybrid_config,
+                kernel_spec=kernel_spec,
+                collector=collector,
+            )
+            decision = AttentionDecision(
+                requested=ATTENTION_HYBRID,
+                selected=ATTENTION_HYBRID,
+                backend=backend,
+                adapter=ATTENTION_HYBRID,
+                reason=(
+                    "explicit portable Sparse Sage experiment (%s)"
+                    % hybrid_config.density_mode
+                ),
+                environment=environment,
+                projector=backend.projector,
+            )
+            patched = model.clone()
+            apply_legacy(
+                patched,
+                config=optimizer_config,
+                decision=decision,
+            )
+            return io.NodeOutput(patched)
+
         if density_mode != DENSITY_FIXED:
             raise ValueError(
-                "The deprecated compatibility adapter supports fixed density "
-                "only. Replace this node with the new Sparse Sage node before "
-                "using or redesigning adaptive routing."
+                "unknown density mode %r" % density_mode
             )
+
+        del min_video_density
+        del max_video_density
+        del adaptive_temperature
+        del adaptive_target_mass
 
         plan = read_plan(model)
         plan = plan.with_memory(

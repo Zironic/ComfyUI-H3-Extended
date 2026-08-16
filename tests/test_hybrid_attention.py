@@ -700,10 +700,10 @@ def test_node_mode_schema():
         "node describes architecture-native routing rather than one GPU geometry",
     )
     mode = next(item for item in schema.inputs if item.id == "mode")
-    check(mode.options == ["sage128", "sage128_fused_qkv"],
-          "node exposes established and fused-QKV modes")
-    check(mode.default == "sage128",
-          "established mode remains the backward-compatible default")
+    check(mode.options == ["auto", "sage128", "sage128_fused_qkv"],
+          "node exposes auto, established, and explicit fused-QKV modes")
+    check(mode.default == "auto",
+          "new compatibility nodes default to capability-safe fused-QKV selection")
 
     from h3_memory_optimizer.config import ACTIVATION_MODES
     activation = next(item for item in schema.inputs if item.id == "activation")
@@ -752,8 +752,15 @@ def test_node_rejects_invalid_compile_configuration_before_preflight():
 def test_sparse_quant_uses_i64_pointer_arithmetic():
     print("sparse quant pointer width")
     source = inspect.getsource(sparse_quant._quantize_blocks.fn)
-    check(source.count(".to(tl.int64)") >= 15,
-          "Q/K source, mean, output, and scale offsets use int64")
+    check(source.count(".to(tl.int64)") >= 5,
+          "program ids and index vectors use int64")
+    for stride in (
+        "stride_b", "stride_h", "stride_n",
+        "out_b", "out_h", "out_n",
+        "scale_b", "scale_h", "mean_b", "mean_h",
+    ):
+        check("%s.to(tl.int64)" % stride not in source,
+              "%s remains compatible with constexpr strides" % stride)
 
 
 def test_report_files():

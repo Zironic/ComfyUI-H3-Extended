@@ -34,17 +34,17 @@ def _quantize_blocks(
     row_mask = rows < sequence
     source = (
         x_ptr
-        + batch * stride_b.to(tl.int64)
-        + head * stride_h.to(tl.int64)
-        + rows[:, None] * stride_n.to(tl.int64)
+        + batch * stride_b
+        + head * stride_h
+        + rows[:, None] * stride_n
         + cols[None, :]
     )
     value = tl.load(source, mask=row_mask[:, None], other=0.0).to(tl.float32)
     if subtract_mean:
         mean = tl.load(
             mean_ptr
-            + batch * mean_b.to(tl.int64)
-            + head * mean_h.to(tl.int64)
+            + batch * mean_b
+            + head * mean_h
             + cols
         )
         value -= mean[None, :]
@@ -55,16 +55,16 @@ def _quantize_blocks(
     quantized += 0.5 * tl.where(quantized >= 0, 1, -1)
     destination = (
         out_ptr
-        + batch * out_b.to(tl.int64)
-        + head * out_h.to(tl.int64)
-        + rows[:, None] * out_n.to(tl.int64)
+        + batch * out_b
+        + head * out_h
+        + rows[:, None] * out_n
         + cols[None, :]
     )
     tl.store(destination, quantized.to(tl.int8), mask=row_mask[:, None])
     tl.store(
         scale_ptr
-        + batch * scale_b.to(tl.int64)
-        + head * scale_h.to(tl.int64)
+        + batch * scale_b
+        + head * scale_h
         + block,
         scale,
     )

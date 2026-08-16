@@ -14,6 +14,10 @@ before cloning, CUDA probing, weight inspection, or patch installation.
 
 The package preserves the checkpoint's existing linear layouts.
 
+`fused_qkv=auto` is the production default. It prefers a fused provider after
+the checkpoint format, device, Triton, and attention ABI all pass validation;
+otherwise it keeps the standard H3 QKV projection.
+
 - A validated ConvRot-256 TensorWise-INT8 H3 can use the current specialized
   dense or sparse fused-QKV provider.
 - Unsupported QKV formats use the standard H3 projection when

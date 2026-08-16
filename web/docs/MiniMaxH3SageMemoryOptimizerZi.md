@@ -7,7 +7,7 @@ The node inspects the actual QKV, `fc1`, and `fc2` weight layouts and selects a 
 ## Main controls
 
 - **QKV projection optimization**
-  - `auto`: use a fused QKV provider only when the checkpoint format, GPU, and resolved attention backend are compatible; otherwise use standard H3 QKV.
+  - `auto` (default): use a fused QKV provider only when the checkpoint format, GPU, and resolved attention backend are compatible; otherwise use standard H3 QKV.
   - `off`: always use standard H3 QKV.
 - **MLP memory optimization**
   - `auto`: use ConvRot two-slice execution when compatible; otherwise use generic token chunking through the checkpoint's existing Comfy linear format.

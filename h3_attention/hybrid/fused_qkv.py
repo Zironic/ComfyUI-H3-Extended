@@ -89,7 +89,7 @@ def validate_prepared_fused_qkv(prepared):
 if TRITON_AVAILABLE:
 
     @triton.jit
-    def _fused_qkv_kernel(
+    def _fused_qk_kernel(
         x_ptr,
         weight_ptr,
         x_scale_ptr,
@@ -101,12 +101,13 @@ if TRITON_AVAILABLE:
         q_scale_ptr,
         k_ptr,
         k_scale_ptr,
-        v_ptr,
         q_summary_ptr,
         k_summary_ptr,
         sequence: tl.constexpr,
         hidden: tl.constexpr,
         heads: tl.constexpr,
+        weight_stride_output: tl.constexpr,
+        weight_stride_inner: tl.constexpr,
         rope_stride_seq: tl.constexpr,
         rope_stride_dim: tl.constexpr,
         rope_stride_rot: tl.constexpr,
@@ -131,7 +132,10 @@ if TRITON_AVAILABLE:
             inner = start + tl.arange(0, BLOCK_K)
             inner_mask = inner < hidden
             x_offsets = rows[:, None].to(tl.int64) * hidden + inner[None, :]
-            w_offsets = output_col[:, None].to(tl.int64) * hidden + inner[None, :]
+            w_offsets = (
+                output_col[:, None].to(tl.int64) * weight_stride_output
+                + inner[None, :] * weight_stride_inner
+            )
             x = tl.load(
                 x_ptr + x_offsets,
                 mask=row_mask[:, None] & inner_mask[None, :],
@@ -155,10 +159,6 @@ if TRITON_AVAILABLE:
             + rows[:, None].to(tl.int64) * BLOCK_N
             + dims[None, :]
         )
-        if KIND == 2:
-            tl.store(v_ptr + output_offsets, value, mask=row_mask[:, None])
-            return
-
         if KIND == 0:
             norm_weight = tl.load(q_norm_ptr + dims).to(tl.float32)
         else:
@@ -299,6 +299,77 @@ if TRITON_AVAILABLE:
                 tl.store(k_summary_ptr + second_offset, second_summary)
 
 
+    @triton.jit
+    def _fused_v_kernel(
+        x_ptr,
+        weight_ptr,
+        x_scale_ptr,
+        weight_scale_ptr,
+        v_ptr,
+        sequence: tl.constexpr,
+        hidden: tl.constexpr,
+        output_features: tl.constexpr,
+        head_dim: tl.constexpr,
+        weight_stride_output: tl.constexpr,
+        weight_stride_inner: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        block_m = tl.program_id(0)
+        block_n = tl.program_id(1)
+
+        rows = block_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        columns = block_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        row_mask = rows < sequence
+        column_mask = columns < output_features
+        weight_columns = 2 * output_features + columns
+
+        accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
+        for start in range(0, hidden, BLOCK_K):
+            inner = start + tl.arange(0, BLOCK_K)
+            inner_mask = inner < hidden
+            x_offsets = rows[:, None].to(tl.int64) * hidden + inner[None, :]
+            w_offsets = (
+                weight_columns[:, None].to(tl.int64) * weight_stride_output
+                + inner[None, :] * weight_stride_inner
+            )
+            x = tl.load(
+                x_ptr + x_offsets,
+                mask=row_mask[:, None] & inner_mask[None, :],
+                other=0,
+            )
+            weight = tl.load(
+                weight_ptr + w_offsets,
+                mask=column_mask[:, None] & inner_mask[None, :],
+                other=0,
+            )
+            accumulator += tl.dot(x, tl.trans(weight), out_dtype=tl.int32)
+
+        row_scale = tl.load(x_scale_ptr + rows, mask=row_mask, other=0.0)
+        column_scale = tl.load(
+            weight_scale_ptr + weight_columns,
+            mask=column_mask,
+            other=0.0,
+        )
+        value = accumulator.to(tl.float32)
+        value *= row_scale[:, None] * column_scale[None, :]
+        value = value.to(tl.bfloat16)
+
+        heads = columns // head_dim
+        dims = columns % head_dim
+        output_offsets = (
+            heads[None, :].to(tl.int64) * sequence * head_dim
+            + rows[:, None].to(tl.int64) * head_dim
+            + dims[None, :]
+        )
+        tl.store(
+            v_ptr + output_offsets,
+            value,
+            mask=row_mask[:, None] & column_mask[None, :],
+        )
+
+
 def _plain_qkv_weight(module, x):
     import comfy.ops
     from comfy.quant_ops import QuantizedTensor, TensorWiseINT8Layout
@@ -373,6 +444,17 @@ def _fused_qkv_tensor_core(
     has_rope,
     rope_strides,
     output_dtype,
+    q_block_k=128,
+    q_num_warps=8,
+    q_num_stages=3,
+    k_block_k=128,
+    k_num_warps=8,
+    k_num_stages=3,
+    v_block_m=128,
+    v_block_n=256,
+    v_block_k=128,
+    v_num_warps=8,
+    v_num_stages=3,
 ):
     """Run only the tensor projection and return raw carrier tensors.
 
@@ -396,9 +478,12 @@ def _fused_qkv_tensor_core(
         (1, heads, k_blocks, HEAD_DIM), dtype=output_dtype, device=x_int8.device
     )
 
-    grid = (triton.cdiv(sequence, Q_TILE), heads)
-    for kind in range(3):
-        _fused_qkv_kernel[grid](
+    qk_grid = (triton.cdiv(sequence, Q_TILE), heads)
+    for kind, block_k, num_warps, num_stages in (
+        (0, q_block_k, q_num_warps, q_num_stages),
+        (1, k_block_k, k_num_warps, k_num_stages),
+    ):
+        _fused_qk_kernel[qk_grid](
             x_int8,
             qdata,
             x_scale,
@@ -410,12 +495,13 @@ def _fused_qkv_tensor_core(
             q_scale,
             k_int8,
             k_scale,
-            v,
             q_summary,
             k_summary,
             sequence=sequence,
             hidden=hidden,
             heads=heads,
+            weight_stride_output=qdata.stride(0),
+            weight_stride_inner=qdata.stride(1),
             rope_stride_seq=rope_strides[0],
             rope_stride_dim=rope_strides[1],
             rope_stride_rot=rope_strides[2],
@@ -425,10 +511,32 @@ def _fused_qkv_tensor_core(
             KIND=kind,
             BLOCK_M=Q_TILE,
             BLOCK_N=HEAD_DIM,
-            BLOCK_K=64,
-            num_warps=8,
-            num_stages=3,
+            BLOCK_K=block_k,
+            num_warps=num_warps,
+            num_stages=num_stages,
         )
+    v_grid = (
+        triton.cdiv(sequence, v_block_m),
+        triton.cdiv(heads * HEAD_DIM, v_block_n),
+    )
+    _fused_v_kernel[v_grid](
+        x_int8,
+        qdata,
+        x_scale,
+        weight_scale,
+        v,
+        sequence=sequence,
+        hidden=hidden,
+        output_features=heads * HEAD_DIM,
+        head_dim=HEAD_DIM,
+        weight_stride_output=qdata.stride(0),
+        weight_stride_inner=qdata.stride(1),
+        BLOCK_M=v_block_m,
+        BLOCK_N=v_block_n,
+        BLOCK_K=v_block_k,
+        num_warps=v_num_warps,
+        num_stages=v_num_stages,
+    )
     return q_int8, q_scale, k_int8, k_scale, v, q_summary, k_summary
 
 
@@ -545,8 +653,6 @@ def fused_qkv_module_op(
                 "fused H3 QKV weight shape is %s; expected %s"
                 % (tuple(qdata.shape), expected_weight)
             )
-        if not qdata.is_contiguous():
-            qdata = qdata.contiguous()
         weight_scale = weight_scale.reshape(-1).contiguous()
         if (weight_scale.numel() != inner * 3
                 or weight_scale.dtype != torch.float32
@@ -679,8 +785,6 @@ def run_fused_qkv(module, x, rope_freqs, *, layer_index, tensor_core=None):
                     "fused H3 QKV weight shape is %s; expected %s"
                     % (tuple(qdata.shape), expected_weight)
                 )
-            if not qdata.is_contiguous():
-                qdata = qdata.contiguous()
             weight_scale = weight_scale.reshape(-1).contiguous()
             if (weight_scale.numel() != inner * 3
                     or weight_scale.dtype != torch.float32

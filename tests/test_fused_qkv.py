@@ -1,5 +1,6 @@
 """CPU contracts for fused H3 QKV carriers and projected Sparse Sage."""
 
+import inspect
 import os
 import sys
 from dataclasses import replace
@@ -13,6 +14,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(_HERE))
 sys.path.insert(0, os.path.abspath(os.path.join(_HERE, "..", "..", "..")))
 
+import h3_attention.hybrid.fused_qkv as fused_qkv  # noqa: E402
 from h3_attention.hybrid.fused_qkv import (  # noqa: E402
     FusedQKVError,
     FusedQKVProjector,
@@ -283,6 +285,43 @@ def test_projected_backend_integration():
     check(torch.all(output == 4), "hybrid backend executes the projected carrier")
 
 
+def test_v_projection_is_a_separate_kernel():
+    print("dedicated V projection")
+    core_source = inspect.getsource(fused_qkv._fused_qkv_tensor_core)
+    check("for kind, block_k, num_warps, num_stages" in core_source,
+          "Q/K retain separate constexpr-specialized launches")
+    check("_fused_v_kernel[v_grid]" in core_source,
+          "V uses its own launch configuration")
+    v_source = inspect.getsource(fused_qkv._fused_v_kernel.fn)
+    check("q_norm_ptr" not in v_source
+          and "k_norm_ptr" not in v_source
+          and "rope_ptr" not in v_source,
+          "V carries no Q/K-only norm or RoPE inputs")
+    defaults = inspect.signature(fused_qkv._fused_qkv_tensor_core).parameters
+    check(defaults["q_block_k"].default == 128
+          and defaults["k_block_k"].default == 128,
+          "Q and K independently use the exact-gated K128 specialization")
+    check((defaults["v_block_m"].default,
+           defaults["v_block_n"].default,
+           defaults["v_block_k"].default) == (128, 256, 128),
+          "V uses the measured M128/N256/K128 geometry")
+    check(defaults["v_num_warps"].default == 8
+          and defaults["v_num_stages"].default == 3,
+          "V uses the lower-register eight-warp three-stage launch")
+
+
+def test_qdata_stride_is_preserved_without_a_hot_path_copy():
+    print("QData stride")
+    source = inspect.getsource(fused_qkv)
+    check("qdata = qdata.contiguous()" not in source,
+          "fused projection never copies full QKV QData")
+    for kernel in (fused_qkv._fused_qk_kernel, fused_qkv._fused_v_kernel):
+        kernel_source = inspect.getsource(kernel.fn)
+        check("weight_stride_output" in kernel_source
+              and "weight_stride_inner" in kernel_source,
+              "%s indexes the checkpoint QData with its actual strides" % kernel.fn.__name__)
+
+
 def main():
     test_prepared_validation()
     test_mode_selection()
@@ -290,6 +329,8 @@ def main():
     test_summary_router_matches_direct()
     test_projected_sparse_sage()
     test_projected_backend_integration()
+    test_v_projection_is_a_separate_kernel()
+    test_qdata_stride_is_preserved_without_a_hot_path_copy()
     print("\nall fused QKV tests passed")
 
 

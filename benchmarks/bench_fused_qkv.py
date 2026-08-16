@@ -8,6 +8,7 @@ kernel.
 """
 
 import argparse
+import itertools
 import json
 import os
 import statistics
@@ -38,6 +39,11 @@ from h3_attention.hybrid.fused_qkv import (  # noqa: E402
     HEAD_DIM,
     FusedQKVProjector,
     PreparedFusedQKV,
+    _fused_qk_kernel,
+    _fused_v_kernel,
+    _plain_qkv_weight,
+    _quantize_projection_input,
+    fused_qkv_op,
     fused_qkv_tensor_core,
     run_fused_qkv,
 )
@@ -55,6 +61,125 @@ from h3_runtime.timing import publish_timing, timed_stage  # noqa: E402
 from h3_attention.hybrid.stats import TIMING_STAGES  # noqa: E402
 
 
+LAUNCH_CONFIGS = {
+    "production": {},
+    "m64_n128_k64_w4_s3": {
+        "v_block_m": 64, "v_block_n": 128, "v_block_k": 64,
+        "v_num_warps": 4, "v_num_stages": 3,
+    },
+    "m64_n128_k64_w8_s3": {
+        "v_block_m": 64, "v_block_n": 128, "v_block_k": 64,
+        "v_num_warps": 8, "v_num_stages": 3,
+    },
+    "m64_n256_k64_w8_s3": {
+        "v_block_m": 64, "v_block_n": 256, "v_block_k": 64,
+        "v_num_warps": 8, "v_num_stages": 3,
+    },
+    "m64_n256_k64_w4_s3": {
+        "v_block_m": 64, "v_block_n": 256, "v_block_k": 64,
+        "v_num_warps": 4, "v_num_stages": 3,
+    },
+    "m64_n256_k64_w8_s2": {
+        "v_block_m": 64, "v_block_n": 256, "v_block_k": 64,
+        "v_num_warps": 8, "v_num_stages": 2,
+    },
+    "m64_n256_k64_w8_s4": {
+        "v_block_m": 64, "v_block_n": 256, "v_block_k": 64,
+        "v_num_warps": 8, "v_num_stages": 4,
+    },
+    "m64_n256_k128_w8_s3": {
+        "v_block_m": 64, "v_block_n": 256, "v_block_k": 128,
+        "v_num_warps": 8, "v_num_stages": 3,
+    },
+    "m64_n256_k128_w4_s3": {
+        "v_block_m": 64, "v_block_n": 256, "v_block_k": 128,
+        "v_num_warps": 4, "v_num_stages": 3,
+    },
+    "m64_n256_k128_w8_s2": {
+        "v_block_m": 64, "v_block_n": 256, "v_block_k": 128,
+        "v_num_warps": 8, "v_num_stages": 2,
+    },
+    "m64_n256_k128_w8_s4": {
+        "v_block_m": 64, "v_block_n": 256, "v_block_k": 128,
+        "v_num_warps": 8, "v_num_stages": 4,
+    },
+    "m32_n512_k64_w8_s3": {
+        "v_block_m": 32, "v_block_n": 512, "v_block_k": 64,
+        "v_num_warps": 8, "v_num_stages": 3,
+    },
+    "m128_n64_k64_w4_s3": {
+        "v_block_m": 128, "v_block_n": 64, "v_block_k": 64,
+        "v_num_warps": 4, "v_num_stages": 3,
+    },
+    "m128_n128_k64_w4_s3": {
+        "v_block_m": 128, "v_block_n": 128, "v_block_k": 64,
+        "v_num_warps": 4, "v_num_stages": 3,
+    },
+    "m128_n128_k64_w8_s2": {
+        "v_block_m": 128, "v_block_n": 128, "v_block_k": 64,
+        "v_num_warps": 8, "v_num_stages": 2,
+    },
+    "m128_n128_k64_w8_s4": {
+        "v_block_m": 128, "v_block_n": 128, "v_block_k": 64,
+        "v_num_warps": 8, "v_num_stages": 4,
+    },
+    "m128_n128_k128_w8_s3": {
+        "v_block_m": 128, "v_block_n": 128, "v_block_k": 128,
+        "v_num_warps": 8, "v_num_stages": 3,
+    },
+}
+
+SM89_SWEEP_SPACE = {
+    "block_k": (32, 64, 128),
+    "num_warps": (4, 8),
+    "num_stages": (2, 3, 4, 5),
+    "v_block_m": (32, 64, 128),
+    "v_block_n": (128, 256, 512),
+}
+
+
+def sm89_launch_sweep_candidates(kind):
+    if kind not in ("q", "k", "v"):
+        raise ValueError("launch sweep kind must be q, k, or v")
+    if kind in ("q", "k"):
+        return [
+            (
+                "%s_k%d_w%d_s%d" % (kind, block_k, num_warps, num_stages),
+                {
+                    "%s_block_k" % kind: block_k,
+                    "%s_num_warps" % kind: num_warps,
+                    "%s_num_stages" % kind: num_stages,
+                },
+            )
+            for block_k, num_warps, num_stages in itertools.product(
+                SM89_SWEEP_SPACE["block_k"],
+                SM89_SWEEP_SPACE["num_warps"],
+                SM89_SWEEP_SPACE["num_stages"],
+            )
+        ]
+    return [
+        (
+            "v_m%d_n%d_k%d_w%d_s%d" % (
+                block_m, block_n, block_k, num_warps, num_stages,
+            ),
+            {
+                "v_block_m": block_m,
+                "v_block_n": block_n,
+                "v_block_k": block_k,
+                "v_num_warps": num_warps,
+                "v_num_stages": num_stages,
+            },
+        )
+        for block_m, block_n, block_k, num_warps, num_stages in itertools.product(
+            SM89_SWEEP_SPACE["v_block_m"],
+            SM89_SWEEP_SPACE["v_block_n"],
+            SM89_SWEEP_SPACE["block_k"],
+            SM89_SWEEP_SPACE["num_warps"],
+            SM89_SWEEP_SPACE["num_stages"],
+        )
+    ]
+
+
 def _ensure_forward_imports():
     global project_qkv, to_hnd
     if project_qkv is None:
@@ -70,6 +195,196 @@ def compile_fused_qkv_core(torch_module, core):
 def compile_sparse_sage_kernel_core(torch_module, adapter):
     """Compile the fixed-shape tensor-only Sparse Sage kernel adapter."""
     return torch_module.compile(adapter, fullgraph=True, dynamic=False)
+
+
+def bind_fused_qkv_launch_config(core, config):
+    config = dict(config)
+
+    def configured(*args, **kwargs):
+        return core(*args, **kwargs, **config)
+
+    return configured
+
+
+def triton_compiler_metadata(kernel):
+    compiled_kernels = []
+    seen = set()
+    for kernel_cache, _, _, _, _ in kernel.device_caches.values():
+        for compiled in kernel_cache.values():
+            compiled._init_handles()
+            if compiled.name in seen:
+                continue
+            seen.add(compiled.name)
+            ptx = compiled.asm.get("ptx", "")
+            compiled_kernels.append({
+                "name": compiled.name,
+                "num_warps": int(compiled.metadata.num_warps),
+                "registers_per_thread": int(compiled.n_regs),
+                "shared_memory_bytes": int(compiled.metadata.shared),
+                "spills": int(compiled.n_spills),
+                "max_threads_per_block": int(compiled.n_max_threads),
+                "ptx_mma_sync_instructions": ptx.count("mma.sync"),
+            })
+    return compiled_kernels
+
+
+def summarize_cuda_trace(events):
+    kernels = {}
+    activities = {}
+    for event in events:
+        if event.device_type != torch.autograd.DeviceType.CUDA:
+            continue
+        activity = str(event.activity_type)
+        activities[activity] = activities.get(activity, 0) + 1
+        if (activity.casefold() != "kernel"
+                and "CONCURRENT_KERNEL" not in activity):
+            continue
+        details = kernels.setdefault(event.name, {
+            "count": 0,
+            "device_time_ms": 0.0,
+        })
+        details["count"] += 1
+        details["device_time_ms"] += event.time_range.elapsed_us() / 1000.0
+        metadata = event.event_metadata
+        if metadata is not None:
+            fields = (
+                "registers_per_thread", "shared_memory", "grid", "block",
+                "est_occupancy_pct", "occupancy",
+            )
+            populated = {
+                name: value
+                for name, value in metadata._asdict().items()
+                if name in fields and value is not None
+            }
+            if populated:
+                occupancy = populated.get("occupancy")
+                if occupancy is not None:
+                    populated["occupancy_estimate_valid"] = (
+                        occupancy.get("activeBlocksPerMultiprocessor", 0) > 0
+                    )
+                details["metadata"] = populated
+    return {
+        "kernel_launches": sum(details["count"] for details in kernels.values()),
+        "kernels": [
+            {"name": name, **details}
+            for name, details in sorted(kernels.items())
+        ],
+        "cuda_activities": activities,
+    }
+
+
+def profile_cuda_launches(fn):
+    result = fn()
+    torch.cuda.synchronize()
+    del result
+    activities = [
+        torch.profiler.ProfilerActivity.CPU,
+        torch.profiler.ProfilerActivity.CUDA,
+    ]
+    experimental_config = torch.profiler._ExperimentalConfig(
+        expose_kineto_event_metadata=True,
+    )
+    with torch.profiler.profile(
+        activities=activities,
+        experimental_config=experimental_config,
+    ) as profile:
+        result = fn()
+        torch.cuda.synchronize()
+    del result
+    return summarize_cuda_trace(profile.events())
+
+
+class CarrierParityError(RuntimeError):
+    pass
+
+
+def require_exact_carriers(actual, reference):
+    names = (
+        "q_int8", "q_scale", "k_int8", "k_scale",
+        "v", "q_summary", "k_summary",
+    )
+    exact = {
+        name: bool(torch.equal(value, expected))
+        for name, value, expected in zip(names, actual, reference)
+    }
+    if not all(exact.values()):
+        failed = ", ".join(name for name, value in exact.items() if not value)
+        raise CarrierParityError(
+            "launch configuration changed fused QKV carriers: %s" % failed
+        )
+    return exact
+
+
+def benchmark_launch_sweep(
+    kind, core, case_factory, reference, warmup, iterations,
+):
+    candidates = sm89_launch_sweep_candidates(kind)
+    production = benchmark_case(case_factory(core), warmup, iterations)
+    valid = []
+    rejected = {}
+    rejected_examples = []
+    for name, config in candidates:
+        candidate_fn = case_factory(bind_fused_qkv_launch_config(core, config))
+        try:
+            carriers = candidate_fn()
+            torch.cuda.synchronize()
+            require_exact_carriers(carriers, reference)
+            del carriers
+            measurement = benchmark_case(candidate_fn, warmup, iterations)
+        except Exception as exc:
+            error_type = type(exc).__name__
+            if error_type not in (
+                "CarrierParityError", "OutOfResources", "CompilationError",
+                "CompileTimeAssertionFailure",
+            ):
+                raise
+            rejected[error_type] = rejected.get(error_type, 0) + 1
+            if len(rejected_examples) < 8:
+                rejected_examples.append({
+                    "name": name,
+                    "config": config,
+                    "error": "%s: %s" % (error_type, exc),
+                })
+            continue
+        valid.append({
+            "name": name,
+            "config": config,
+            **measurement,
+        })
+    valid.sort(key=lambda result: result["median_ms"])
+    best = valid[0] if valid else None
+    return {
+        "kind": kind,
+        "candidate_count": len(candidates),
+        "valid_exact_count": len(valid),
+        "rejected_count": len(candidates) - len(valid),
+        "rejected_by_error": rejected,
+        "rejected_examples": rejected_examples,
+        "production": production,
+        "best": best,
+        "best_over_production_ratio": (
+            best["median_ms"] / production["median_ms"] if best else None
+        ),
+        "fastest_exact": valid[:10],
+        "space": {
+            "block_m": (
+                list(SM89_SWEEP_SPACE["v_block_m"])
+                if kind == "v" else [Q_TILE]
+            ),
+            "block_n": (
+                list(SM89_SWEEP_SPACE["v_block_n"])
+                if kind == "v" else [HEAD_DIM]
+            ),
+            "block_k": list(SM89_SWEEP_SPACE["block_k"]),
+            "num_warps": list(SM89_SWEEP_SPACE["num_warps"]),
+            "num_stages": list(SM89_SWEEP_SPACE["num_stages"]),
+        },
+        "block_m_note": (
+            "Q/K BLOCK_M remains 128 because their carrier reductions own one "
+            "128-row Q tile and two 64-row K tiles."
+            if kind in ("q", "k") else None
+        ),
+    }
 
 
 def make_sparse_sage_kernel_adapter(kernel, output_shape, output_dtype):
@@ -470,6 +785,199 @@ def baseline(module, x, rope, block_index):
     )
 
 
+def projection_case_boundaries():
+    return {
+        "A_standard_preparation": {
+            "input": "BF16 activations",
+            "includes": "module QKV; Q/K RMSNorm+RoPE; Q/K carriers and summaries; BF16 V",
+            "excludes": "routing; Sparse Sage V preparation and kernel",
+            "weights": "production module acquisition is measured",
+        },
+        "B_raw_kitchen_qkv_gemm": {
+            "input": "prebuilt ConvRot INT8 activations and row scales",
+            "includes": "Kitchen CUTLASS INT8 QKV GEMM and fused dequantization epilogue; BF16 QKV",
+            "excludes": "input quantization; Q/K RMSNorm, RoPE, carriers, and summaries",
+            "weights": "QData and scale are held outside measurement",
+        },
+        "C_fused_with_input_quantization": {
+            "input": "BF16 activations",
+            "includes": "Kitchen input quantization; custom QKV projection and epilogues",
+            "excludes": "module acquisition; routing; Sparse Sage V preparation and kernel",
+            "weights": "QData, scale, and norm weights are held outside measurement",
+        },
+        "D_fused_prequantized": {
+            "input": "prebuilt ConvRot INT8 activations and row scales",
+            "includes": "custom QKV projection and epilogues",
+            "excludes": "input quantization; module acquisition; routing and Sparse Sage",
+            "weights": "all tensor carriers are held outside measurement",
+        },
+        "input_quantization": {
+            "input": "BF16 activations",
+            "includes": "Kitchen ConvRot input quantization",
+            "excludes": "QKV projection and epilogues",
+            "weights": "no projection weight is consumed",
+        },
+    }
+
+
+def raw_kitchen_qkv_gemm(
+    kitchen_cuda, x_int8, qdata, x_scale, weight_scale, output_dtype,
+):
+    extension = kitchen_cuda._C
+    if not hasattr(extension, "cutlass_int8_dequant"):
+        raise RuntimeError(
+            "installed Comfy Kitchen has no prequantized CUTLASS INT8 GEMM ABI"
+        )
+    rows = x_int8.shape[0]
+    outputs = qdata.shape[0]
+    output = torch.empty(
+        (rows, outputs), dtype=output_dtype, device=x_int8.device,
+    )
+    x_scale_arg = x_scale.reshape(-1).contiguous()
+    weight_scale_arg = weight_scale.reshape(-1)
+    if weight_scale_arg.numel() != outputs:
+        weight_scale_arg = weight_scale_arg.expand(outputs).contiguous()
+    empty_bias = kitchen_cuda._empty_cuda_tensor(x_int8.device, output_dtype)
+    used_cutlass = extension.cutlass_int8_dequant(
+        kitchen_cuda._wrap_for_dlpack(x_int8),
+        kitchen_cuda._wrap_for_dlpack(qdata),
+        kitchen_cuda._wrap_for_dlpack(x_scale_arg),
+        kitchen_cuda._wrap_for_dlpack(weight_scale_arg),
+        kitchen_cuda._wrap_for_dlpack(empty_bias),
+        kitchen_cuda._wrap_for_dlpack(output),
+        kitchen_cuda.DTYPE_TO_CODE[output_dtype],
+        torch.cuda.current_stream(x_int8.device).cuda_stream,
+    )
+    if not used_cutlass:
+        raise RuntimeError(
+            "Kitchen CUTLASS INT8 GEMM rejected the benchmark geometry"
+        )
+    return output
+
+
+def projection_measurement_capabilities():
+    return {
+        "measured": ["cuda_event_elapsed_ms", "peak_allocated_delta_bytes"],
+        "available_in_profile_case_d": [
+            "registers_per_thread", "shared_memory_bytes", "spills",
+        ],
+        "available_with_profile_kernel_launches": [
+            "kernel_launches", "kernel_names", "cuda_activities",
+        ],
+        "requires_external_profiler": [
+            "tensor_core_utilization",
+            "achieved_memory_bandwidth",
+            "achieved_occupancy",
+        ],
+        "note": (
+            "CUDA event samples include output allocation and carrier writes. "
+            "Separate case medians are not an additive stage decomposition."
+        ),
+    }
+
+
+def make_projection_case_functions(
+    *,
+    standard_fn,
+    x,
+    qdata,
+    weight_scale,
+    q_norm,
+    k_norm,
+    rope,
+    rope_strides,
+    heads,
+    epsilon,
+    x_int8,
+    x_scale,
+    kitchen_gemm,
+    quantizer,
+    fused_op,
+    tensor_core,
+):
+    sequence, hidden = x.shape
+    fused_weight_scale = weight_scale.reshape(-1).contiguous()
+    fused_x_scale = x_scale.reshape(-1).contiguous()
+    core_kwargs = {
+        "heads": int(heads),
+        "sequence": int(sequence),
+        "hidden": int(hidden),
+        "epsilon": float(epsilon),
+        "has_rope": rope is not None,
+        "rope_strides": tuple(rope_strides),
+        "output_dtype": x.dtype,
+    }
+    return {
+        "A_standard_preparation": standard_fn,
+        "B_raw_kitchen_qkv_gemm": lambda: kitchen_gemm(
+            x_int8,
+            qdata,
+            fused_x_scale,
+            weight_scale,
+            x.dtype,
+        ),
+        "C_fused_with_input_quantization": lambda: fused_op(
+            x,
+            qdata,
+            fused_weight_scale,
+            q_norm,
+            k_norm,
+            rope,
+            int(heads),
+            float(epsilon),
+            rope is not None,
+            list(rope_strides),
+        ),
+        "D_fused_prequantized": lambda: tensor_core(
+            x_int8,
+            qdata,
+            fused_x_scale,
+            fused_weight_scale,
+            q_norm,
+            k_norm,
+            rope,
+            **core_kwargs,
+        ),
+        "input_quantization": lambda: quantizer(x),
+    }
+
+
+def benchmark_projection_cases(
+    case_functions, warmup, iterations, precomputed=None,
+):
+    boundaries = projection_case_boundaries()
+    precomputed = precomputed or {}
+    return {
+        name: {
+            "boundary": boundaries[name],
+            "measurement": (
+                precomputed[name]
+                if name in precomputed
+                else benchmark_case(fn, warmup, iterations)
+            ),
+        }
+        for name, fn in case_functions.items()
+    }
+
+
+def projection_case_comparisons(results):
+    measurements = {
+        name: details["measurement"] for name, details in results.items()
+    }
+    a_ms = measurements["A_standard_preparation"]["median_ms"]
+    b_ms = measurements["B_raw_kitchen_qkv_gemm"]["median_ms"]
+    c_ms = measurements["C_fused_with_input_quantization"]["median_ms"]
+    d_ms = measurements["D_fused_prequantized"]["median_ms"]
+    quant_ms = measurements["input_quantization"]["median_ms"]
+    return {
+        "standard_over_fused_total_ratio": a_ms / c_ms,
+        "fused_total_minus_prequantized_ms": c_ms - d_ms,
+        "standalone_input_quantization_ms": quant_ms,
+        "fused_prequantized_over_raw_kitchen_ratio": d_ms / b_ms,
+        "note": "Separate median samples are diagnostic, not additive timing.",
+    }
+
+
 def benchmark_case(fn, warmup, iterations):
     for _ in range(warmup):
         result = fn()
@@ -793,10 +1301,33 @@ def main():
         "--compile-sage", action="store_true",
         help="also benchmark eager vs fixed-shape torch.compile Sparse Sage kernel (geometry only)",
     )
+    parser.add_argument(
+        "--launch-config", "--v-config",
+        dest="launch_config",
+        choices=tuple(LAUNCH_CONFIGS),
+        default="production",
+        help="benchmark-time launch configuration for prequantized case D",
+    )
+    parser.add_argument(
+        "--profile-case-d", action="store_true",
+        help="launch configured prequantized case D once for an external profiler",
+    )
+    parser.add_argument(
+        "--profile-kernel-launches", action="store_true",
+        help="record one warmed CUDA launch trace for each projection case",
+    )
+    parser.add_argument(
+        "--sweep-launch-configs", choices=("q", "k", "v", "all"),
+        help="exact-gate and time the requested SM89 per-kind tuning matrix",
+    )
+    parser.add_argument("--sweep-warmup", type=int, default=1)
+    parser.add_argument("--sweep-iterations", type=int, default=2)
     parser.add_argument("--i-understand-this-uses-gpu", action="store_true")
     args = parser.parse_args()
     if args.warmup < 0 or args.iterations <= 0:
         raise SystemExit("sequence/iteration arguments are invalid")
+    if args.sweep_warmup < 0 or args.sweep_iterations <= 0:
+        raise SystemExit("sweep iteration arguments are invalid")
     try:
         sequence, layout = resolve_sequence(
             args.sequence, args.frames, args.width, args.height, args.text_len,
@@ -885,6 +1416,61 @@ def main():
     )
     rope = make_rope(sequence, device)
 
+    if args.profile_case_d:
+        import comfy.model_management
+        import comfy.ops
+
+        qdata = weight_scale = handle = held_weight = bias = None
+        try:
+            qdata, weight_scale, handle, held_weight, bias = _plain_qkv_weight(module, x)
+            q_norm = comfy.model_management.cast_to(
+                module.q_norm.weight, device=x.device, dtype=x.dtype,
+            ).contiguous()
+            k_norm = comfy.model_management.cast_to(
+                module.k_norm.weight, device=x.device, dtype=x.dtype,
+            ).contiguous()
+            x_int8, x_scale = _quantize_projection_input(x)
+            configured_core = bind_fused_qkv_launch_config(
+                fused_qkv_tensor_core, LAUNCH_CONFIGS[args.launch_config],
+            )
+            configured_core(
+                x_int8,
+                qdata,
+                x_scale.reshape(-1).contiguous(),
+                weight_scale.reshape(-1).contiguous(),
+                q_norm,
+                k_norm,
+                rope,
+                heads=int(module.heads),
+                sequence=int(sequence),
+                hidden=int(hidden),
+                epsilon=float(module.q_norm.eps),
+                has_rope=True,
+                rope_strides=(
+                    rope.stride(1), rope.stride(3), rope.stride(4), rope.stride(5),
+                ),
+                output_dtype=x.dtype,
+            )
+            torch.cuda.synchronize()
+        finally:
+            if held_weight is not None:
+                comfy.ops.uncast_bias_weight(
+                    module.qkv_proj, held_weight, bias, handle,
+                )
+        print(json.dumps({
+            "profile_case": "D_fused_prequantized",
+            "sequence": sequence,
+            "compiler_metadata": {
+                "qk": triton_compiler_metadata(_fused_qk_kernel),
+                "v": triton_compiler_metadata(_fused_v_kernel),
+            },
+            "launch_config": {
+                "name": args.launch_config,
+                **LAUNCH_CONFIGS[args.launch_config],
+            },
+        }, sort_keys=True))
+        return
+
     baseline_fn = lambda: baseline(module, x, rope, args.block)
     fused_fn = lambda: run_fused_qkv(module, x, rope, layer_index=args.block)
     reference = baseline_fn()
@@ -903,6 +1489,172 @@ def main():
 
     baseline_result = benchmark_case(baseline_fn, args.warmup, args.iterations)
     fused_result = benchmark_case(fused_fn, args.warmup, args.iterations)
+    import comfy.model_management
+    import comfy.ops
+    import comfy_kitchen.backends.cuda as kitchen_cuda
+
+    qdata = weight_scale = handle = held_weight = bias = None
+    try:
+        qdata, weight_scale, handle, held_weight, bias = _plain_qkv_weight(module, x)
+        q_norm = comfy.model_management.cast_to(
+            module.q_norm.weight, device=x.device, dtype=x.dtype,
+        ).contiguous()
+        k_norm = comfy.model_management.cast_to(
+            module.k_norm.weight, device=x.device, dtype=x.dtype,
+        ).contiguous()
+        x_int8, x_scale = _quantize_projection_input(x)
+        rope_strides = (
+            rope.stride(1), rope.stride(3), rope.stride(4), rope.stride(5),
+        )
+        case_functions = make_projection_case_functions(
+            standard_fn=baseline_fn,
+            x=x,
+            qdata=qdata,
+            weight_scale=weight_scale,
+            q_norm=q_norm,
+            k_norm=k_norm,
+            rope=rope,
+            rope_strides=rope_strides,
+            heads=module.heads,
+            epsilon=module.q_norm.eps,
+            x_int8=x_int8,
+            x_scale=x_scale,
+            kitchen_gemm=lambda *values: raw_kitchen_qkv_gemm(
+                kitchen_cuda, *values,
+            ),
+            quantizer=_quantize_projection_input,
+            fused_op=fused_qkv_op,
+            tensor_core=bind_fused_qkv_launch_config(
+                fused_qkv_tensor_core, LAUNCH_CONFIGS[args.launch_config],
+            ),
+        )
+        production_functions = make_projection_case_functions(
+            standard_fn=baseline_fn,
+            x=x,
+            qdata=qdata,
+            weight_scale=weight_scale,
+            q_norm=q_norm,
+            k_norm=k_norm,
+            rope=rope,
+            rope_strides=rope_strides,
+            heads=module.heads,
+            epsilon=module.q_norm.eps,
+            x_int8=x_int8,
+            x_scale=x_scale,
+            kitchen_gemm=lambda *values: raw_kitchen_qkv_gemm(
+                kitchen_cuda, *values,
+            ),
+            quantizer=_quantize_projection_input,
+            fused_op=fused_qkv_op,
+            tensor_core=fused_qkv_tensor_core,
+        )
+        production_carriers = production_functions["D_fused_prequantized"]()
+        candidate_carriers = case_functions["D_fused_prequantized"]()
+        torch.cuda.synchronize()
+        case_d_parity = require_exact_carriers(
+            candidate_carriers, production_carriers,
+        )
+        launch_sweeps = None
+        if args.sweep_launch_configs:
+            sweep_kinds = (
+                ("q", "k", "v")
+                if args.sweep_launch_configs == "all"
+                else (args.sweep_launch_configs,)
+            )
+
+            def sweep_case_factory(core):
+                return make_projection_case_functions(
+                    standard_fn=baseline_fn,
+                    x=x,
+                    qdata=qdata,
+                    weight_scale=weight_scale,
+                    q_norm=q_norm,
+                    k_norm=k_norm,
+                    rope=rope,
+                    rope_strides=rope_strides,
+                    heads=module.heads,
+                    epsilon=module.q_norm.eps,
+                    x_int8=x_int8,
+                    x_scale=x_scale,
+                    kitchen_gemm=lambda *values: raw_kitchen_qkv_gemm(
+                        kitchen_cuda, *values,
+                    ),
+                    quantizer=_quantize_projection_input,
+                    fused_op=fused_qkv_op,
+                    tensor_core=core,
+                )["D_fused_prequantized"]
+
+            launch_sweeps = {
+                kind: benchmark_launch_sweep(
+                    kind,
+                    fused_qkv_tensor_core,
+                    sweep_case_factory,
+                    production_carriers,
+                    args.sweep_warmup,
+                    args.sweep_iterations,
+                )
+                for kind in sweep_kinds
+            }
+        strided_storage = torch.empty(
+            (qdata.shape[0], qdata.shape[1] * 2),
+            dtype=qdata.dtype,
+            device=qdata.device,
+        )
+        strided_qdata = strided_storage[:, ::2]
+        strided_qdata.copy_(qdata)
+        strided_functions = make_projection_case_functions(
+            standard_fn=baseline_fn,
+            x=x,
+            qdata=strided_qdata,
+            weight_scale=weight_scale,
+            q_norm=q_norm,
+            k_norm=k_norm,
+            rope=rope,
+            rope_strides=rope_strides,
+            heads=module.heads,
+            epsilon=module.q_norm.eps,
+            x_int8=x_int8,
+            x_scale=x_scale,
+            kitchen_gemm=lambda *values: raw_kitchen_qkv_gemm(
+                kitchen_cuda, *values,
+            ),
+            quantizer=_quantize_projection_input,
+            fused_op=fused_qkv_op,
+            tensor_core=bind_fused_qkv_launch_config(
+                fused_qkv_tensor_core, LAUNCH_CONFIGS[args.launch_config],
+            ),
+        )
+        strided_carriers = strided_functions["D_fused_prequantized"]()
+        torch.cuda.synchronize()
+        case_d_strided_qdata_parity = require_exact_carriers(
+            strided_carriers, production_carriers,
+        )
+        del (
+            production_carriers, candidate_carriers, strided_carriers,
+            strided_functions, strided_qdata, strided_storage,
+        )
+        projection_cases = benchmark_projection_cases(
+            case_functions, args.warmup, args.iterations,
+            precomputed={"A_standard_preparation": baseline_result},
+        )
+        case_d_production_control = None
+        if args.launch_config != "production":
+            case_d_production_control = benchmark_case(
+                production_functions["D_fused_prequantized"],
+                args.warmup,
+                args.iterations,
+            )
+        kernel_launch_profiles = None
+        if args.profile_kernel_launches:
+            kernel_launch_profiles = {
+                name: profile_cuda_launches(fn)
+                for name, fn in case_functions.items()
+            }
+    finally:
+        if held_weight is not None:
+            comfy.ops.uncast_bias_weight(
+                module.qkv_proj, held_weight, bias, handle,
+            )
     result = {
         "checkpoint": checkpoint,
         "prefix": prefix,
@@ -914,10 +1666,29 @@ def main():
         "device": torch.cuda.get_device_name(),
         "baseline": baseline_result,
         "fused": fused_result,
+        "projection_cases": projection_cases,
+        "projection_case_comparisons": projection_case_comparisons(projection_cases),
+        "measurement_capabilities": projection_measurement_capabilities(),
+        "case_d_launch_config": {
+            "name": args.launch_config,
+            **LAUNCH_CONFIGS[args.launch_config],
+        },
+        "case_d_exact_parity": case_d_parity,
+        "case_d_strided_qdata_exact_parity": case_d_strided_qdata_parity,
         "peak_reduction_bytes": baseline_result["peak_bytes"] - fused_result["peak_bytes"],
         "speedup": baseline_result["median_ms"] / fused_result["median_ms"],
         "comparisons": comparisons,
     }
+    if kernel_launch_profiles is not None:
+        result["kernel_launch_profiles"] = kernel_launch_profiles
+    if launch_sweeps is not None:
+        result["launch_sweeps"] = launch_sweeps
+    if case_d_production_control is not None:
+        result["case_d_production_control"] = case_d_production_control
+        result["case_d_candidate_over_production_ratio"] = (
+            projection_cases["D_fused_prequantized"]["measurement"]["median_ms"]
+            / case_d_production_control["median_ms"]
+        )
     if getattr(args, "compile_fused", False):
         compiled_core = compile_fused_qkv_core(torch, fused_qkv_tensor_core)
         compiled_fn = lambda: run_fused_qkv(
@@ -950,6 +1721,21 @@ def main():
             fused_result["median_ms"], fused_result["peak_bytes"] / 2**30))
         print("speedup: %.3fx; peak reduction: %.3f GiB" % (
             result["speedup"], result["peak_reduction_bytes"] / 2**30))
+        print("projection isolation:")
+        for name, details in projection_cases.items():
+            measurement = details["measurement"]
+            print("  %s: %.3f ms, peak %.3f GiB" % (
+                name,
+                measurement["median_ms"],
+                measurement["peak_bytes"] / 2**30,
+            ))
+        print("  profiler-only: %s" % ", ".join(
+            result["measurement_capabilities"]["requires_external_profiler"]
+        ))
+        if "kernel_launch_profiles" in result:
+            print("kernel launch trace:")
+            for name, profile in result["kernel_launch_profiles"].items():
+                print("  %s: %d" % (name, profile["kernel_launches"]))
         if "compiled_fused" in result:
             print("compiled: %.3f ms, peak %.3f GiB, compile warmup %.3f ms" % (
                 result["compiled_fused"]["median_ms"],

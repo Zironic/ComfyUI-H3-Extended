@@ -163,18 +163,22 @@ graph. Per-stage CUDA events are omitted inside that graph; `total_dit_block`
 is measured around each invocation. CUDA graph capture is disabled for this
 path so every AIMDO lifecycle and custom-kernel call executes normally.
 
-The default `sage128` mode requires `spas_sage_attn` compiled for the active
-device and resolves its architecture contract at preflight: SM80/86/87 use
-128Q/64KV tiles with FP16 V, SM89 uses 128Q/64KV with FP8 V, and SM90 uses
-64Q/128KV with FP8 V. SM120 uses the maintained architecture-split package's
-128Q/64KV FP8-V path and requires CUDA 12.8 or newer. Both monolithic and
-architecture-split compiled extension layouts are normalized at this boundary;
-SM100/103/121 are not accepted.
-This mode retains the established BF16 QKV projection. The opt-in `sage128_fused_qkv` mode remains
-SM89-only because its projection emits 128Q/64KV routing summaries. It projects
-directly from the checkpoint's ConvRot-256 INT8 weights into Sparse Sage's INT8
-Q/K carriers and a BF16 V carrier. It avoids the full BF16 QKV allocation; K
-smoothing is disabled on this path, so it remains an explicitly approximate experiment.
+The production Memory Optimizer and newly created deprecated Hybrid adapters
+default QKV projection to `auto`. This selects fused QKV only for compatible
+ConvRot-256 TensorWise-INT8 H3 weights on SM89 with Triton and the 128Q/64KV
+Sparse Sage ABI; every failed gate falls back to standard H3 QKV. Explicit
+saved `sage128` and `sage128_fused_qkv` values retain their former behavior.
+
+Sparse Sage requires `spas_sage_attn` compiled for the active device and
+resolves its architecture contract at preflight: SM80/86/87 use 128Q/64KV
+tiles with FP16 V, SM89 uses 128Q/64KV with FP8 V, and SM90 uses 64Q/128KV with
+FP8 V. SM120 uses the maintained architecture-split package's 128Q/64KV FP8-V
+path and requires CUDA 12.8 or newer. Both monolithic and architecture-split
+compiled extension layouts are normalized at this boundary; SM100/103/121 are
+not accepted. The SM89 fused projection emits Sparse Sage's INT8 Q/K carriers,
+routing summaries, and BF16 V directly from the checkpoint weights, avoiding
+the full BF16 QKV allocation. K smoothing remains disabled on this approximate
+path.
 `benchmarks/bench_fused_qkv.py` compares both projection paths using one real
 checkpoint block. With no `--frames` it retains the sequence-only projection
 microbenchmark (default sequence 54006); adding geometry runs both production
@@ -187,6 +191,30 @@ python benchmarks/bench_fused_qkv.py `
   --warmup 1 --iterations 3 --compile-fused --json `
   --i-understand-this-uses-gpu
 ```
+
+Sequence-only results also include an A-D boundary matrix for standard carrier
+preparation, Kitchen's prequantized CUTLASS QKV GEMM and fused dequantization
+epilogue, fused projection with input quantization, and the same fused tensor
+core with a prebuilt INT8 input carrier. The input quantizer is measured
+separately. CUDA events cover elapsed time and peak allocation; kernel launches,
+tensor-core utilization, bandwidth, and achieved occupancy remain
+external-profiler-only metrics.
+
+The production SM89 tensor core uses K128 Q/K tiles and an M128/N256/K128 V
+kernel with eight warps and three stages. `--profile-case-d` launches the
+selected prequantized case once and reports Triton register, spill, and shared
+memory metadata plus the compiled PTX tensor-core instruction count.
+`--profile-kernel-launches` records one warmed CUDA launch trace for every A-D
+case and the standalone quantizer. Kineto occupancy estimates are marked invalid
+when its static calculator reports zero resident blocks for a kernel that ran.
+Exact-gated sweep schedules are selected with `--launch-config`; Q, K, and V
+have independent launch parameters while the production schedule stays static.
+`--sweep-launch-configs q|k|v|all` covers K32/K64/K128, four/eight warps,
+two through five stages, and M32/M64/M128 plus N128/N256/N512 for V. Q/K M
+remains 128 because the carrier ABI requires one 128-row Q reduction and two
+64-row K reductions per CTA. Q and K remain separate constexpr-specialized
+launches: the measured dynamic kind grid saved one launch but was slower, and
+the measured block-pointer variant was also slower.
 
 The geometry result includes routing, preparation, kernel timing, peak memory,
 and bounded output-error metrics; run the required idle-GPU preflight first.

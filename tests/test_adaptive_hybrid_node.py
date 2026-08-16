@@ -12,6 +12,11 @@ _ROOT = os.path.abspath(os.path.join(_HERE, "..", "..", ".."))
 sys.path.insert(0, _PACK)
 sys.path.insert(0, _ROOT)
 
+sys.argv = [sys.argv[0], "--cpu"]
+import comfy.options  # noqa: E402
+
+comfy.options.enable_args_parsing()
+
 from h3_attention.hybrid import (  # noqa: E402
     DENSITY_ADAPTIVE_BUDGET,
     DENSITY_FIXED,

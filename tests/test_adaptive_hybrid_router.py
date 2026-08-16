@@ -256,7 +256,7 @@ def test_configuration_guards():
     print("adaptive configuration guards")
     cases = (
         ({"min_video_density": 0.6, "max_video_density": 0.5}, "min"),
-        ({"video_budget": 0.2, "min_video_density": 0.3}, "between"),
+        ({"video_budget": 0.2, "min_video_density": 0.3}, "below"),
         ({"adaptive_temperature": 0.0}, "temperature"),
         ({"adaptive_target_mass": 0.0}, "target_mass"),
         ({"density_mode": "unknown"}, "density_mode"),
