@@ -108,6 +108,30 @@ def _categorized_node(node):
     return CategorizedNode
 
 
+def _experimental_node(node):
+    categorized = _categorized_node(node)
+
+    class ExperimentalNode(categorized):
+        @classmethod
+        def define_schema(cls):
+            schema = super().define_schema()
+            display_name = schema.display_name or schema.node_id
+            suffix = ' (Experimental)'
+            if not display_name.endswith(suffix):
+                display_name += suffix
+            if is_dataclass(schema):
+                return replace(schema, display_name=display_name)
+            if hasattr(schema, 'model_copy'):
+                return schema.model_copy(update={'display_name': display_name})
+            schema.display_name = display_name
+            return schema
+
+    ExperimentalNode.__name__ = node.__name__
+    ExperimentalNode.__qualname__ = node.__qualname__
+    ExperimentalNode.__module__ = node.__module__
+    return ExperimentalNode
+
+
 class H3ExtendedExtension(ComfyExtension):
     async def get_node_list(self):
         nodes = []
@@ -132,7 +156,7 @@ class H3ExtendedExtension(ComfyExtension):
             MiniMaxH3DiagnosticsExtension(),
         ):
             nodes.extend(
-                _categorized_node(node)
+                _experimental_node(node)
                 for node in await ext.get_node_list()
             )
         return nodes
