@@ -47,7 +47,10 @@ def main():
                 "reason": "preserves TensorCoreFP8Layout",
                 "chunk_rows": 2048,
             },
-            "sparse": {"video_budget": 0.5},
+            "sparse": {
+                "video_budget": 0.5,
+                "denser_early_late_steps": True,
+            },
         }
     )
     memory = format_memory_status(model)
@@ -60,6 +63,7 @@ def main():
     sparse = format_sparse_status(model)
     check(
         "50.0%" in sparse
+        and "First 2 and last 2 steps add 30 percentage points" in sparse
         and "rounded up to a whole KV-tile count" in sparse
         and "mixed boundary tiles remain dense" in sparse,
         "Sparse status explains requested versus effective density",

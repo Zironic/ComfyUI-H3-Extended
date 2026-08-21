@@ -11,6 +11,9 @@ DENSITY_FIXED = "fixed"
 DENSITY_ADAPTIVE_BUDGET = "adaptive_budget"
 DENSITY_MODES = (DENSITY_FIXED, DENSITY_ADAPTIVE_BUDGET)
 
+DENSER_EARLY_LATE_STEP_COUNT = 2
+DENSER_EARLY_LATE_BONUS = 0.30
+
 
 @dataclass(frozen=True)
 class HybridSparseConfig:
@@ -24,6 +27,7 @@ class HybridSparseConfig:
     max_video_density: float = 0.50
     adaptive_temperature: float = 1.0
     adaptive_target_mass: float = 0.80
+    denser_early_late_steps: bool = False
 
     def __post_init__(self):
         if self.mode not in IMPLEMENTED_MODES:
@@ -74,4 +78,21 @@ class HybridSparseConfig:
             float(self.max_video_density),
             float(self.adaptive_temperature),
             float(self.adaptive_target_mass),
+            bool(self.denser_early_late_steps),
         )
+
+
+def resolve_video_budget(config, step_index, total_steps):
+    budget = float(config.video_budget)
+    if not config.denser_early_late_steps:
+        return budget
+    step_index = int(step_index)
+    total_steps = int(total_steps)
+    if step_index < 0 or total_steps <= 0 or step_index >= total_steps:
+        return budget
+    if (
+        step_index < DENSER_EARLY_LATE_STEP_COUNT
+        or step_index >= total_steps - DENSER_EARLY_LATE_STEP_COUNT
+    ):
+        return min(1.0, budget + DENSER_EARLY_LATE_BONUS)
+    return budget

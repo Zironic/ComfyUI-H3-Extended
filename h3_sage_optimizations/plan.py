@@ -78,6 +78,7 @@ class SparseRequest:
 
     video_budget: float = 0.5
     density_mode: str = DENSITY_FIXED
+    denser_early_late_steps: bool = False
 
     def __post_init__(self):
         budget = float(self.video_budget)
@@ -90,7 +91,11 @@ class SparseRequest:
 
     @property
     def signature(self):
-        return (float(self.video_budget), self.density_mode)
+        return (
+            float(self.video_budget),
+            self.density_mode,
+            bool(self.denser_early_late_steps),
+        )
 
 
 @dataclass(frozen=True)

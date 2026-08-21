@@ -64,12 +64,18 @@ def layout(sequence=384, video_start=128):
     )
 
 
-def options(sequence=384, video_start=128, device=None):
+def options(
+    sequence=384,
+    video_start=128,
+    device=None,
+    step_index=3,
+    total_steps=20,
+):
     token_layout = layout(sequence, video_start)
     snapshot = RuntimeSnapshot(
         request_id=2,
-        step_index=3,
-        total_steps=20,
+        step_index=step_index,
+        total_steps=total_steps,
         sigma=0.5,
         branch=(0,),
         layout=token_layout,
@@ -266,10 +272,18 @@ def test_per_step_timing():
           "step summary includes model-forward timing")
 
 
-def backend(kernel=None, collector=None, budget=0.5):
+def backend(
+    kernel=None,
+    collector=None,
+    budget=0.5,
+    denser_early_late_steps=False,
+):
     kernel = kernel or FakeSparseKernel()
     api = kernel_spec(kernel)
-    config = HybridSparseConfig(video_budget=budget)
+    config = HybridSparseConfig(
+        video_budget=budget,
+        denser_early_late_steps=denser_early_late_steps,
+    )
     return HybridSparseBackend(
         config,
         kernel_spec=api,
@@ -278,6 +292,51 @@ def backend(kernel=None, collector=None, budget=0.5):
         v_preparer=fake_v_preparer,
         qk_quantizer=quantize_qk,
     ), kernel
+
+
+def test_denser_early_late_steps():
+    print("denser early/late sampling steps")
+    hybrid, _ = backend(budget=0.5, denser_early_late_steps=True)
+    q, k, v = fused_hnd()
+    expected = {
+        -1: 0.5,
+        0: 0.8,
+        1: 0.8,
+        2: 0.5,
+        17: 0.5,
+        18: 0.8,
+        19: 0.8,
+    }
+    for step_index, budget in expected.items():
+        prepared = hybrid.prepare(
+            q,
+            k,
+            v,
+            layer_index=0,
+            transformer_options=options(step_index=step_index),
+        )
+        check(
+            abs(
+                prepared.sparse.metadata["requested_video_budget"]
+                - budget
+            )
+            < 1e-9,
+            "step %d resolves to %.0f%% video budget"
+            % (step_index, budget * 100.0),
+        )
+
+    capped, _ = backend(budget=0.85, denser_early_late_steps=True)
+    prepared = capped.prepare(
+        q,
+        k,
+        v,
+        layer_index=0,
+        transformer_options=options(step_index=0),
+    )
+    check(
+        prepared.sparse.metadata["requested_video_budget"] == 1.0,
+        "early/late video budget is capped at 100%",
+    )
 
 
 def test_adaptive_budget_raises_effective_maximum():
@@ -827,6 +886,7 @@ def optional_cuda_numerical():
 def main():
     test_kernel_spec_resolution()
     test_architecture_specific_carriers_and_abis()
+    test_denser_early_late_steps()
     test_adaptive_budget_raises_effective_maximum()
     test_fp8_allocation_oom_retry()
     test_prepare_execute_lifetime()

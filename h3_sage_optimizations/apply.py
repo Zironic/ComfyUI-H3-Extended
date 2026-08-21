@@ -139,6 +139,7 @@ def _resolve_sparse(plan, environment, inventory):
         ),
         video_budget=float(plan.sparse.video_budget),
         density_mode=plan.sparse.density_mode,
+        denser_early_late_steps=bool(plan.sparse.denser_early_late_steps),
         strict=True,
         run_tag="production",
         timing=False,

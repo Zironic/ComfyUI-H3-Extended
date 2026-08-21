@@ -211,13 +211,26 @@ class MiniMaxH3SparseSageAttention(io.ComfyNode):
                         "route while still using the Sparse Sage execution path."
                     ),
                 ),
+                io.Boolean.Input(
+                    "denser_early_late_steps",
+                    display_name="Denser Early/Late steps",
+                    default=False,
+                    tooltip=(
+                        "Add 30 percentage points to the Video KV budget for "
+                        "the first 2 and last 2 sampling steps, capped at 100%."
+                    ),
+                ),
             ],
             outputs=[io.Model.Output()],
         )
 
     @classmethod
     def execute(
-        cls, model, enabled=True, video_budget=0.5
+        cls,
+        model,
+        enabled=True,
+        video_budget=0.5,
+        denser_early_late_steps=False,
     ):
         if not enabled:
             return io.NodeOutput(
@@ -229,7 +242,10 @@ class MiniMaxH3SparseSageAttention(io.ComfyNode):
                 ),
             )
         plan = read_plan(model).with_sparse(
-            SparseRequest(video_budget=float(video_budget))
+            SparseRequest(
+                video_budget=float(video_budget),
+                denser_early_late_steps=bool(denser_early_late_steps),
+            )
         )
         patched = apply_plan(model, plan)
         return io.NodeOutput(

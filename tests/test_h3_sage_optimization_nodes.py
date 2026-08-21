@@ -2,6 +2,8 @@
 
 import os
 import sys
+from types import SimpleNamespace
+from unittest import mock
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
 
@@ -102,7 +104,12 @@ def main():
         "Sparse Sage has a stable production node id",
     )
     check(
-        sparse_ids == ["model", "enabled", "video_budget"],
+        sparse_ids == [
+            "model",
+            "enabled",
+            "video_budget",
+            "denser_early_late_steps",
+        ],
         "Sparse Sage contains no QKV or MLP controls",
     )
     budget = input_by_id(sparse, "video_budget")
@@ -115,6 +122,14 @@ def main():
         and "mixed boundary tiles remain dense" in budget.tooltip
         and "1.0" in budget.tooltip,
         "Sparse budget tooltip explains quantization and dense context",
+    )
+    denser = input_by_id(sparse, "denser_early_late_steps")
+    check(
+        denser.display_name == "Denser Early/Late steps"
+        and denser.default is False
+        and "30 percentage points" in denser.tooltip
+        and "first 2 and last 2" in denser.tooltip,
+        "early/late density toggle is explicit and backward-compatible",
     )
     check(
         "Sparse Sage" in sparse.search_aliases
@@ -138,6 +153,25 @@ def main():
         sparse_out.args[0] is marker
         and "disabled" in sparse_out.ui.value.lower(),
         "disabled Sparse Sage is pass-through with visible status",
+    )
+
+    model = SimpleNamespace(model_options={})
+    patched = SimpleNamespace(model_options={})
+    with mock.patch(
+        "h3_sage_optimizations.nodes.apply_plan",
+        return_value=patched,
+    ) as apply:
+        result = MiniMaxH3SparseSageAttention.execute(
+            model,
+            video_budget=0.5,
+            denser_early_late_steps=True,
+        )
+    request = apply.call_args.args[1].sparse
+    check(
+        result.args[0] is patched
+        and request.video_budget == 0.5
+        and request.denser_early_late_steps is True,
+        "Sparse node carries the enabled early/late policy into its request",
     )
     print("\nall split H3 Sage node tests passed")
 

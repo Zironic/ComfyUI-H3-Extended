@@ -8,6 +8,10 @@ Applies fixed-density Sparse Sage attention only to MiniMax H3. Other model fami
 
 The request is rounded up to a whole KV-tile count, so the effective density depends on the packed video geometry. For example, a requested value of `0.50` may produce a slightly higher actual density when the number of pure-video KV tiles is odd.
 
+## Denser Early/Late steps
+
+Enable **Denser Early/Late steps** to add 30 percentage points to the Video KV budget for the first two and last two sampling steps. The adjusted budget is capped at 1.0; all other steps use the configured Video KV budget.
+
 The following content remains dense regardless of the budget:
 
 - text tokens;

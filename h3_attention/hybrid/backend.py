@@ -4,7 +4,11 @@ from dataclasses import dataclass
 
 import torch
 
-from .config import HybridSparseConfig, MODE_SAGE128_FUSED_QKV
+from .config import (
+    HybridSparseConfig,
+    MODE_SAGE128_FUSED_QKV,
+    resolve_video_budget,
+)
 from .fused_qkv import FusedQKVProjector
 from .router import SparseRouterError, SparseTileRouter
 from .sparse_sage import SparseSageError, SparseSageExecutor, load_sparse_sage_spec
@@ -145,12 +149,17 @@ class HybridSparseBackend:
             )
         total_timing = self.timing.begin("total_hybrid_attention")
         router_timing = self.timing.begin("direct_lut_construction")
+        video_budget = resolve_video_budget(
+            self.config,
+            snapshot.step_index,
+            snapshot.total_steps,
+        )
         try:
             lut, valid_block_num, mask_metadata = self.router.build_lut(
                 q,
                 k,
                 snapshot.layout,
-                self.config.video_budget,
+                video_budget,
             )
         except SparseRouterError as exc:
             self.timing.end(total_timing)
@@ -215,12 +224,17 @@ class HybridSparseBackend:
             )
         total_timing = self.timing.begin("total_hybrid_attention")
         router_timing = self.timing.begin("direct_lut_construction")
+        video_budget = resolve_video_budget(
+            self.config,
+            snapshot.step_index,
+            snapshot.total_steps,
+        )
         try:
             lut, valid_block_num, mask_metadata = self.router.build_lut_from_summaries(
                 projected.q_summary,
                 projected.k_summary,
                 snapshot.layout,
-                self.config.video_budget,
+                video_budget,
             )
         except SparseRouterError as exc:
             self.timing.end(total_timing)
@@ -275,6 +289,9 @@ class HybridSparseBackend:
             "phase": "A",
             "mode": self.config.mode,
             "video_budget": float(self.config.video_budget),
+            "denser_early_late_steps": bool(
+                self.config.denser_early_late_steps
+            ),
             "density_mode": self.config.density_mode,
             "min_video_density": float(self.config.min_video_density),
             "max_video_density": float(self.config.max_video_density),
