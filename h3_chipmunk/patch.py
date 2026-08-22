@@ -28,7 +28,7 @@ def install(model_patcher, config):
         model_patcher.model_options.get("transformer_options", {}).copy()
     )
     runtime = options.get("minimax_h3_runtime_session")
-    chip_session = H3ChipmunkSession()
+    chip_session = H3ChipmunkSession(config)
     listener = H3ChipmunkReportListener(chip_session, config)
     if runtime is None:
         runtime = H3RuntimeSession(
@@ -87,6 +87,8 @@ def install(model_patcher, config):
     options[STATUS_KEY] = {
         "mode": config.mode,
         "top_fraction": float(config.top_fraction),
+        "density_profile": config.density_profile,
+        "profile": [list(item) for item in config.profile],
         "refresh_every": int(config.refresh_every),
         "feature_group": int(config.feature_group),
         "token_group_rows": int(config.token_group_rows),
@@ -94,7 +96,8 @@ def install(model_patcher, config):
         "effective_chunk_rows": int(config.effective_chunk_rows),
         "scope": config.scope,
         "cache_location": config.cache_location,
-        "cache_budget_gb": float(config.cache_budget_gb),
+        "gpu_staging_budget_gb": float(config.cache_budget_gb),
+        "staging_slots": int(config.staging_slots),
         "layer_range": [int(config.layer_start), int(config.layer_stop)],
         "approximate": config.mode == "reference_delta",
         "forbid_device_sync": True,
@@ -102,10 +105,12 @@ def install(model_patcher, config):
     }
     options["minimax_h3_chipmunk_session"] = chip_session
     logging.info(
-        "%s installed: mode=%s top=%.3f refresh=%d group=%d token_group=%d "
-        "chunk=%d effective_chunk=%d scope=%s cache=%s budget=%.1fGiB no_sync=true",
+        "%s installed: mode=%s profile=%s top=%.3f refresh=%d group=%d token_group=%d "
+        "chunk=%d effective_chunk=%d scope=%s cache=%s staging_budget=%.2fGiB "
+        "slots=%d no_sync=true",
         LOG_PREFIX,
         config.mode,
+        config.density_profile,
         config.top_fraction,
         config.refresh_every,
         config.feature_group,
@@ -115,5 +120,6 @@ def install(model_patcher, config):
         config.scope,
         config.cache_location,
         config.cache_budget_gb,
+        config.staging_slots,
     )
     return chip_session

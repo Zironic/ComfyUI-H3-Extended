@@ -2,57 +2,96 @@
 
 Experimental training-free MLP delta acceleration for MiniMax H3.
 
-## Production-node invariant
+## Production invariant
 
-The Comfy model node is **CUDA-only for Chipmunk state**. It does not materialize CUDA diagnostics on the host and it does not support synchronous CPU-backed reference-delta caches.
+All Chipmunk math runs on CUDA. Persistent cache tensors are **storage-only** pinned host buffers used for asynchronous DMA; they are never processed on CPU.
 
-Production execution/reporting must not use `.item()`, `.cpu()`, `.tolist()`, or device-to-host tensor copies. The shared H3 runtime is switched into `forbid_device_sync` mode when Chipmunk is installed; sampler evaluations are counted from the explicit sampler boundary instead of reading sigma values from CUDA.
+The model thread does not materialize CUDA values on the host and does not call device synchronization APIs. H2D and D2H transfers use dedicated CUDA streams plus events. If a transfer is not ready, that chunk runs dense instead of blocking the CPU.
 
-If a future diagnostic requires host materialization, it belongs in a standalone benchmark/offline analysis tool, not in this model node.
+The shared H3 runtime is switched into `forbid_device_sync` mode when Chipmunk is installed, so sampler evaluations are counted from the explicit sampler boundary instead of reading sigma values from CUDA.
+
+## Why the cache is offloaded
+
+A real H3 Chipmunk cache cannot reasonably be persistent in VRAM. For long video sequences the previous raw MLP output plus selected activation state is tens of GiB across the transformer stack.
+
+The production design therefore uses:
+
+```text
+pinned host backing (persistent)
+        ^          |
+        | D2H      | H2D
+        |          v
+2 bounded CUDA staging slots
+        |
+        v
+selected MLP CUDA kernels / dense fallback
+```
+
+With the default H3 geometry, `chunk_rows=2048`, and `depth_safe_v1`, the two staging slots occupy about **0.108 GiB** of VRAM. `cache_budget_gb=1.0` is a hard staging cap, not a request to reserve 1 GiB.
+
+Pinned host buffers are allocated by a background thread as eligible layer/chunk shapes are discovered. The first dense evaluation gives that allocator time to work. If a particular buffer has not finished allocating by the next evaluation, that chunk simply stays dense. Allocated buffers remain warm across later requests with the same geometry.
 
 ## Modes
 
-- `measure`: output-exact dense smoke mode. It performs the normal dense H3 MLP and does **not** collect CUDA-valued selector diagnostics.
-- `reference_delta`: approximate GPU-resident Chipmunk execution. Dense refreshes establish GPU caches; intermediate evaluations recompute selected complete ConvRot-256 SwiGLU groups and apply their old/new `fc2` contribution as a delta to the cached raw MLP output.
-
-`shadow_validate` was removed from the production node after live testing showed that diagnostic observation itself was an unacceptable workload for a real generation path.
+- `measure`: output-exact dense smoke mode. No CUDA-valued diagnostics are collected.
+- `reference_delta`: actual approximate Chipmunk execution. Dense refreshes write state asynchronously to pinned backing; intermediate evaluations JIT-prefetch the state into bounded CUDA slots and apply selected old/new MLP contributions.
 
 ## H3 geometry
 
-H3 uses a bias-free 14,336-wide SwiGLU FFN with TensorWise INT8 ConvRot-256 weights. Chipmunk therefore selects complete 256-neuron logical SwiGLU groups. A selected group recomputes both paired `fc1` gate/value rows and the corresponding `fc2` columns.
+H3 uses a bias-free 14,336-wide SwiGLU FFN with TensorWise INT8 ConvRot-256 weights. Chipmunk selects complete 256-neuron logical groups, recomputing both paired `fc1` gate/value rows and the matching `fc2` columns.
 
-The exact dense runner already prepackages H3 into two equal 7,168-feature ConvRot tiles. The production sparse selector therefore keeps an equal number of groups from each half. This gives fixed rectangular CUDA shapes and lets sparse fc1/fc2 reuse those already-held tiles without reacquiring or restaging model weights.
+The exact dense runner already prepackages H3 into two equal 7,168-feature ConvRot tiles. The sparse selector keeps an equal number of groups from each half, which gives fixed rectangular CUDA shapes and lets selected fc1/fc2 reuse the exact runner's already-held weights without reacquiring or restaging them.
 
-At `top_fraction=0.30`, each 28-group half keeps 9 groups, so the actual active width is 18/56 = **32.14%**.
+## Depth-safe production profile
 
-The selector evaluates `fc1` + SwiGLU on token-group means, compares the current summary to the previous dense refresh summary, and ranks each 256-neuron group by RMS cross-step feature delta. Selection/top-k, activation caches, output caches, and delta updates remain on CUDA.
+The measurement run showed that the earliest blocks have strong delta concentration, but those blocks are also the most destructive place to inject approximation error because every downstream block sees the perturbation. The production profile therefore protects the front of the transformer instead of blindly sparsifying where the selector looks strongest:
 
-## Next real CUDA test
+```text
+layers  0-10: dense
+layers 11-19: 40% requested density  -> 24/56 groups = 42.86% actual
+layers 20-29: 50% requested density  -> 28/56 groups = 50.00% actual
+layers 30-49: 60% requested density  -> 34/56 groups = 60.71% actual
+```
 
-The first measurement showed the strongest concentration in the earliest transformer blocks, so the next test limits approximation to layers 0-9:
+`top_fraction` is used only when `density_profile=uniform`.
+
+## First runnable test
 
 ```text
 mode = reference_delta
-top_fraction = 0.30
+density_profile = depth_safe_v1
 refresh_every = 6
 first_dense_steps = 2
 last_dense_steps = 2
 first_dense_layers = 0
 layer_start = 0
-layer_stop = 10
+layer_stop = 50
 chunk_rows = 2048
 token_group_rows = 128
 scope = target_video
-cache_location = gpu
-cache_budget_gb = 24
+cache_location = async_pinned
+cache_budget_gb = 1.0
 random_groups = 0
 strict = true
 save_report = false
 ```
 
-Layers 10-49 remain dense. This is intentionally conservative: it tests a real approximate video while keeping persistent GPU cache state modest. If quality and runtime behavior are acceptable, the next expansion is `layer_stop=15`.
+Use fixed 20% Hybrid Sparse attention for the first matched test. Keep Activation Memory, shared-block compile, FirstBlockCache, Vector Accel, and profiling diagnostics off so the only new approximation is the MLP delta path.
 
-Use ordinary H3 sampling for the first run. Keep Activation Memory, shared-block compile, FirstBlockCache, Vector Accel, and timing/profiling diagnostics off so the only new variable is the GPU-resident MLP delta path.
+This is not a ten-layer smoke test. It exercises the complete depth policy while keeping persistent VRAM bounded.
+
+## Transfer scheduling
+
+Each block queues cache prefetch roughly two MLP chunks ahead. Two staging slots alternate:
+
+```text
+slot A: current chunk compute -> async D2H store
+slot B: next chunk H2D prefetch
+```
+
+Ordering uses `torch.cuda.Event`, `Stream.wait_event`, and `Stream.wait_stream`. There is no `Event.synchronize`, `Stream.synchronize`, `.item()`, `.cpu()`, `.tolist()`, or blocking CUDA-to-host value materialization in the production Chipmunk modules.
+
+A slot miss, unfinished pinned allocation, or unavailable DMA state never causes the model thread to wait for a CPU operation. The chunk falls back dense and can establish a fresh cache if backing storage is ready.
 
 ## Patch ordering
 
@@ -63,18 +102,10 @@ MODEL
   -> sampler
 ```
 
-Use Chipmunk instead of Activation Memory/shared-block compilation on that model clone. Compatible H3 patches share one runtime session; installing Chipmunk upgrades that session to no-device-sync step tracking.
-
-## Cache policy
-
-Caches are isolated by request, CFG branch, layer, and MLP chunk. `reference_delta` requires `cache_location=gpu`. The previous pageable synchronous CPU cache path is rejected by configuration rather than silently stalling generation.
-
-Before allocating reference-delta state, the executor estimates cache usage from dynamic-token count, enabled layer range, hidden width, and the balanced selected feature width. It raises if the estimate exceeds `cache_budget_gb`.
-
-Dense execution is forced for the configured first/last evaluations, configured always-dense early layers, every `refresh_every` evaluations, and chunks outside the selected scope.
+Use Chipmunk instead of Activation Memory/shared-block compilation on that model clone. Compatible H3 patches share one runtime session; installing Chipmunk upgrades the shared session to no-device-sync step tracking.
 
 ## Current performance boundary
 
-This remains a research implementation using existing Comfy/Comfy-Kitchen ConvRot INT8 operations. It reuses the already-held two-slice ConvRot weights, but selected rows/columns are still gathered with `index_select(...).contiguous()` before calling the existing kernels. There are not yet bespoke fused sparse kernels. Therefore a successful quality test does not imply a wall-clock speedup yet.
+The cache/storage architecture is now representative of something that can actually run under a small VRAM budget. The sparse math is still research-grade: selected ConvRot rows/columns are gathered with `index_select(...).contiguous()` before calling the existing Comfy-Kitchen INT8 kernels.
 
-The next optimization stage, if this CUDA-only quality run is acceptable, is fused group-indexed ConvRot execution that avoids those weight gathers and fuses the old/new selected `fc2` contribution update.
+If the full depth-safe quality test is acceptable, the next optimization is a fused group-indexed ConvRot fc1/fc2 implementation that reads selected groups directly from the held weights and fuses the old/new `fc2` contribution update. That optimization can be done without changing the bounded async cache ABI.

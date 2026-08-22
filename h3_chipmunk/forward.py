@@ -7,7 +7,7 @@ from ..h3_activation_memory.chunks import iter_mod_chunks, validate_mod_segments
 from ..h3_activation_memory.linear import ConvRotTwoSliceMLP
 from ..h3_runtime.context import get_runtime_snapshot
 from ..h3_runtime.timing import timed_stage
-from .executor import run_chipmunk_chunk
+from .executor import run_chipmunk_chunk, prefetch_chipmunk_chunk
 from .selector import logical_swiglu
 
 
@@ -87,9 +87,9 @@ def make_forward(block, layer_index, config, session, original_forward=None):
                 return torch.cat(pieces, dim=-1)
 
             def selected_activation_runner(value, logical_indices):
-                # The balanced selector always emits equal group counts from the
-                # two 7168-wide logical feature tiles. Split by static tensor
-                # shape, never by a CUDA value.
+                # The balanced selector emits equal group counts from the two
+                # 7168-wide logical feature tiles. Split by static tensor shape,
+                # never by a CUDA scalar.
                 half = int(logical_indices.shape[0]) // 2
                 local_indices = (
                     logical_indices[:half].long(),
@@ -141,6 +141,27 @@ def make_forward(block, layer_index, config, session, original_forward=None):
                         result.add_(partial)
                 return result
 
+            def queue_prefetch(index):
+                if index < 0 or index >= len(chunks):
+                    return
+                chunk = chunks[index]
+                prefetch_chipmunk_chunk(
+                    block=block,
+                    layer_index=layer_index,
+                    chunk_index=index,
+                    chunk_start=chunk.start,
+                    chunk_stop=chunk.stop,
+                    snapshot=snapshot,
+                    session=session,
+                    config=config,
+                    device=x.device,
+                )
+
+            # Two staging slots let the transfer stream prepare the next chunk
+            # while the current chunk is running. Nothing here waits on the CPU.
+            queue_prefetch(0)
+            queue_prefetch(1)
+
             for chunk_index, chunk in enumerate(chunks):
                 with timed_stage(transformer_options, "norm2_modulation"):
                     h = block.norm2(x[chunk.start:chunk.stop])
@@ -182,6 +203,9 @@ def make_forward(block, layer_index, config, session, original_forward=None):
                         gate_mlp[chunk.mod_row],
                     )
                 del h, out
+
+                # Refill the slot released by the current chunk two chunks ahead.
+                queue_prefetch(chunk_index + 2)
         finally:
             held.__exit__(None, None, None)
         return x
