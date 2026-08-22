@@ -69,6 +69,19 @@ pre-packed tiles are inherently held, so tiled cases are emitted once per
 chunk regardless of `--held-modes`; production should replace the original
 layout or consume strided tiles rather than retain both copies.
 
+Use `full` in `--chunks` to include the unchunked sequence. For the native
+TensorWise-INT8 ConvRot path, `--profile-native-stages` records the exact fused
+SwiGLU/activation-quantizer and CUTLASS INT8 GEMM/dequant CUDA calls separately.
+The trace fails if Kitchen selects a different path instead of relabeling it:
+
+```powershell
+python custom_nodes/ComfyUI-H3-Extended/benchmarks/benchmark_h3_activation_memory.py `
+  --checkpoint hf_minimax_h3/minimax_h3_fl2va_pruned_int8_convrot.safetensors `
+  --device cuda --dtype bf16 --seq 63448 `
+  --chunks 256,512,768,1024,1536,2048,3072,4096,8192,full `
+  --swiglu-modes native --held-modes on --profile-native-stages
+```
+
 To compare the existing fused ConvRot-INT8 down-projection against Transformer
 Engine delayed-scaling FP8 using the same real `fc2` weight and BF16 reference:
 

@@ -28,6 +28,16 @@ def test_case_parsing_matrix():
     assert cases[-1] == {"chunk_rows": 16384, "swiglu_mode": "native", "held_mode": "on"}
 
 
+def test_chunk_parser_resolves_full_sequence():
+    assert bench.parse_chunks("256,full", full_rows=63448) == (256, 63448)
+    try:
+        bench.parse_chunks("full")
+    except ValueError as exc:
+        assert "sequence row count" in str(exc)
+    else:
+        raise AssertionError("full must require the sequence row count")
+
+
 def test_tiled_cases_are_prepacked_once_per_chunk():
     cases = bench.iter_cases((128,), ("bf16", "tiled_convrot"), ("off", "on"))
     assert cases == (
@@ -325,6 +335,38 @@ def test_tiled_dispatch_with_cpu_fake_convrot():
     assert output.shape == (3, 256)
     assert path == "tiled_convrot"
     assert torch.allclose(output, expected, atol=1e-2, rtol=1e-2)
+
+
+def test_native_convrot_stage_trace_labels_exact_compiled_calls():
+    class FakeEvent:
+        def record(self):
+            pass
+
+        def elapsed_time(self, _other):
+            return 1.25
+
+    class FakeCompiled:
+        def quantize_int8_rowwise_convrot64(self, *_args):
+            return None
+
+        def cutlass_int8_dequant(self, *_args):
+            return True
+
+    compiled = FakeCompiled()
+    trace = bench.NativeConvRotStageTrace(
+        torch.device("cpu"),
+        compiled=compiled,
+        event_factory=FakeEvent,
+        synchronize_fn=lambda: None,
+    )
+    with trace:
+        compiled.quantize_int8_rowwise_convrot64(None, None, None, 256, False, 0)
+        assert compiled.cutlass_int8_dequant()
+        compiled.quantize_int8_rowwise_convrot64(None, None, None, 256, False, 2)
+        assert compiled.cutlass_int8_dequant()
+    summary = trace.summary(expected_chunks=1)
+    assert all(summary[name] == 1.25 for name in bench.NativeConvRotStageTrace.STAGES)
+    assert all(summary["calls"][name] == 1 for name in bench.NativeConvRotStageTrace.STAGES)
 
 
 def test_tiled_metadata_rejects_transposed_and_wrong_format():

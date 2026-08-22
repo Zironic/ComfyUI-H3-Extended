@@ -6,10 +6,14 @@ from .apply import apply_plan
 from .plan import (
     ATTENTION_AUTO,
     ATTENTION_EXISTING,
+    DEFAULT_EDGE_KV,
+    DEFAULT_EDGE_STEPS,
+    DEFAULT_VIDEO_BUDGET,
     FUSED_QKV_AUTO,
     FUSED_QKV_OFF,
     MLP_MEMORY_AUTO,
     MLP_MEMORY_EPILOGUE,
+    MLP_MEMORY_LEGACY_CONVROT_REQUIRED,
     MLP_MEMORY_OFF,
     MemoryRequest,
     SparseRequest,
@@ -149,7 +153,11 @@ class MiniMaxH3SageMemoryOptimizer(io.ComfyNode):
             MemoryRequest(
                 attention=attention,
                 fused_qkv=fused_qkv,
-                mlp_memory=mlp_memory,
+                mlp_memory=(
+                    MLP_MEMORY_LEGACY_CONVROT_REQUIRED
+                    if mlp_memory == MLP_MEMORY_EPILOGUE
+                    else mlp_memory
+                ),
                 chunk_rows=int(chunk_rows),
                 prefer_held_weights=bool(prefer_held_weights),
             )
@@ -254,9 +262,112 @@ class MiniMaxH3SparseSageAttention(io.ComfyNode):
         )
 
 
+class MiniMaxH3SparseSageAttentionAdvanced(io.ComfyNode):
+    """Fixed-density sparse attention with explicit edge-step budgets."""
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="MiniMaxH3SparseSageAttentionAdvancedZi",
+            display_name="MiniMax H3 Sparse Sage Attention Advanced (Zi)",
+            category="model/patch/minimax",
+            description=(
+                "H3 fixed-density sparse attention with independent early, "
+                "middle, and late target-video KV budgets."
+            ),
+            search_aliases=[
+                "H3 sparse advanced",
+                "H3 sparse schedule",
+                "Sparse Sage advanced",
+                "H3 early late KV",
+            ],
+            inputs=[
+                io.Model.Input("model"),
+                io.Boolean.Input("enabled", display_name="Enable", default=True),
+                io.Float.Input(
+                    "video_budget",
+                    display_name="Video KV budget",
+                    default=DEFAULT_VIDEO_BUDGET,
+                    min=0.01,
+                    max=1.0,
+                    step=0.01,
+                ),
+                io.Int.Input(
+                    "early_steps",
+                    display_name="Early steps",
+                    default=DEFAULT_EDGE_STEPS,
+                    min=0,
+                    max=1000,
+                    step=1,
+                ),
+                io.Float.Input(
+                    "early_kv",
+                    display_name="Early KV",
+                    default=DEFAULT_EDGE_KV,
+                    min=0.01,
+                    max=1.0,
+                    step=0.01,
+                ),
+                io.Int.Input(
+                    "late_steps",
+                    display_name="Late steps",
+                    default=DEFAULT_EDGE_STEPS,
+                    min=0,
+                    max=1000,
+                    step=1,
+                ),
+                io.Float.Input(
+                    "late_kv",
+                    display_name="Late KV",
+                    default=DEFAULT_EDGE_KV,
+                    min=0.01,
+                    max=1.0,
+                    step=0.01,
+                ),
+            ],
+            outputs=[io.Model.Output()],
+        )
+
+    @classmethod
+    def execute(
+        cls,
+        model,
+        enabled=True,
+        video_budget=DEFAULT_VIDEO_BUDGET,
+        early_steps=DEFAULT_EDGE_STEPS,
+        early_kv=DEFAULT_EDGE_KV,
+        late_steps=DEFAULT_EDGE_STEPS,
+        late_kv=DEFAULT_EDGE_KV,
+    ):
+        if not enabled:
+            return io.NodeOutput(
+                model,
+                ui=ui.PreviewText(
+                    format_disabled_status(
+                        "MiniMax H3 Sparse Sage Attention Advanced"
+                    )
+                ),
+            )
+        plan = read_plan(model).with_sparse(
+            SparseRequest(
+                video_budget=float(video_budget),
+                early_steps=int(early_steps),
+                early_kv=float(early_kv),
+                late_steps=int(late_steps),
+                late_kv=float(late_kv),
+            )
+        )
+        patched = apply_plan(model, plan)
+        return io.NodeOutput(
+            patched,
+            ui=ui.PreviewText(format_sparse_status(patched)),
+        )
+
+
 class MiniMaxH3SageOptimizationsExtension(ComfyExtension):
     async def get_node_list(self):
         return [
             MiniMaxH3SageMemoryOptimizer,
             MiniMaxH3SparseSageAttention,
+            MiniMaxH3SparseSageAttentionAdvanced,
         ]

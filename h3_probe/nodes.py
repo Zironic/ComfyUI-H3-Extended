@@ -121,6 +121,7 @@ class MiniMaxH3Moba3DProbe(io.ComfyNode):
                 io.Combo.Input("execution_geometry", options=["logical", "sage_sparse"], default="sage_sparse", tooltip="Use sage_sparse for production-like direct 128x64 calibration and the Q-mask sharing sweep; logical retains only the fine per-token router metrics."),
                 io.Int.Input("sage_q_tile", default=128, min=1, max=4096, tooltip="Global packed-sequence Q tile size. SM89 Sparse Sage uses 128."),
                 io.Int.Input("sage_kv_tile", default=64, min=1, max=4096, tooltip="Global packed-sequence KV tile size. SM89 Sparse Sage uses 64."),
+                io.Boolean.Input("capture_router_dynamics", default=True, tooltip="Track lightweight routes on every conditional layer/step. Disable for bounded exact-snapshot experiments."),
             ],
             outputs=[io.Model.Output()],
         )
@@ -131,7 +132,8 @@ class MiniMaxH3Moba3DProbe(io.ComfyNode):
                 video_budgets, include_audio_query, include_text_query,
                 capture_uncond, capture_latent_dynamics=True,
                 capture_attention=True, execution_geometry="sage_sparse",
-                sage_q_tile=128, sage_kv_tile=64) -> io.NodeOutput:
+                sage_q_tile=128, sage_kv_tile=64,
+                capture_router_dynamics=True) -> io.NodeOutput:
         if not enabled:
             return io.NodeOutput(model)
 
@@ -158,6 +160,7 @@ class MiniMaxH3Moba3DProbe(io.ComfyNode):
             execution_geometry=execution_geometry,
             sage_q_tile=sage_q_tile,
             sage_kv_tile=sage_kv_tile,
+            capture_router_dynamics=capture_router_dynamics,
         )
 
         m = model.clone()
@@ -168,9 +171,10 @@ class MiniMaxH3Moba3DProbe(io.ComfyNode):
             comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, "h3_moba3d_probe",
             moba_capture.make_wrapper(session), m.model_options, is_model_options=True)
         logging.info(
-            "[H3 MoBA3D probe] armed: tag=%s exact_layers=%s exact_steps=%s block=%dx%dx%d budgets=%s execution=%s q_tile=%d kv_tile=%d router_dynamics=all_conditional_steps latent_dynamics=%s attention=%s",
+            "[H3 MoBA3D probe] armed: tag=%s exact_layers=%s exact_steps=%s block=%dx%dx%d budgets=%s execution=%s q_tile=%d kv_tile=%d router_dynamics=%s latent_dynamics=%s attention=%s",
             run_tag, layers, steps, block_t, block_h, block_w, video_budgets,
             execution_geometry, sage_q_tile, sage_kv_tile,
+            capture_router_dynamics,
             capture_latent_dynamics, capture_attention,
         )
         return io.NodeOutput(m)

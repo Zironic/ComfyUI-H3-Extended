@@ -16,6 +16,14 @@ class WeightFootprint:
     mandatory_group: str | None
 
     @property
+    def resident_bytes(self):
+        return self.resident_pages * PAGE_SIZE
+
+    @property
+    def pinned_bytes(self):
+        return self.pinned_pages * PAGE_SIZE
+
+    @property
     def resident_unpinned_bytes(self):
         return self.resident_unpinned_pages * PAGE_SIZE
 

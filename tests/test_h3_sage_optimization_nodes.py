@@ -21,6 +21,7 @@ comfy.options.enable_args_parsing()
 from h3_sage_optimizations.nodes import (  # noqa: E402
     MiniMaxH3SageMemoryOptimizer,
     MiniMaxH3SparseSageAttention,
+    MiniMaxH3SparseSageAttentionAdvanced,
 )
 
 
@@ -38,6 +39,7 @@ def main():
     print("split H3 Sage node schemas")
     memory = MiniMaxH3SageMemoryOptimizer.define_schema()
     sparse = MiniMaxH3SparseSageAttention.define_schema()
+    advanced = MiniMaxH3SparseSageAttentionAdvanced.define_schema()
 
     memory_ids = [item.id for item in memory.inputs]
     sparse_ids = [item.id for item in sparse.inputs]
@@ -136,6 +138,20 @@ def main():
         and "Sparge" in sparse.search_aliases,
         "Sparse node publishes search aliases",
     )
+    check(
+        advanced.node_id == "MiniMaxH3SparseSageAttentionAdvancedZi"
+        and [item.id for item in advanced.inputs]
+        == [
+            "model",
+            "enabled",
+            "video_budget",
+            "early_steps",
+            "early_kv",
+            "late_steps",
+            "late_kv",
+        ],
+        "advanced Sparse Sage exposes independent edge budgets",
+    )
 
     marker = object()
     memory_out = MiniMaxH3SageMemoryOptimizer.execute(
@@ -161,6 +177,19 @@ def main():
         "h3_sage_optimizations.nodes.apply_plan",
         return_value=patched,
     ) as apply:
+        MiniMaxH3SageMemoryOptimizer.execute(
+            model,
+            mlp_memory="epilogue_prototype",
+        )
+    request = apply.call_args.args[1].memory
+    check(
+        request.mlp_memory == "legacy_convrot_2slice_required",
+        "saved epilogue workflows map to the production two-slice provider",
+    )
+    with mock.patch(
+        "h3_sage_optimizations.nodes.apply_plan",
+        return_value=patched,
+    ) as apply:
         result = MiniMaxH3SparseSageAttention.execute(
             model,
             video_budget=0.5,
@@ -172,6 +201,29 @@ def main():
         and request.video_budget == 0.5
         and request.denser_early_late_steps is True,
         "Sparse node carries the enabled early/late policy into its request",
+    )
+    with mock.patch(
+        "h3_sage_optimizations.nodes.apply_plan",
+        return_value=patched,
+    ) as apply:
+        MiniMaxH3SparseSageAttentionAdvanced.execute(
+            model,
+            video_budget=0.3,
+            early_steps=3,
+            early_kv=0.6,
+            late_steps=4,
+            late_kv=0.7,
+        )
+    request = apply.call_args.args[1].sparse
+    check(
+        (
+            request.early_steps,
+            request.early_kv,
+            request.late_steps,
+            request.late_kv,
+        )
+        == (3, 0.6, 4, 0.7),
+        "advanced node carries explicit early and late schedules",
     )
     print("\nall split H3 Sage node tests passed")
 

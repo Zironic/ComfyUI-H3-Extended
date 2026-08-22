@@ -70,6 +70,7 @@ NODE_CATEGORIES = {
     "MiniMaxH3MemoryOptimizerZi": "H3-Extender/Model Patches",
     "MiniMaxH3SageMemoryOptimizerZi": "H3-Extender/Model Patches",
     "MiniMaxH3SparseSageAttentionZi": "H3-Extender/Model Patches",
+    "MiniMaxH3SparseSageAttentionAdvancedZi": "H3-Extender/Model Patches",
     "MiniMaxH3SolEngineZi": "H3-Extender/Experiments",
     "MiniMaxH3HybridSparseAttentionZi": "H3-Extender/Compatibility",
     "MiniMaxH3AttentionProbeZi": "H3-Extender/Diagnostics",

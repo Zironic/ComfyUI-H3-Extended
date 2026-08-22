@@ -9,6 +9,12 @@ import torch
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(_HERE))
+sys.path.insert(0, os.path.abspath(os.path.join(_HERE, "..", "..", "..")))
+
+if "--cpu" not in sys.argv:
+    sys.argv.append("--cpu")
+import comfy.options  # noqa: E402
+comfy.options.enable_args_parsing()
 
 from h3_activation_memory.config import (  # noqa: E402
     ActivationMemoryConfig,
@@ -19,13 +25,14 @@ from h3_activation_memory.convrot_epilogue import (  # noqa: E402
     convrot_epilogue_launch_policy,
     convrot_fc1_swiglu,
 )
+from h3_optimizations_dependency import dependency_module  # noqa: E402
 from h3_sage_optimizations.plan import (  # noqa: E402
-    MLP_MEMORY_EPILOGUE,
+    MLP_MEMORY_LEGACY_CONVROT_REQUIRED,
 )
-from h3_sage_optimizations.qkv.providers import (  # noqa: E402
-    MLP_CONVROT_INT8_EPILOGUE,
-    resolve_mlp_provider,
-)
+
+_providers = dependency_module("qkv.providers")
+MLP_CONVROT_INT8_TWO_SLICE = _providers.MLP_CONVROT_INT8_TWO_SLICE
+resolve_mlp_provider = _providers.resolve_mlp_provider
 
 
 def check(value, message):
@@ -52,15 +59,15 @@ class IncompatibleInventory(Inventory):
 
 def test_provider_and_config():
     resolution = resolve_mlp_provider(
-        Inventory(), request=MLP_MEMORY_EPILOGUE
+        Inventory(), request=MLP_MEMORY_LEGACY_CONVROT_REQUIRED
     )
     check(
-        resolution.provider_id == MLP_CONVROT_INT8_EPILOGUE,
-        "explicit prototype request selects the epilogue provider",
+        resolution.provider_id == MLP_CONVROT_INT8_TWO_SLICE,
+        "saved prototype requests migrate to the production two-slice provider",
     )
     check(
-        resolution.activation_mode == MODE_CONVROT_EPILOGUE,
-        "provider selects the dedicated activation-memory mode",
+        resolution.activation_mode == "mlp_chunked_convrot_2slice",
+        "dependency execution no longer selects the retired epilogue prototype",
     )
     config = ActivationMemoryConfig(
         mode=MODE_CONVROT_EPILOGUE,
@@ -74,11 +81,11 @@ def test_provider_and_config():
     try:
         resolve_mlp_provider(
             IncompatibleInventory(),
-            request=MLP_MEMORY_EPILOGUE,
+            request=MLP_MEMORY_LEGACY_CONVROT_REQUIRED,
         )
     except RuntimeError as exc:
         check(
-            "homogeneous ConvRot-256" in str(exc),
+            "required ConvRot two-slice" in str(exc),
             "explicit prototype request fails during format preflight",
         )
     else:

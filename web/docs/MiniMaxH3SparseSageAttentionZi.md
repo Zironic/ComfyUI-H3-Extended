@@ -1,6 +1,9 @@
 # MiniMax H3 Sparse Sage Attention
 
-Applies fixed-density Sparse Sage attention only to MiniMax H3. Other model families pass through unchanged.
+Applies dependency-owned fixed-density sparse attention only to MiniMax H3.
+Other model families pass through unchanged. If Sparse Sage is unavailable, a
+supported NVIDIA runtime tries INT8 Triton sparse attention, then FP8
+FlexAttention, before preserving the resolved dense H3 path.
 
 ## Video KV budget
 
@@ -42,7 +45,8 @@ Memory Optimizer -> Sparse Sage
 Sparse Sage -> Memory Optimizer
 ```
 
-The status text reports the requested budget, selected QKV provider, and any upstream MLP optimization.
+The status text reports the requested budget, actual fallback backend, selected
+QKV provider, and any upstream MLP optimization.
 
 ## Disabled behavior
 

@@ -30,6 +30,7 @@ import run_context  # noqa: E402
 import vram_guard  # noqa: E402
 import weight_footprint  # noqa: E402
 import working_set  # noqa: E402
+from h3_runtime.timing import observing_stages, timed_stage  # noqa: E402
 
 MB = vram_guard.MB
 CUDA = torch.device("cuda:0")
@@ -45,12 +46,25 @@ class FakeGPU:
     """Stands in for the driver: `free` is what mem_get_info reports next."""
 
     def __init__(self, free_mb, recovers_to_mb=None, total_mb=12282,
-                 allocated_mb=8, peak_mb=12):
+                 allocated_mb=8, peak_mb=12, reserved_mb=9000,
+                 backend="native", fraction=1.0):
         self.free = free_mb * MB
         self.total = total_mb * MB
         self.recovers_to = None if recovers_to_mb is None else recovers_to_mb * MB
         self.allocated = allocated_mb * MB
         self.peak = peak_mb * MB
+        self.reserved = reserved_mb * MB
+        self.backend = backend
+        self.fraction = float(fraction)
+        self.fraction_sets = []
+        self.stats = {
+            "num_device_free": 0,
+            "segment.all.freed": 0,
+            "reserved_bytes.all.freed": 0,
+            "num_alloc_retries": 0,
+            "num_ooms": 0,
+            "num_oom_rejections": 0,
+        }
         self.releases = 0
         self.synchronizes = 0
         self.peak_resets = 0
@@ -69,6 +83,16 @@ class FakeGPU:
     def reset_peak(self, device=None):
         self.peak_resets += 1
 
+    def get_fraction(self, device=None):
+        return self.fraction
+
+    def set_fraction(self, fraction, device=None):
+        self.fraction = float(fraction)
+        self.fraction_sets.append(self.fraction)
+
+    def memory_stats(self, device=None):
+        return dict(self.stats)
+
 
 def with_gpu(gpu, fn):
     real_info = torch.cuda.mem_get_info
@@ -79,16 +103,28 @@ def with_gpu(gpu, fn):
     real_reset = torch.cuda.reset_peak_memory_stats
     real_sync = torch.cuda.synchronize
     real_capability = torch.cuda.get_device_capability
+    real_backend = torch.cuda.memory.get_allocator_backend
+    real_get_fraction = torch.cuda.get_per_process_memory_fraction
+    real_set_fraction = torch.cuda.set_per_process_memory_fraction
+    real_stats = torch.cuda.memory_stats
     real_device = comfy.model_management.get_torch_device
+    real_alloc_conf = os.environ.get("PYTORCH_ALLOC_CONF")
+    real_cuda_alloc_conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF")
     torch.cuda.mem_get_info = gpu.mem_get_info
     comfy.model_management.soft_empty_cache = gpu.release
-    torch.cuda.memory_reserved = lambda device=None: 9000 * MB
+    torch.cuda.memory_reserved = lambda device=None: gpu.reserved
     torch.cuda.memory_allocated = lambda device=None: gpu.allocated
     torch.cuda.max_memory_allocated = lambda device=None: gpu.peak
     torch.cuda.reset_peak_memory_stats = gpu.reset_peak
     torch.cuda.synchronize = gpu.synchronize
     torch.cuda.get_device_capability = lambda device=None: (8, 9)
+    torch.cuda.memory.get_allocator_backend = lambda: gpu.backend
+    torch.cuda.get_per_process_memory_fraction = gpu.get_fraction
+    torch.cuda.set_per_process_memory_fraction = gpu.set_fraction
+    torch.cuda.memory_stats = gpu.memory_stats
     comfy.model_management.get_torch_device = lambda: CUDA
+    os.environ["PYTORCH_ALLOC_CONF"] = "backend:%s,garbage_collection_threshold:0.95" % gpu.backend
+    os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)
     try:
         return fn()
     finally:
@@ -100,7 +136,19 @@ def with_gpu(gpu, fn):
         torch.cuda.reset_peak_memory_stats = real_reset
         torch.cuda.synchronize = real_sync
         torch.cuda.get_device_capability = real_capability
+        torch.cuda.memory.get_allocator_backend = real_backend
+        torch.cuda.get_per_process_memory_fraction = real_get_fraction
+        torch.cuda.set_per_process_memory_fraction = real_set_fraction
+        torch.cuda.memory_stats = real_stats
         comfy.model_management.get_torch_device = real_device
+        if real_alloc_conf is None:
+            os.environ.pop("PYTORCH_ALLOC_CONF", None)
+        else:
+            os.environ["PYTORCH_ALLOC_CONF"] = real_alloc_conf
+        if real_cuda_alloc_conf is None:
+            os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)
+        else:
+            os.environ["PYTORCH_CUDA_ALLOC_CONF"] = real_cuda_alloc_conf
 
 
 class FakePatcher:
@@ -226,6 +274,93 @@ def main():
           "a higher observation raises the bound with an allowance")
     working_set.clear_observed()
 
+    print("request-scoped QKV and MLP attribution")
+    gpu = FakeGPU(free_mb=9000, allocated_mb=100)
+
+    def sample_phases():
+        profiler = vram_guard.PhaseMemoryProfiler(CUDA)
+        options = {}
+        with observing_stages(options, profiler):
+            with timed_stage(options, "qkv_proj"):
+                gpu.allocated = 132 * MB
+        gpu.allocated = 140 * MB
+        profiler("mlp_chunk_enter", 0, {"chunk_index": 0})
+        gpu.allocated = 220 * MB
+        profiler("mlp_fc2_ready", 0, {"chunk_index": 0})
+        gpu.allocated = 150 * MB
+        profiler("mlp_chunk_gated", 0, {"chunk_index": 0})
+        return profiler.finish(120 * MB)
+
+    phases = with_gpu(gpu, sample_phases)
+    check(phases.qkv == 32 * MB, "QKV allocation is sampled at the actual projection stage")
+    check(phases.mlp == 80 * MB, "MLP allocation spans the complete live chunk")
+    check(phases.forward == 120 * MB, "the whole-forward peak remains a separate observation")
+
+    print("native allocator GC placement")
+    saved_alloc_conf = os.environ.get("PYTORCH_ALLOC_CONF")
+    saved_cuda_alloc_conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF")
+    os.environ.pop("PYTORCH_ALLOC_CONF", None)
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "backend:native,garbage_collection_threshold:0.93"
+    try:
+        check(vram_guard._gc_threshold() == (0.93, "PYTORCH_CUDA_ALLOC_CONF"),
+              "the legacy allocator-config alias used by this Comfy install is recognized")
+    finally:
+        if saved_alloc_conf is not None:
+            os.environ["PYTORCH_ALLOC_CONF"] = saved_alloc_conf
+        else:
+            os.environ.pop("PYTORCH_ALLOC_CONF", None)
+        if saved_cuda_alloc_conf is not None:
+            os.environ["PYTORCH_CUDA_ALLOC_CONF"] = saved_cuda_alloc_conf
+        else:
+            os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)
+
+    gpu = FakeGPU(free_mb=3000, total_mb=12282, reserved_mb=9000, allocated_mb=8000)
+
+    def exercise_fraction():
+        with vram_guard._native_memory_fraction(CUDA, 800 * MB) as policy:
+            check(gpu.fraction == policy.fraction < 1.0,
+                  "native allocator receives a temporary lower memory fraction")
+            gpu.stats["num_device_free"] += 2
+            gpu.stats["segment.all.freed"] += 2
+            gpu.stats["reserved_bytes.all.freed"] += 256 * MB
+        return policy
+
+    policy = with_gpu(gpu, exercise_fraction)
+    check(abs(policy.gc_target - policy.desired_gc_target) <= 1,
+          "the 0.95 GC coefficient maps to one page ahead of the physical guard")
+    check(gpu.fraction == 1.0 and gpu.fraction_sets[-1] == 1.0,
+          "the previous process memory fraction is restored")
+    check(vram_guard._stats_delta(policy.stats_before, policy.stats_after,
+                                  "num_device_free") == 2,
+          "generic allocator reclamation evidence is captured across the forward")
+
+    async_gpu = FakeGPU(free_mb=3000, backend="cudaMallocAsync")
+
+    def exercise_async():
+        with vram_guard._native_memory_fraction(CUDA, 800 * MB) as async_policy:
+            return async_policy
+
+    async_policy = with_gpu(async_gpu, exercise_async)
+    check(not async_gpu.fraction_sets and async_policy.backend == "cudaMallocAsync",
+          "cudaMallocAsync is diagnosed but never receives native-only fraction control")
+
+    diagnostic = with_gpu(gpu, lambda: "\n".join(vram_guard._memory_diagnostic_lines(
+        CUDA,
+        model_patcher=patcher,
+        guard_bytes=800 * MB,
+        policy=policy,
+        phases=phases,
+    )))
+    check("Other/unattributed card use" in diagnostic and "AIMDO on this device" in diagnostic,
+          "full diagnostic separates residual card use from AIMDO")
+    check("PyTorch H3 QKV observed live delta" in diagnostic and
+          "PyTorch H3 MLP observed live delta" in diagnostic,
+          "full diagnostic includes QKV and MLP observations")
+    check("temporary guarded-forward limit" in diagnostic and "current reserved" in diagnostic,
+          "full diagnostic includes physical limit and native GC pressure")
+    check("no dedicated threshold-GC trigger flag" in diagnostic,
+          "full diagnostic states the limit of PyTorch GC attribution")
+
     print("capacity proof")
     gpu = FakeGPU(free_mb=176, total_mb=256)
     signature, proof = with_gpu(
@@ -323,6 +458,8 @@ def main():
           "conditioning kwargs are forwarded unchanged")
     check(gpu.releases == 1 and gpu.peak_resets == 1,
           "the first signature is proved and observed once")
+    check(len(gpu.fraction_sets) == 2 and gpu.fraction_sets[-1] == 1.0,
+          "the guarded forward restores its temporary PyTorch fraction")
     with_gpu(gpu, lambda: wrapper(apply_model, args))
     check(gpu.releases == 1 and gpu.peak_resets == 1,
           "the same successful signature is not proved again")
@@ -346,6 +483,8 @@ def main():
         ))
     except ValueError:
         pass
+    check(retry_gpu.fraction == 1.0 and retry_gpu.fraction_sets[-1] == 1.0,
+          "a failing forward also restores the previous PyTorch fraction")
     with_gpu(retry_gpu, lambda: retry_wrapper(apply_model, forward_args(text_len=4)))
     check(retry_gpu.releases == 2,
           "a failed first forward is proved again before the signature is trusted")
@@ -402,6 +541,17 @@ def main():
         check(getattr(armed, "_h3_vram_guard", False), "the wrapper is marked as an H3 guard")
     check("model_function_wrapper" not in shared,
           "disarmed on exit, leaving the patcher exactly as it was")
+
+    model, _ = fake_h3_model()
+    sampler_patcher = FakePatcher(model=model)
+    sampler_gpu = FakeGPU(free_mb=11000)
+    with vram_guard.guarded(shared, 800, model_patcher=sampler_patcher):
+        sampler_wrapper = shared["model_function_wrapper"]
+        with_gpu(sampler_gpu, lambda: sampler_wrapper(apply_model, forward_args(text_len=5)))
+    check(sampler_gpu.releases == 1,
+          "a sampler-supplied patcher enables the capacity proof before its first forward")
+    check("model_function_wrapper" not in shared,
+          "the sampler capacity guard is also disarmed on exit")
 
     existing = lambda apply_model, args: "other patch"  # noqa: E731
     shared = {"model_function_wrapper": existing}

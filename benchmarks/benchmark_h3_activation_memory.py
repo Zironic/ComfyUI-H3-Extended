@@ -34,11 +34,26 @@ def dtype_from_name(name):
     return {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[name]
 
 
-def parse_chunks(value):
-    values = tuple(int(item.strip()) for item in str(value).split(",") if item.strip())
-    if not values or any(item <= 0 for item in values):
-        raise ValueError("chunks must contain positive integers")
-    return values
+def parse_chunks(value, full_rows=None):
+    values = []
+    for item in (part.strip() for part in str(value).split(",")):
+        if not item:
+            continue
+        if item.lower() == "full":
+            if full_rows is None:
+                raise ValueError("full chunk size requires the sequence row count")
+            chunk_rows = int(full_rows)
+        else:
+            try:
+                chunk_rows = int(item)
+            except ValueError as exc:
+                raise ValueError("chunks must contain positive integers or full") from exc
+        if chunk_rows <= 0:
+            raise ValueError("chunks must contain positive integers or full")
+        values.append(chunk_rows)
+    if not values:
+        raise ValueError("chunks must contain positive integers or full")
+    return tuple(values)
 
 
 def parse_modes(value, allowed, option):
@@ -372,6 +387,100 @@ def _load_comfy_kitchen():
     return ck
 
 
+class NativeConvRotStageTrace:
+    """Time the exact CUDA calls inside Kitchen's native ConvRot MLP path."""
+
+    QUANTIZER = "quantize_int8_rowwise_convrot64"
+    GEMM = "cutlass_int8_dequant"
+    STAGES = (
+        "mlp_fc1_input_quant_ms",
+        "mlp_fc1_gemm_dequant_ms",
+        "mlp_swiglu_act_quant_ms",
+        "mlp_fc2_gemm_dequant_ms",
+    )
+
+    def __init__(self, device, compiled=None, event_factory=None, synchronize_fn=None):
+        self.device = device
+        self.compiled = compiled
+        self.event_factory = event_factory or (lambda: torch.cuda.Event(enable_timing=True))
+        self.synchronize_fn = synchronize_fn or (lambda: torch.cuda.synchronize(device))
+        self.events = {name: [] for name in self.STAGES}
+        self.pending_gemms = []
+        self.originals = {}
+
+    def _timed(self, stage, fn, *args, **kwargs):
+        started = self.event_factory()
+        finished = self.event_factory()
+        started.record()
+        result = fn(*args, **kwargs)
+        finished.record()
+        self.events[stage].append((started, finished))
+        return result
+
+    def _quantize(self, *args, **kwargs):
+        if len(args) < 6:
+            raise RuntimeError("Kitchen ConvRot quantizer signature changed")
+        input_act_code = int(args[5])
+        if input_act_code == 0:
+            quant_stage = "mlp_fc1_input_quant_ms"
+            gemm_stage = "mlp_fc1_gemm_dequant_ms"
+        elif input_act_code == 2:
+            quant_stage = "mlp_swiglu_act_quant_ms"
+            gemm_stage = "mlp_fc2_gemm_dequant_ms"
+        else:
+            raise RuntimeError("unexpected Kitchen input activation code %d" % input_act_code)
+        self.pending_gemms.append(gemm_stage)
+        return self._timed(quant_stage, self.originals[self.QUANTIZER], *args, **kwargs)
+
+    def _gemm(self, *args, **kwargs):
+        if not self.pending_gemms:
+            raise RuntimeError("Kitchen CUTLASS GEMM ran without a traced quantizer")
+        stage = self.pending_gemms.pop(0)
+        used = self._timed(stage, self.originals[self.GEMM], *args, **kwargs)
+        if not used:
+            raise RuntimeError("Kitchen CUTLASS INT8 GEMM declined the native MLP shape")
+        return used
+
+    def __enter__(self):
+        if self.compiled is None:
+            from comfy_kitchen.backends import cuda as cuda_backend
+
+            self.compiled = cuda_backend._C
+        missing = [name for name in (self.QUANTIZER, self.GEMM) if not hasattr(self.compiled, name)]
+        if missing:
+            raise RuntimeError("Kitchen CUDA backend is missing %s" % ", ".join(missing))
+        self.originals = {
+            self.QUANTIZER: getattr(self.compiled, self.QUANTIZER),
+            self.GEMM: getattr(self.compiled, self.GEMM),
+        }
+        setattr(self.compiled, self.QUANTIZER, self._quantize)
+        setattr(self.compiled, self.GEMM, self._gemm)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        for name, original in self.originals.items():
+            setattr(self.compiled, name, original)
+        return False
+
+    def summary(self, expected_chunks):
+        self.synchronize_fn()
+        if self.pending_gemms:
+            raise RuntimeError("Kitchen stage trace ended with unmatched quantizer calls")
+        counts = {name: len(events) for name, events in self.events.items()}
+        wrong = {name: count for name, count in counts.items() if count != expected_chunks}
+        if wrong:
+            raise RuntimeError(
+                "Kitchen stage trace did not reach every native MLP kernel: expected %d, got %s"
+                % (expected_chunks, wrong)
+            )
+        result = {
+            name: sum(start.elapsed_time(end) for start, end in events)
+            for name, events in self.events.items()
+        }
+        result["calls"] = counts
+        return result
+
+
 def run_tiled_convrot_case(ck, activation, chunk_rows, fc1, fc2, tiles, device, convrot_fn=None):
     """Execute all activation chunks without materializing a full fc1 expansion."""
     output = torch.empty((activation.shape[0], fc2["weight"].shape[0]), device=activation.device, dtype=torch.bfloat16)
@@ -481,6 +590,7 @@ def run_actual_case(
     epilogue_session=None,
     residual=None,
     gate=None,
+    record_stage_timing=True,
 ):
     """Run one actual-weight case; returns output, path, and stage timings."""
     if swiglu_mode == "convrot_epilogue":
@@ -505,27 +615,27 @@ def run_actual_case(
         with HeldMLP(mlp, activation[:1]) as session:
             for start in range(0, activation.shape[0], chunk_rows):
                 stop = min(activation.shape[0], start + chunk_rows)
-                started = time.perf_counter()
-                fc1_start = torch.cuda.Event(enable_timing=True) if device.type == "cuda" else None
-                fc1_end = torch.cuda.Event(enable_timing=True) if device.type == "cuda" else None
+                started = time.perf_counter() if record_stage_timing else None
+                fc1_start = torch.cuda.Event(enable_timing=True) if device.type == "cuda" and record_stage_timing else None
+                fc1_end = torch.cuda.Event(enable_timing=True) if device.type == "cuda" and record_stage_timing else None
                 if fc1_start is not None:
                     fc1_start.record()
                 expanded = session.fc1(activation[start:stop])
                 if fc1_end is not None:
                     fc1_end.record()
                     fc1_events.append((fc1_start, fc1_end))
-                else:
+                elif record_stage_timing:
                     fc1_ms += (time.perf_counter() - started) * 1000
-                started = time.perf_counter()
-                fc2_start = torch.cuda.Event(enable_timing=True) if device.type == "cuda" else None
-                fc2_end = torch.cuda.Event(enable_timing=True) if device.type == "cuda" else None
+                started = time.perf_counter() if record_stage_timing else None
+                fc2_start = torch.cuda.Event(enable_timing=True) if device.type == "cuda" and record_stage_timing else None
+                fc2_end = torch.cuda.Event(enable_timing=True) if device.type == "cuda" and record_stage_timing else None
                 if fc2_start is not None:
                     fc2_start.record()
                 out, path = session.fc2_swiglu(expanded, native=native)
                 if fc2_end is not None:
                     fc2_end.record()
                     fc2_events.append((fc2_start, fc2_end))
-                else:
+                elif record_stage_timing:
                     fc2_ms += (time.perf_counter() - started) * 1000
                 if native and "native" not in path:
                     raise RuntimeError("native SwiGLU silently fell back to %s" % path)
@@ -534,27 +644,27 @@ def run_actual_case(
     else:
         for start in range(0, activation.shape[0], chunk_rows):
             stop = min(activation.shape[0], start + chunk_rows)
-            started = time.perf_counter()
-            fc1_start = torch.cuda.Event(enable_timing=True) if device.type == "cuda" else None
-            fc1_end = torch.cuda.Event(enable_timing=True) if device.type == "cuda" else None
+            started = time.perf_counter() if record_stage_timing else None
+            fc1_start = torch.cuda.Event(enable_timing=True) if device.type == "cuda" and record_stage_timing else None
+            fc1_end = torch.cuda.Event(enable_timing=True) if device.type == "cuda" and record_stage_timing else None
             if fc1_start is not None:
                 fc1_start.record()
             expanded = module_fc1(mlp, activation[start:stop])
             if fc1_end is not None:
                 fc1_end.record()
                 fc1_events.append((fc1_start, fc1_end))
-            else:
+            elif record_stage_timing:
                 fc1_ms += (time.perf_counter() - started) * 1000
-            started = time.perf_counter()
-            fc2_start = torch.cuda.Event(enable_timing=True) if device.type == "cuda" else None
-            fc2_end = torch.cuda.Event(enable_timing=True) if device.type == "cuda" else None
+            started = time.perf_counter() if record_stage_timing else None
+            fc2_start = torch.cuda.Event(enable_timing=True) if device.type == "cuda" and record_stage_timing else None
+            fc2_end = torch.cuda.Event(enable_timing=True) if device.type == "cuda" and record_stage_timing else None
             if fc2_start is not None:
                 fc2_start.record()
             out, path = module_swiglu_fc2(mlp, expanded, native=native)
             if fc2_end is not None:
                 fc2_end.record()
                 fc2_events.append((fc2_start, fc2_end))
-            else:
+            elif record_stage_timing:
                 fc2_ms += (time.perf_counter() - started) * 1000
             if native and "native" not in path:
                 raise RuntimeError("native SwiGLU silently fell back to %s" % path)
@@ -564,7 +674,7 @@ def run_actual_case(
         raise RuntimeError("actual case produced no chunks")
     if any(path != paths[0] for path in paths):
         raise RuntimeError("MLP execution path changed between chunks")
-    if device.type == "cuda":
+    if device.type == "cuda" and record_stage_timing:
         # One synchronization after the complete slab loop; no chunk-level
         # synchronization is introduced by the event timing.
         torch.cuda.synchronize(device)
@@ -632,72 +742,115 @@ def _run_actual_impl(loaded, args, device, dtype, mlp, hidden, ffn, activation, 
         tiled_tiles = prepare_convrot_tiles(
             tiled_fc1, tiled_fc2, getattr(args, "feature_tile_width", DEFAULT_FEATURE_TILE_WIDTH)
         )
+
+    def execute_case(case, record_stage_timing=True):
+        if case["swiglu_mode"] == "tiled_convrot":
+            return run_tiled_convrot_case(
+                tiled_ck, activation, case["chunk_rows"], tiled_fc1, tiled_fc2, tiled_tiles, device
+            )
+        if case["swiglu_mode"] == "convrot_epilogue":
+            return run_actual_case(
+                mlp, activation, case["chunk_rows"], case["swiglu_mode"], case["held_mode"], device,
+                epilogue_session, residual, gate,
+            )
+        return run_actual_case(
+            mlp,
+            activation,
+            case["chunk_rows"],
+            case["swiglu_mode"],
+            case["held_mode"],
+            device,
+            record_stage_timing=record_stage_timing,
+        )
+
+    if args.warmup < 0 or args.iterations <= 0:
+        raise ValueError("warmup must be non-negative and iterations must be positive")
+    if args.profile_native_stages and args.stage_iterations <= 0:
+        raise ValueError("--stage-iterations must be positive")
     rows = []
     for case in iter_cases(
-        parse_chunks(args.chunks),
+        parse_chunks(args.chunks, args.seq),
         swiglu_modes,
         parse_modes(args.held_modes, DEFAULT_HELD_MODES, "--held-modes"),
     ):
-        samples = []
-        stage_fc1 = []
-        stage_fc2 = []
+        sample_events = []
         paths = []
         measured_output = None
-        if device.type == "cuda":
-            torch.cuda.reset_peak_memory_stats(device)
-            baseline_alloc = torch.cuda.memory_allocated(device)
-        else:
-            baseline_alloc = 0
         for _ in range(args.warmup):
-            if case["swiglu_mode"] == "tiled_convrot":
-                out, path, _, _ = run_tiled_convrot_case(
-                    tiled_ck, activation, case["chunk_rows"], tiled_fc1, tiled_fc2, tiled_tiles, device
-                )
-            elif case["swiglu_mode"] == "convrot_epilogue":
-                out, path, _, _ = run_actual_case(
-                    mlp, activation, case["chunk_rows"], case["swiglu_mode"], case["held_mode"], device,
-                    epilogue_session, residual, gate,
-                )
-            else:
-                out, path, _, _ = run_actual_case(mlp, activation, case["chunk_rows"], case["swiglu_mode"], case["held_mode"], device)
+            out, path, _, _ = execute_case(case, record_stage_timing=False)
             del out
         synchronize(device)
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
             baseline_alloc = torch.cuda.memory_allocated(device)
-        for _ in range(args.iterations):
-            started = time.perf_counter()
-            if case["swiglu_mode"] == "tiled_convrot":
-                out, path, fc1_ms, fc2_ms = run_tiled_convrot_case(
-                    tiled_ck, activation, case["chunk_rows"], tiled_fc1, tiled_fc2, tiled_tiles, device
-                )
-            elif case["swiglu_mode"] == "convrot_epilogue":
-                out, path, fc1_ms, fc2_ms = run_actual_case(
-                    mlp, activation, case["chunk_rows"], case["swiglu_mode"], case["held_mode"], device,
-                    epilogue_session, residual, gate,
-                )
+        else:
+            baseline_alloc = 0
+        for iteration in range(args.iterations):
+            total_start = torch.cuda.Event(enable_timing=True) if device.type == "cuda" else None
+            total_end = torch.cuda.Event(enable_timing=True) if device.type == "cuda" else None
+            started = time.perf_counter() if device.type != "cuda" else None
+            if total_start is not None:
+                total_start.record()
+            out, path, _, _ = execute_case(case, record_stage_timing=False)
+            if total_end is not None:
+                total_end.record()
+                sample_events.append((total_start, total_end))
             else:
-                out, path, fc1_ms, fc2_ms = run_actual_case(mlp, activation, case["chunk_rows"], case["swiglu_mode"], case["held_mode"], device)
-            samples.append((time.perf_counter() - started) * 1000)
-            stage_fc1.append(fc1_ms)
-            stage_fc2.append(fc2_ms)
+                sample_events.append((time.perf_counter() - started) * 1000)
             paths.append(path)
-            checksum = sampled_checksum(out)
-            if case["swiglu_mode"] in ("tiled_convrot", "convrot_epilogue") and _ == args.iterations - 1:
+            if iteration == args.iterations - 1:
                 measured_output = out
             else:
                 del out
         synchronize(device)
+        samples = (
+            [start.elapsed_time(end) for start, end in sample_events]
+            if device.type == "cuda"
+            else sample_events
+        )
         if any(path != paths[0] for path in paths):
             raise RuntimeError("MLP execution path changed between iterations")
         peak_allocated = torch.cuda.max_memory_allocated(device) - baseline_alloc if device.type == "cuda" else 0
         peak_reserved = torch.cuda.max_memory_reserved(device) if device.type == "cuda" else 0
+        if measured_output is None:
+            raise RuntimeError("MLP benchmark did not retain a measured output")
+        checksum = sampled_checksum(measured_output)
+        if case["swiglu_mode"] not in ("tiled_convrot", "convrot_epilogue"):
+            del measured_output
+
+        stage_out, stage_path, fc1_ms, fc2_ms = execute_case(case, record_stage_timing=True)
+        del stage_out
+        if stage_path != paths[0]:
+            raise RuntimeError("diagnostic MLP stage path changed from %s to %s" % (paths[0], stage_path))
+
+        native_stage_fields = {}
+        if args.profile_native_stages and case["swiglu_mode"] == "native":
+            chunk_count = (args.seq + case["chunk_rows"] - 1) // case["chunk_rows"]
+            stage_samples = []
+            for _ in range(args.stage_iterations):
+                with NativeConvRotStageTrace(device) as trace:
+                    stage_out, trace_path, _, _ = execute_case(case, record_stage_timing=False)
+                del stage_out
+                if trace_path != paths[0]:
+                    raise RuntimeError("native stage trace path changed from %s to %s" % (paths[0], trace_path))
+                stage_samples.append(trace.summary(chunk_count))
+            native_stage_fields = {
+                "native_stage_trace": {
+                    "measurement_iterations": args.stage_iterations,
+                    "quantizer_cuda_call": NativeConvRotStageTrace.QUANTIZER,
+                    "gemm_cuda_call": NativeConvRotStageTrace.GEMM,
+                    "gemm_contract": "INT8 GEMM plus BF16 dequant epilogue",
+                    "samples": stage_samples,
+                },
+            }
+            for name in NativeConvRotStageTrace.STAGES:
+                values = [sample[name] for sample in stage_samples]
+                native_stage_fields[name + "_mean"] = statistics.mean(values)
+                native_stage_fields[name + "_median"] = statistics.median(values)
         error_metrics = {}
         if case["swiglu_mode"] in ("tiled_convrot", "convrot_epilogue"):
             # Capture the measured peak first; reference/error work is outside
             # timing and must not contaminate the transient allocation report.
-            if measured_output is None:
-                raise RuntimeError("ConvRot benchmark did not retain a measured output")
             delta_sq = 0.0
             reference_sq = 0.0
             max_abs = 0.0
@@ -740,16 +893,22 @@ def _run_actual_impl(loaded, args, device, dtype, mlp, hidden, ffn, activation, 
             del measured_output
         rows.append({
             **case,
+            "chunk_mode": "full" if case["chunk_rows"] >= args.seq else "chunked",
             "total_mlp_ms_mean": statistics.mean(samples),
             "total_mlp_ms_median": statistics.median(samples),
-            "mlp_fc1_ms": statistics.mean(stage_fc1),
-            "mlp_swiglu_fc2_ms": statistics.mean(stage_fc2),
+            "total_mlp_samples_ms": samples,
+            "total_mlp_timing": "enclosing CUDA events" if device.type == "cuda" else "synchronized wall time",
+            "mlp_fc1_ms": fc1_ms,
+            "mlp_swiglu_fc2_ms": fc2_ms,
+            "diagnostic_stage_iterations": 1,
+            "baseline_allocated_bytes": baseline_alloc,
             "peak_allocated_bytes": peak_allocated,
             "transient_peak_allocated_bytes": peak_allocated,
             "peak_reserved_bytes": peak_reserved,
             "checksum": checksum,
             "chunk_count": (args.seq + case["chunk_rows"] - 1) // case["chunk_rows"],
             "execution_path": paths[0],
+            **native_stage_fields,
             **({
                 "feature_tile_width": int(getattr(args, "feature_tile_width", DEFAULT_FEATURE_TILE_WIDTH)),
                 "feature_tile_count": len(tiled_tiles),
@@ -791,7 +950,7 @@ def run_synthetic(args, device, dtype):
 
     baseline = measure(stock, device, args.warmup, args.iterations)
     rows = [{"mode": "full", "chunk_rows": args.seq, **baseline}]
-    for chunk_rows in parse_chunks(args.chunks):
+    for chunk_rows in parse_chunks(args.chunks, args.seq):
         def chunked(chunk_rows=chunk_rows):
             output = torch.empty_like(x)
             for start in range(0, args.seq, chunk_rows):
@@ -824,6 +983,12 @@ def build_parser():
     parser.add_argument("--json", dest="json_path")
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--iterations", type=int, default=3)
+    parser.add_argument(
+        "--profile-native-stages",
+        action="store_true",
+        help="time the exact ConvRot SwiGLU quantizer and CUTLASS fc1/fc2 calls",
+    )
+    parser.add_argument("--stage-iterations", type=int, default=3)
     return parser
 
 

@@ -17,6 +17,12 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(_HERE))
 sys.path.insert(0, os.path.abspath(os.path.join(_HERE, "..", "..", "..")))
 
+import comfy.options  # noqa: E402
+
+comfy.options.enable_args_parsing()
+if "--cpu" not in sys.argv:
+    sys.argv.append("--cpu")
+
 from h3_probe import moba3d, router_characterization as rc  # noqa: E402
 
 
@@ -31,6 +37,8 @@ def layout():
         seq_len=8,
         video_range=(0, 8),
         video_shape=(1, 2, 4),
+        segments=[(0, 8, "video")],
+        audio_t=0,
     )
 
 
@@ -184,12 +192,115 @@ def test_changed_route_is_visible():
           "a planted disjoint route has near-zero sampled Jaccard")
 
 
+def test_precision_teacher_reports_changed_rows():
+    lay = SimpleNamespace(
+        seq_len=128,
+        video_range=(0, 128),
+        video_shape=(1, 8, 16),
+        segments=[(0, 128, "video")],
+        audio_t=0,
+    )
+    metrics = None
+    for seed in range(32):
+        torch.manual_seed(seed)
+        q = torch.randn(1, 2, lay.seq_len, 32, dtype=torch.bfloat16)
+        k = torch.randn_like(q)
+        v = torch.randn_like(q)
+        candidate = rc._direct_tile_calibration(
+            q,
+            k,
+            v,
+            lay,
+            0,
+            lay.seq_len,
+            budgets=(0.5,),
+            head_chunk=1,
+            q_tile=8,
+            kv_tile=4,
+        )[0.5]["router_precision_teacher"]
+        if candidate["changed_route_q_tile_rows"]:
+            metrics = candidate
+            break
+
+    check(metrics is not None,
+          "deterministic BF16 activations contain a precision-sensitive route")
+    check(metrics["summary_arms"]["bf16"].startswith("BF16 pooling"),
+          "BF16 arm pools and scores in BF16")
+    check(metrics["summary_arms"]["fp32"].startswith("FP32 pooling"),
+          "FP32 arm pools and scores in FP32")
+    check(metrics["selected_slot_substitution_fraction"] > 0.0,
+          "route report counts selected-slot substitutions")
+    check(metrics["changed_rows"]["sampled_row_head_count"] > 0,
+          "teacher report isolates sampled rows whose routes changed")
+    check(metrics["arms"]["bf16"]["retained_dense_attention_mass"]["mean"] > 0.0,
+          "BF16 route reports retained dense attention mass")
+    check(metrics["arms"]["fp32"]["sparse_output_rel_l2_by_row"]["p95"] >= 0.0,
+          "FP32 route reports row-level p95 output error")
+    check(metrics["boundary_margin"]["bf16"]["changed"] is not None,
+          "BF16 cutoff margins are split by changed routes")
+
+
+def test_adaptive_teacher_uses_real_luts_and_exact_budget():
+    lay = SimpleNamespace(
+        seq_len=128,
+        video_range=(0, 128),
+        video_shape=(1, 8, 16),
+        segments=[(0, 128, "video")],
+        audio_t=0,
+    )
+    torch.manual_seed(907)
+    q = torch.randn(1, 2, lay.seq_len, 32, dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    metrics = rc._direct_tile_calibration(
+        q,
+        k,
+        v,
+        lay,
+        0,
+        lay.seq_len,
+        budgets=(0.5,),
+        head_chunk=1,
+        q_tile=8,
+        kv_tile=4,
+    )[0.5]["adaptive_teacher"]
+    route = metrics["full_router_call"]
+    sampled = metrics["sampled_teacher_rows"]
+    controls = metrics["sampled_allocation_controls"]
+    check(route["exact_budget_match"],
+          "fixed and adaptive production LUTs preserve the exact full-call budget")
+    check(route["adaptive_k"]["min"] >= 1,
+          "adaptive production LUT reports valid per-row K")
+    check(sampled["fixed"]["micro_relative_l2"] >= 0.0
+          and sampled["adaptive"]["micro_relative_l2"] >= 0.0,
+          "paired dense-teacher arms report micro relative L2")
+    check(sampled["fixed"]["retained_dense_attention_mass"]["p05"] >= 0.0,
+          "paired dense-teacher arms report the retained-mass bottom tail")
+    outcomes = sampled["adaptive_rel_l2_outcomes"]
+    check(abs(outcomes["win_fraction"] + outcomes["tie_fraction"]
+              + outcomes["loss_fraction"] - 1.0) < 1e-6,
+          "paired adaptive outcomes partition wins, ties, and losses")
+    check(metrics["demand_teacher"]["oracle_k95"]["min"] >= 1,
+          "exact dense block mass produces per-row oracle K95")
+    check("spearman_adaptive_k_vs_total_pure_video_attention_mass"
+          in metrics["demand_teacher"],
+          "adaptive K is correlated against absolute video-vs-context mass")
+    check(controls["target_selected_video_tiles"]
+          == controls["output_allocation_control"]["selected_video_tiles"],
+          "sampled output-allocation control repairs to its exact local budget")
+    check(controls["output_allocation_control"]["squared_error"]
+          <= controls["output_allocation_control"]["uniform_fixed_squared_error"] + 1e-8,
+          "sampled output-allocation control is no worse than uniform fixed K")
+
+
 def main():
     print("router characterization")
     test_direct_router_full_budget_is_dense()
     test_wrapped_probe_exposes_direct_calibration()
     test_temporal_reuse_metrics_and_topology_archive()
     test_changed_route_is_visible()
+    test_precision_teacher_reports_changed_rows()
+    test_adaptive_teacher_uses_real_luts_and_exact_budget()
     print("\nall router characterization self-tests passed")
 
 

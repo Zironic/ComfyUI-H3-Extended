@@ -17,17 +17,20 @@ MoBA3D exact-error path remains selective according to the node's ``layers`` and
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import json
 import logging
 import math
 import os
+import weakref
 from dataclasses import dataclass
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 
-from . import capture, latent_dynamics, layout as h3_layout, moba3d, moba_capture, moba_report
+from . import adaptive_teacher, capture, latent_dynamics, layout as h3_layout, moba3d, moba_capture, moba_report
 
 try:
     from ..h3_attention.observer import observing
@@ -42,14 +45,24 @@ _ORIGINAL_ANALYZE_ROUTING = None
 _ORIGINAL_WRITE_RUN = None
 _ORIGINAL_MAKE_WRAPPER = None
 
-# One attention layer is queried several times by the expensive probe.  Keep the
-# latest direct-router summary/score state so all query regions reuse it.
-_DIRECT_STATE_CACHE = None
+# One attention layer is queried several times by the expensive probe. Reuse
+# its summaries only inside that observer call, then release them.
+_DIRECT_STATE_CACHE = contextvars.ContextVar("h3_direct_router_state", default=None)
 
 
-def _mean_pool(x, block):
+@contextlib.contextmanager
+def _direct_state_scope():
+    token = _DIRECT_STATE_CACHE.set({})
+    try:
+        yield
+    finally:
+        _DIRECT_STATE_CACHE.reset(token)
+
+
+def _mean_pool(x, block, dtype):
     """Mean-pool the packed sequence at the requested execution granularity."""
     block = max(1, int(block))
+    x = x.to(dtype=dtype)
     sequence = int(x.shape[-2])
     full = sequence // block
     remainder = sequence % block
@@ -58,11 +71,10 @@ def _mean_pool(x, block):
         pieces.append(
             x[..., : full * block, :]
             .reshape(*x.shape[:-2], full, block, x.shape[-1])
-            .float()
             .mean(dim=-2)
         )
     if remainder:
-        pieces.append(x[..., full * block :, :].float().mean(dim=-2, keepdim=True))
+        pieces.append(x[..., full * block :, :].mean(dim=-2, keepdim=True))
     if not pieces:
         raise ValueError("cannot pool an empty sequence")
     return pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=-2)
@@ -96,8 +108,9 @@ def _geometry(layout, q_tile, kv_tile):
 
 @dataclass
 class _DirectRouterState:
-    q_identity: tuple
-    k_identity: tuple
+    q_ref: weakref.ReferenceType
+    k_ref: weakref.ReferenceType
+    precision: str
     geometry: dict
     q_summary: torch.Tensor
     k_summary: torch.Tensor
@@ -105,30 +118,27 @@ class _DirectRouterState:
     indices_by_budget: dict
 
 
-def _tensor_identity(value):
-    try:
-        ptr = int(value.untyped_storage().data_ptr())
-    except Exception:
-        ptr = id(value)
-    return (ptr, tuple(int(x) for x in value.shape), str(value.device), str(value.dtype))
-
-
-def _prepare_direct_state(q, k, layout, q_tile, kv_tile):
-    global _DIRECT_STATE_CACHE
+def _prepare_direct_state(q, k, layout, q_tile, kv_tile, precision="fp32"):
     geometry = _geometry(layout, q_tile, kv_tile)
-    q_identity = _tensor_identity(q)
-    k_identity = _tensor_identity(k)
-    cached = _DIRECT_STATE_CACHE
+    precision = str(precision).lower()
+    if precision == "bf16":
+        summary_dtype = torch.bfloat16
+    elif precision == "fp32":
+        summary_dtype = torch.float32
+    else:
+        raise ValueError("router summary precision must be bf16 or fp32")
+    cache = _DIRECT_STATE_CACHE.get()
+    cached = None if cache is None else cache.get(precision)
     if (
         cached is not None
-        and cached.q_identity == q_identity
-        and cached.k_identity == k_identity
+        and cached.q_ref() is q
+        and cached.k_ref() is k
         and cached.geometry == geometry
     ):
         return cached
 
-    q_summary = _mean_pool(q, geometry["q_tile"])
-    k_summary = _mean_pool(k, geometry["kv_tile"])
+    q_summary = _mean_pool(q, geometry["q_tile"], summary_dtype)
+    k_summary = _mean_pool(k, geometry["kv_tile"], summary_dtype)
     if geometry["pure_q"] <= 0 or geometry["pure_kv"] <= 0:
         raise ValueError("packed layout has no pure-video execution tiles")
     scores = torch.matmul(
@@ -136,15 +146,17 @@ def _prepare_direct_state(q, k, layout, q_tile, kv_tile):
         k_summary[..., geometry["pure_kv_start"] :, :].transpose(-1, -2),
     )
     cached = _DirectRouterState(
-        q_identity=q_identity,
-        k_identity=k_identity,
+        q_ref=weakref.ref(q),
+        k_ref=weakref.ref(k),
+        precision=precision,
         geometry=geometry,
         q_summary=q_summary,
         k_summary=k_summary,
         scores=scores,
         indices_by_budget={},
     )
-    _DIRECT_STATE_CACHE = cached
+    if cache is not None:
+        cache[precision] = cached
     return cached
 
 
@@ -203,6 +215,75 @@ def _direct_keep_for_query_range(state, selected, qs, qe):
     return tile_keep.index_select(2, kv_tile_ids)
 
 
+def _route_overlap(bf16_indices, fp32_indices):
+    positions = torch.searchsorted(fp32_indices, bf16_indices)
+    positions = positions.clamp_max(fp32_indices.shape[-1] - 1)
+    matches = fp32_indices.gather(-1, positions) == bf16_indices
+    intersection = matches.sum(-1)
+    retained = int(bf16_indices.shape[-1])
+    substitutions = retained - intersection
+    return {
+        "changed_rows": substitutions > 0,
+        "substitutions": substitutions,
+        "jaccard": intersection.float() / (2 * retained - intersection).float(),
+    }
+
+
+def _cutoff_margin(state, target):
+    scores = state.scores.float()
+    candidates = int(scores.shape[-1])
+    if target >= candidates:
+        return None
+    below = torch.kthvalue(scores, candidates - target, dim=-1).values
+    above = torch.kthvalue(scores, candidates - target + 1, dim=-1).values
+    return (above - below).float()
+
+
+def _distribution(values):
+    values = values.float().flatten()
+    if not values.numel():
+        return None
+    return {
+        "mean": float(values.mean()),
+        "p50": float(values.median()),
+        "p95": float(torch.quantile(values, 0.95)),
+        "max": float(values.max()),
+    }
+
+
+def _margin_report(margin, changed_rows):
+    if margin is None:
+        return None
+    margin = margin.detach().cpu()
+    changed_rows = changed_rows.detach().cpu()
+    return {
+        "all": _distribution(margin),
+        "changed": _distribution(margin[changed_rows]),
+        "unchanged": _distribution(margin[~changed_rows]),
+        "zero_fraction": float((margin == 0).float().mean()),
+    }
+
+
+def _arm_report(bucket):
+    retained = torch.cat(bucket["retained"]).float()
+    row_rel_l2 = torch.cat(bucket["row_rel_l2"]).float()
+    row_mean_abs = torch.cat(bucket["row_mean_abs"]).float()
+    head_rel_l2 = torch.cat(bucket["head_rel_l2"]).float()
+    head_mean_abs = torch.cat(bucket["head_mean_abs"]).float()
+    head_max_abs = torch.cat(bucket["head_max_abs"]).float()
+    return {
+        "retained_dense_attention_mass": _distribution(retained),
+        "sparse_output_rel_l2_by_row": _distribution(row_rel_l2),
+        "sparse_output_mean_abs_by_row": _distribution(row_mean_abs),
+        "sparse_output_rel_l2_mean_head": float(head_rel_l2.mean()),
+        "sparse_output_rel_l2_median_head": float(head_rel_l2.median()),
+        "sparse_output_rel_l2_max_head": float(head_rel_l2.max()),
+        "sparse_output_mean_abs_mean_head": float(head_mean_abs.mean()),
+        "sparse_output_max_abs": float(head_max_abs.max()),
+        "worst_heads": moba3d._worst_heads(head_rel_l2),
+    }
+
+
 def _direct_tile_calibration(
     q,
     k,
@@ -216,16 +297,57 @@ def _direct_tile_calibration(
     q_tile,
     kv_tile,
 ):
-    """Exact sparse-output error for the direct production-like tile router."""
-    state = _prepare_direct_state(q, k, layout, q_tile, kv_tile)
+    """Compare BF16 and native-FP32 fixed routes against one dense teacher."""
+    states = {
+        "bf16": _prepare_direct_state(q, k, layout, q_tile, kv_tile, "bf16"),
+        "fp32": _prepare_direct_state(q, k, layout, q_tile, kv_tile, "fp32"),
+    }
     budgets = tuple(float(x) for x in moba3d.parse_budgets(budgets))
+    adaptive_experiment = adaptive_teacher.AdaptiveTeacherExperiment(
+        q,
+        k,
+        layout,
+        qs,
+        qe,
+        budgets,
+        q_tile=q_tile,
+        kv_tile=kv_tile,
+    )
     scale = float(q.shape[-1]) ** -0.5
     heads = int(q.shape[1])
     head_chunk = max(1, int(head_chunk))
-    accum = {
-        frac: {"density": [], "rel_l2": [], "mean_abs": [], "max_abs": []}
-        for frac in budgets
-    }
+    accum = {}
+    for frac in budgets:
+        selected = {}
+        target = None
+        for precision, state in states.items():
+            selected[precision], arm_target = _selected_indices(state, frac)
+            target = arm_target if target is None else target
+            if arm_target != target:
+                raise RuntimeError("router precision arms resolved different budgets")
+        overlap = _route_overlap(selected["bf16"], selected["fp32"])
+        accum[frac] = {
+            "selected": selected,
+            "target": target,
+            "overlap": overlap,
+            "sampled_rows": 0,
+            "sampled_changed_rows": 0,
+            "arms": {
+                precision: {
+                    "retained": [],
+                    "density": [],
+                    "row_rel_l2": [],
+                    "row_mean_abs": [],
+                    "head_rel_l2": [],
+                    "head_mean_abs": [],
+                    "head_max_abs": [],
+                    "changed_retained": [],
+                    "changed_row_rel_l2": [],
+                    "changed_row_mean_abs": [],
+                }
+                for precision in states
+            },
+        }
 
     for h0 in range(0, heads, head_chunk):
         h1 = min(heads, h0 + head_chunk)
@@ -234,47 +356,127 @@ def _direct_tile_calibration(
         vh = v[0, h0:h1].float()
         probs = torch.softmax(torch.matmul(qh, kh.transpose(-1, -2)) * scale, dim=-1)
         dense_out = torch.matmul(probs, vh)
+        adaptive_experiment.observe(h0, h1, probs, dense_out, vh)
 
-        for frac in budgets:
-            selected, _target = _selected_indices(state, frac)
-            keep = _direct_keep_for_query_range(
-                state,
-                selected[:, h0:h1],
-                qs,
-                qe,
-            )
-            _mass, sparse_out = moba3d._renormalized_masked_output(probs, vh, keep)
-            rel_l2, mean_abs, max_abs = moba3d._per_head_error(sparse_out, dense_out)
-            bucket = accum[frac]
-            bucket["density"].append(keep.float().mean(-1).detach().cpu())
-            bucket["rel_l2"].append(rel_l2.detach().cpu())
-            bucket["mean_abs"].append(mean_abs.detach().cpu())
-            bucket["max_abs"].append(max_abs.detach().cpu())
+        for frac, bucket in accum.items():
+            geometry = states["fp32"].geometry
+            q_global = torch.arange(qs, qe, device=q.device)
+            sparse = q_global // geometry["q_tile"] >= geometry["pure_q_start"]
+            changed = torch.zeros(h1 - h0, qe - qs, dtype=torch.bool, device=q.device)
+            if bool(sparse.any()):
+                positions = torch.nonzero(sparse, as_tuple=False).flatten()
+                route_rows = q_global[positions] // geometry["q_tile"] - geometry["pure_q_start"]
+                changed[:, positions] = bucket["overlap"]["changed_rows"][0, h0:h1].index_select(1, route_rows)
+            bucket["sampled_rows"] += changed.numel()
+            bucket["sampled_changed_rows"] += int(changed.sum())
+
+            for precision, state in states.items():
+                keep = _direct_keep_for_query_range(
+                    state,
+                    bucket["selected"][precision][:, h0:h1],
+                    qs,
+                    qe,
+                )
+                retained, sparse_out = moba3d._renormalized_masked_output(probs, vh, keep)
+                rel_l2, mean_abs, max_abs = moba3d._per_head_error(sparse_out, dense_out)
+                diff = sparse_out - dense_out
+                row_rel_l2 = torch.linalg.vector_norm(diff, dim=-1) / torch.linalg.vector_norm(
+                    dense_out, dim=-1
+                ).clamp_min(1e-12)
+                row_mean_abs = diff.abs().mean(-1)
+                arm = bucket["arms"][precision]
+                arm["retained"].append(retained.detach().cpu().flatten())
+                arm["density"].append(keep.float().mean(-1).detach().cpu().flatten())
+                arm["row_rel_l2"].append(row_rel_l2.detach().cpu().flatten())
+                arm["row_mean_abs"].append(row_mean_abs.detach().cpu().flatten())
+                arm["head_rel_l2"].append(rel_l2.detach().cpu())
+                arm["head_mean_abs"].append(mean_abs.detach().cpu())
+                arm["head_max_abs"].append(max_abs.detach().cpu())
+                if bool(changed.any()):
+                    arm["changed_retained"].append(retained[changed].detach().cpu())
+                    arm["changed_row_rel_l2"].append(row_rel_l2[changed].detach().cpu())
+                    arm["changed_row_mean_abs"].append(row_mean_abs[changed].detach().cpu())
 
     result = {}
-    for frac in budgets:
+    adaptive_reports = adaptive_experiment.finalize()
+    for frac, bucket in accum.items():
+        target = bucket["target"]
+        overlap = bucket["overlap"]
+        changed_rows = overlap["changed_rows"]
+        substitutions = overlap["substitutions"]
+        arm_reports = {
+            precision: _arm_report(arm)
+            for precision, arm in bucket["arms"].items()
+        }
+        changed_report = None
+        if bucket["sampled_changed_rows"]:
+            bf16_arm = bucket["arms"]["bf16"]
+            fp32_arm = bucket["arms"]["fp32"]
+            bf16_mass = torch.cat(bf16_arm["changed_retained"]).float()
+            fp32_mass = torch.cat(fp32_arm["changed_retained"]).float()
+            bf16_rel = torch.cat(bf16_arm["changed_row_rel_l2"]).float()
+            fp32_rel = torch.cat(fp32_arm["changed_row_rel_l2"]).float()
+            bf16_mae = torch.cat(bf16_arm["changed_row_mean_abs"]).float()
+            fp32_mae = torch.cat(fp32_arm["changed_row_mean_abs"]).float()
+            changed_report = {
+                "sampled_row_head_count": int(bucket["sampled_changed_rows"]),
+                "retained_mass_delta_fp32_minus_bf16": _distribution(fp32_mass - bf16_mass),
+                "rel_l2_delta_fp32_minus_bf16": _distribution(fp32_rel - bf16_rel),
+                "mean_abs_delta_fp32_minus_bf16": _distribution(fp32_mae - bf16_mae),
+                "fp32_retained_mass_win_fraction": float((fp32_mass > bf16_mass).float().mean()),
+                "fp32_rel_l2_win_fraction": float((fp32_rel < bf16_rel).float().mean()),
+                "fp32_mean_abs_win_fraction": float((fp32_mae < bf16_mae).float().mean()),
+            }
+        route_rows = int(changed_rows.numel())
+        changed_route_rows = int(changed_rows.sum())
+        changed_substitutions = substitutions[changed_rows].float()
+        fp32_report = arm_reports["fp32"]
+        fp32_arm = bucket["arms"]["fp32"]
+        density = torch.cat(fp32_arm["density"]).float()
+        head_rel_l2 = torch.cat(fp32_arm["head_rel_l2"]).float()
         bucket = accum[frac]
-        density = torch.cat(bucket["density"], dim=0)
-        rel_l2 = torch.cat(bucket["rel_l2"], dim=0)
-        mean_abs = torch.cat(bucket["mean_abs"], dim=0)
-        max_abs = torch.cat(bucket["max_abs"], dim=0)
-        selected, target = _selected_indices(state, frac)
         result[frac] = {
             "direct_tile_keep_video_kv_tiles": int(target),
-            "direct_tile_video_kv_tiles": int(state.geometry["pure_kv"]),
-            "direct_tile_video_density": float(target / state.geometry["pure_kv"]),
+            "direct_tile_video_kv_tiles": int(states["fp32"].geometry["pure_kv"]),
+            "direct_tile_video_density": float(target / states["fp32"].geometry["pure_kv"]),
             "direct_tile_effective_token_density_mean": float(density.mean()),
             "direct_tile_effective_token_density_max": float(density.max()),
-            "direct_tile_sparse_output_rel_l2_mean_head": float(rel_l2.mean()),
-            "direct_tile_sparse_output_rel_l2_median_head": float(rel_l2.median()),
-            "direct_tile_sparse_output_rel_l2_max_head": float(rel_l2.max()),
-            "direct_tile_sparse_output_mean_abs_mean_head": float(mean_abs.mean()),
-            "direct_tile_sparse_output_max_abs": float(max_abs.max()),
-            "direct_tile_head_rel_l2": [float(x) for x in rel_l2.tolist()],
-            "direct_tile_q_tile": int(state.geometry["q_tile"]),
-            "direct_tile_kv_tile": int(state.geometry["kv_tile"]),
+            "direct_tile_sparse_output_rel_l2_mean_head": fp32_report["sparse_output_rel_l2_mean_head"],
+            "direct_tile_sparse_output_rel_l2_median_head": fp32_report["sparse_output_rel_l2_median_head"],
+            "direct_tile_sparse_output_rel_l2_max_head": fp32_report["sparse_output_rel_l2_max_head"],
+            "direct_tile_sparse_output_mean_abs_mean_head": fp32_report["sparse_output_mean_abs_mean_head"],
+            "direct_tile_sparse_output_max_abs": fp32_report["sparse_output_max_abs"],
+            "direct_tile_head_rel_l2": [float(x) for x in head_rel_l2.tolist()],
+            "direct_tile_q_tile": int(states["fp32"].geometry["q_tile"]),
+            "direct_tile_kv_tile": int(states["fp32"].geometry["kv_tile"]),
+            "router_precision_teacher": {
+                "summary_arms": {
+                    "bf16": "BF16 pooling and BF16 score matmul",
+                    "fp32": "FP32 pooling and FP32 score matmul",
+                },
+                "route_q_tile_rows": route_rows,
+                "changed_route_q_tile_rows": changed_route_rows,
+                "changed_route_q_tile_row_fraction": float(changed_route_rows / route_rows),
+                "selected_slot_substitution_fraction": float(substitutions.float().sum() / (route_rows * target)),
+                "substitutions_per_changed_route_row_mean": (
+                    float(changed_substitutions.mean()) if changed_substitutions.numel() else 0.0
+                ),
+                "route_jaccard_mean": float(overlap["jaccard"].float().mean()),
+                "sampled_row_head_count": int(bucket["sampled_rows"]),
+                "sampled_changed_row_head_fraction": float(
+                    bucket["sampled_changed_rows"] / bucket["sampled_rows"]
+                ),
+                "boundary_margin": {
+                    precision: _margin_report(
+                        _cutoff_margin(state, target), changed_rows
+                    )
+                    for precision, state in states.items()
+                },
+                "arms": arm_reports,
+                "changed_rows": changed_report,
+            },
+            "adaptive_teacher": adaptive_reports[frac],
         }
-        del selected
     return result
 
 
@@ -534,7 +736,8 @@ class _CombinedForwardProbe:
                 )
 
         if self.snapshot is not None:
-            self.snapshot.observe(q, k, v, layer_index=layer)
+            with _direct_state_scope():
+                self.snapshot.observe(q, k, v, layer_index=layer)
 
 
 def _make_wrapper_with_router_dynamics(session):
@@ -585,7 +788,7 @@ def _make_wrapper_with_router_dynamics(session):
                     budget=DEFAULT_DYNAMICS_BUDGET,
                     topology_q_samples=DEFAULT_TOPOLOGY_Q_SAMPLES,
                 )
-                if run.capture_attention
+                if run.capture_attention and run.capture_router_dynamics
                 else None
             )
             run.notes.update(
@@ -595,14 +798,20 @@ def _make_wrapper_with_router_dynamics(session):
                     "mode": (
                         "latent-dynamics-only"
                         if not run.capture_attention
-                        else "MoBA exact snapshots + direct-tile router dynamics"
+                        else (
+                            "MoBA exact snapshots + direct-tile router dynamics"
+                            if run.capture_router_dynamics
+                            else "MoBA exact snapshots + router precision teacher"
+                        )
                     ),
                     "latent_dynamics": bool(run.capture_latent_dynamics),
                     "capture_attention": bool(run.capture_attention),
                     "execution_geometry": run.execution_geometry,
                     "sage_q_tile": int(run.sage_q_tile),
                     "sage_kv_tile": int(run.sage_kv_tile),
-                    "router_dynamics": bool(run.capture_attention),
+                    "router_dynamics": bool(
+                        run.capture_attention and run.capture_router_dynamics
+                    ),
                     "router_dynamics_budget": float(DEFAULT_DYNAMICS_BUDGET),
                     "router_dynamics_steps": "all conditional denoising evaluations",
                     "router_dynamics_layers": "all observed H3 attention layers",
@@ -612,14 +821,23 @@ def _make_wrapper_with_router_dynamics(session):
                     "anchor_frames": list(run.anchor_frames),
                 }
             )
-            logging.info(
-                "[H3 MoBA3D probe] router dynamics armed: all steps/layers budget=%.0f%% q=%d kv=%d; exact snapshots layers=%s steps=%s",
-                100.0 * DEFAULT_DYNAMICS_BUDGET,
-                run.sage_q_tile,
-                run.sage_kv_tile,
-                sorted(run.layers),
-                sorted(run.steps),
-            )
+            if run.capture_router_dynamics:
+                logging.info(
+                    "[H3 MoBA3D probe] router dynamics armed: all steps/layers budget=%.0f%% q=%d kv=%d; exact snapshots layers=%s steps=%s",
+                    100.0 * DEFAULT_DYNAMICS_BUDGET,
+                    run.sage_q_tile,
+                    run.sage_kv_tile,
+                    sorted(run.layers),
+                    sorted(run.steps),
+                )
+            else:
+                logging.info(
+                    "[H3 MoBA3D probe] bounded exact snapshots armed: layers=%s steps=%s q=%d kv=%d",
+                    sorted(run.layers),
+                    sorted(run.steps),
+                    run.sage_q_tile,
+                    run.sage_kv_tile,
+                )
 
         if not run.capture_attention:
             return executor(*args, **kwargs)

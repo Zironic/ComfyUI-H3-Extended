@@ -9,6 +9,7 @@ _DOCS = os.path.join(_ROOT, "web", "docs")
 EXPECTED = {
     "MiniMaxH3SageMemoryOptimizerZi.md": "Format and carrier distinction",
     "MiniMaxH3SparseSageAttentionZi.md": "Video KV budget",
+    "MiniMaxH3SparseSageAttentionAdvancedZi.md": "Sparse schedule",
     "MiniMaxH3HybridSparseAttentionZi.md": "Deprecated Compatibility",
 }
 

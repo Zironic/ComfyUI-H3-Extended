@@ -38,10 +38,7 @@ try:
         SparseRequest,
         read_plan,
     )
-    from ..h3_sage_optimizations.qkv import (
-        inspect_h3_linears,
-        resolve_qkv_provider,
-    )
+    from ..h3_optimizations_dependency import dependency_module
     from ..h3_sage_optimizations.status import (
         format_disabled_status,
         format_legacy_status,
@@ -78,16 +75,15 @@ except ImportError:
         SparseRequest,
         read_plan,
     )
-    from h3_sage_optimizations.qkv import (
-        inspect_h3_linears,
-        resolve_qkv_provider,
-    )
+    from h3_optimizations_dependency import dependency_module
     from h3_sage_optimizations.status import (
         format_disabled_status,
         format_legacy_status,
     )
 
 ATTENTION_HYBRID = "hybrid_sparse"
+inspect_h3_linears = dependency_module("qkv.formats").inspect_h3_linears
+resolve_qkv_provider = dependency_module("qkv.providers").resolve_qkv_provider
 
 
 def _output_root():
@@ -148,6 +144,7 @@ def _memory_request(mode, activation, strict, chunk_rows):
         mlp_memory=mlp_memory,
         chunk_rows=int(chunk_rows),
         prefer_held_weights=True,
+        mlp_strict=bool(strict),
     )
 
 
@@ -158,7 +155,6 @@ def _resolve_adaptive_mode(model, mode, environment, kernel_spec):
         inspect_h3_linears(get_h3_blocks(model)),
         request=FUSED_QKV_AUTO,
         backend_kind="sparse_sage",
-        capability=environment.capability,
         triton_available=TRITON_AVAILABLE,
         sparse_spec=kernel_spec,
     )

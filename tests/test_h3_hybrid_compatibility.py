@@ -95,7 +95,6 @@ def main():
     check(
         kwargs["request"] == FUSED_QKV_AUTO
         and kwargs["backend_kind"] == "sparse_sage"
-        and kwargs["capability"] == (8, 9)
         and kwargs["sparse_spec"] is kernel_spec,
         "adaptive auto passes the actual Sparse Sage environment to the resolver",
     )
@@ -157,6 +156,10 @@ def main():
     check(
         plan.memory.mlp_memory == MLP_MEMORY_LEGACY_NATIVE,
         "legacy native MLP mode is preserved internally",
+    )
+    check(
+        plan.memory.mlp_strict is True,
+        "legacy strictness is preserved by the dependency request",
     )
     check(
         plan.sparse.video_budget == 0.4,

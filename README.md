@@ -10,6 +10,22 @@ Forked at ComfyUI v0.30.1, including the local `raw_latent_t` addition on
 The AV sigma-shift node requires ComfyUI v0.31.0 or newer for
 `ModelSamplingAV` support.
 
+## Dependency
+
+Install `H3-Optimizations` beside this pack under `custom_nodes`. It is the
+single implementation of the production H3 memory, QKV, Sparse Sage fallback,
+FP8, V-layout, and fixed-density routing paths used by the `(Zi)` adapters:
+
+```text
+custom_nodes/
+  ComfyUI-H3-Extended/
+  H3-Optimizations/
+```
+
+Both custom-node packs may remain enabled. Their public node ids are distinct,
+and the adapter loader reuses one canonical Python package instance so chained
+nodes share one immutable optimization plan.
+
 ## Nodes
 
 Node ids and display names carry a `Zi` suffix so both these and the stock nodes
@@ -26,6 +42,9 @@ can be loaded at the same time:
 | `MiniMaxH3Ref2VExperimentHarnessZi` | MiniMax H3 Ref2V Experiment Harness (Zi) |
 | `MiniMaxH3MaskedRef2VCacheZi` | MiniMax H3 Masked Ref2V Cache (Zi) |
 | `MiniMaxH3HybridSparseAttentionZi` | MiniMax H3 Hybrid Sparse Attention (Zi) |
+| `MiniMaxH3SageMemoryOptimizerZi` | MiniMax H3 Sage Memory Optimizer (Zi) |
+| `MiniMaxH3SparseSageAttentionZi` | MiniMax H3 Sparse Sage Attention (Zi) |
+| `MiniMaxH3SparseSageAttentionAdvancedZi` | MiniMax H3 Sparse Sage Attention Advanced (Zi) |
 | `MiniMaxH3SamplerSchedulerZi` | MiniMax H3 Sampler + Scheduler (Zi) |
 | `MiniMaxH3VectorAccelSamplerZi` | MiniMax H3 Vector Accel Sampler (Zi) |
 
@@ -141,11 +160,17 @@ attention.
 
 ## Hybrid sparse attention
 
-`MiniMaxH3HybridSparseAttentionZi` is the production Sparse Sage experiment. It
-routes at the selected architecture's query/KV tile geometry and retains the
-configured fraction of pure target-video KV tiles per head. Text, references,
-audio, mixed boundary tiles, and non-video Q tiles remain dense. Reports are written to
-`output/h3_hybrid_sparse/<run_tag>_<timestamp>/`.
+`MiniMaxH3SageMemoryOptimizerZi`, `MiniMaxH3SparseSageAttentionZi`, and
+`MiniMaxH3SparseSageAttentionAdvancedZi` are adapters over the production
+`H3-Optimizations` plan. They preserve the existing `(Zi)` workflow contracts
+while inheriting its current Kitchen/chunked QKV, alternative-checkpoint, INT8
+Triton and FP8 Flex fallback, V-layout, and bounded MLP behavior. The advanced
+node exposes independent early and late step windows.
+
+`MiniMaxH3HybridSparseAttentionZi` remains as a deprecated compatibility node.
+Fixed density uses the same dependency plan. Its H3-Extended-owned
+`adaptive_budget` path remains available for saved workflows and writes reports
+to `output/h3_hybrid_sparse/<run_tag>_<timestamp>/`.
 
 The `timing` input defaults to enabled. On CUDA it records deferred event pairs
 for each executed DiT block and its activation/MLP stages, attention
@@ -163,11 +188,11 @@ graph. Per-stage CUDA events are omitted inside that graph; `total_dit_block`
 is measured around each invocation. CUDA graph capture is disabled for this
 path so every AIMDO lifecycle and custom-kernel call executes normally.
 
-The production Memory Optimizer and newly created deprecated Hybrid adapters
-default QKV projection to `auto`. This selects fused QKV only for compatible
-ConvRot-256 TensorWise-INT8 H3 weights on SM89 with Triton and the 128Q/64KV
-Sparse Sage ABI; every failed gate falls back to standard H3 QKV. Explicit
-saved `sage128` and `sage128_fused_qkv` values retain their former behavior.
+The production Memory Optimizer and deprecated Hybrid adapter default QKV
+projection to `auto`. Provider selection validates the checkpoint format and
+the complete active backend ABI. Explicit saved `sage128` and
+`sage128_fused_qkv` values remain accepted; a failed automatic gate preserves
+standard QKV rather than disabling sparse attention.
 
 Sparse Sage requires `spas_sage_attn` compiled for the active device and
 resolves its architecture contract at preflight: SM80/86/87 use 128Q/64KV
@@ -517,6 +542,25 @@ monitor still runs before every DiT forward, releases cached blocks and rechecks
 before cancelling. With the captured model it credits only verified resident,
 unpinned pages from that model. The preview-only route has no patcher, so its checks
 around sampling and the 2.26 GiB preview decoder use raw physical free VRAM.
+
+When PyTorch reports the `native` allocator and
+`garbage_collection_threshold` is configured between 0 and 1, each guarded DiT
+forward temporarily lowers PyTorch's per-process memory fraction. The resulting
+native-GC trigger is placed one 32 MiB AIMDO page before the physical-free guard
+floor after accounting for current non-PyTorch residency. A stricter existing
+fraction is preserved, live allocations can force a less exact placement, and
+the previous fraction is restored in `finally`. `cudaMallocAsync` and other
+backends are diagnosed but never receive this native-only control.
+
+The first successful forward for a signature, every guard trip/recovery/cancel,
+and any guarded forward that frees allocator segments prints a full memory
+diagnostic. It includes physical used/free, native-reported AIMDO usage and exact
+current-model VBAR residency, residual other/unattributed card use, PyTorch
+allocated/reserved/cache, the process limit versus physical VRAM, native-GC
+pressure, and request-scoped QKV/MLP live-allocation deltas. QKV, MLP, and the
+whole-forward peak are transient observations and are not additive. PyTorch has
+no dedicated threshold-GC-trigger flag, so segment/device-free deltas are printed
+as generic reclamation evidence rather than claimed as proof of automatic GC.
 
 The check runs *before* the forward, so the allocation that would have OOM'd
 never happens.

@@ -7,7 +7,7 @@ import os
 
 import numpy as np
 
-from . import latent_dynamics
+from . import latent_dynamics, static_layer_teacher
 
 
 def _pct(x):
@@ -455,6 +455,9 @@ def write_run(run, arrays=True):
         return None
     os.makedirs(run.out_dir, exist_ok=True)
     summary = summarize(run.records)
+    layer_teacher = static_layer_teacher.summarize(
+        run.records, expected_layers=sorted(run.layers)
+    )
     dynamics_summary = latent_dynamics.summarize_dynamics(
         getattr(run, "latent_dynamics", ()), run.records
     )
@@ -479,30 +482,34 @@ def write_run(run, arrays=True):
             raw["index"] = np.asarray(indices, dtype=np.int64)
             raw["step"] = np.asarray(steps, dtype=np.int64)
             np.savez_compressed(os.path.join(run.out_dir, "latent_dynamics.npz"), **raw)
+    payload = {
+        "tag": run.tag,
+        "layout": run.layout.as_dict() if run.layout else None,
+        "layers": sorted(run.layers),
+        "steps": sorted(run.steps),
+        "block_shape": [run.block_t, run.block_h, run.block_w],
+        "budgets": list(run.budgets),
+        "execution_geometry": getattr(run, "execution_geometry", "logical"),
+        "sage_q_tile": int(getattr(run, "sage_q_tile", 128)),
+        "sage_kv_tile": int(getattr(run, "sage_kv_tile", 64)),
+        "notes": run.notes,
+        "capture_attention": bool(getattr(run, "capture_attention", True)),
+        "summary": summary,
+        "static_layer_teacher": layer_teacher,
+        "dynamics_summary": dynamics_summary,
+        "latent_dynamics": list(getattr(run, "latent_dynamics", ())),
+        "records": run.records,
+    }
     with open(
         os.path.join(run.out_dir, "moba3d_summary.json"),
         "w",
         encoding="utf-8",
     ) as f:
-        json.dump(
-            {
-                "tag": run.tag,
-                "layout": run.layout.as_dict() if run.layout else None,
-                "layers": sorted(run.layers),
-                "steps": sorted(run.steps),
-                "block_shape": [run.block_t, run.block_h, run.block_w],
-                "budgets": list(run.budgets),
-                "execution_geometry": getattr(run, "execution_geometry", "logical"),
-                "sage_q_tile": int(getattr(run, "sage_q_tile", 128)),
-                "sage_kv_tile": int(getattr(run, "sage_kv_tile", 64)),
-                "notes": run.notes,
-                "capture_attention": bool(getattr(run, "capture_attention", True)),
-                "summary": summary,
-                "dynamics_summary": dynamics_summary,
-                "latent_dynamics": list(getattr(run, "latent_dynamics", ())),
-                "records": run.records,
-            },
-            f,
-            indent=2,
-        )
+        json.dump(payload, f, indent=2)
+    with open(
+        os.path.join(run.out_dir, "static_layer_teacher.json"),
+        "w",
+        encoding="utf-8",
+    ) as f:
+        json.dump(layer_teacher, f, indent=2)
     return report_path

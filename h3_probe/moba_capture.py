@@ -32,6 +32,7 @@ class MobaProbeRun:
         self.capture_uncond = session.capture_uncond
         self.capture_latent_dynamics = session.capture_latent_dynamics
         self.capture_attention = session.capture_attention
+        self.capture_router_dynamics = session.capture_router_dynamics
         self.block_t = session.block_t
         self.block_h = session.block_h
         self.block_w = session.block_w
@@ -74,6 +75,7 @@ class MobaProbeSession:
         execution_geometry="logical",
         sage_q_tile=128,
         sage_kv_tile=64,
+        capture_router_dynamics=True,
     ):
         self.tag = tag
         self.layers_spec = layers_spec
@@ -96,6 +98,7 @@ class MobaProbeSession:
             raise ValueError("execution_geometry must be logical or sage_sparse")
         self.sage_q_tile = max(1, int(sage_q_tile))
         self.sage_kv_tile = max(1, int(sage_kv_tile))
+        self.capture_router_dynamics = bool(capture_router_dynamics)
         self.run = None
 
     def begin(self):

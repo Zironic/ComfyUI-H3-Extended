@@ -2,24 +2,29 @@
 
 Applies memory and execution optimizations only to MiniMax H3. Other model families pass through unchanged.
 
-The node inspects the actual QKV, `fc1`, and `fc2` weight layouts and selects a validated provider. It does not convert an FP8, BF16, NVFP4, or other checkpoint into ConvRot INT8 merely because a specialized kernel exists.
+The node is a compatibility adapter over `H3-Optimizations`. It inspects the
+actual QKV, `fc1`, and `fc2` weight layouts and selects a validated provider.
+ConvRot INT8 keeps its specialized paths, FP8 uses held FP8 execution, ordinary
+BF16/FP16 may use accelerated FP8 conversion, and unsupported quantized formats
+preserve upstream Comfy execution.
 
 ## Main controls
 
 - **QKV projection optimization**
-  - `auto` (default): use a fused QKV provider only when the checkpoint format, GPU, and resolved attention backend are compatible; otherwise use standard H3 QKV.
+  - `auto` (default): use a chunked QKV provider only when the checkpoint format and resolved backend's complete producer/consumer contract are compatible; otherwise use standard H3 QKV.
   - `off`: always use standard H3 QKV.
 - **MLP memory optimization**
-  - `auto`: use ConvRot two-slice execution when compatible; otherwise use generic token chunking through the checkpoint's existing Comfy linear format.
-  - `epilogue_prototype`: opt into the experimental ConvRot `fc1+SwiGLU` and `fc2+gated-residual` kernels.
+  - `auto`: use ConvRot two-slice, held FP8, converted FP8, or bounded floating execution according to the validated checkpoint and runtime capabilities.
+  - `epilogue_prototype`: accepted for saved workflows and migrated to the production ConvRot two-slice path.
   - `off`: leave the H3 MLP forward unchanged.
 
-The status text shown after execution reports the selected attention backend, QKV provider, MLP provider, and fallback reason.
+The status text reports the selected attention backend, V-layout shim, QKV and
+MLP providers, chunk sizes, and fallback reasons.
 
 ## Advanced controls
 
 - **Dense attention when Sparse is absent**
-  - `auto`: select the prepared dense Sage backend supported by the current GPU.
+  - `auto`: select ComfyUI's public `comfy_kitchen_int8` backend when available.
   - `existing`: preserve the incoming dense attention implementation.
   - This setting is ignored when the Sparse Sage node is also present.
 - **MLP chunk rows**: maximum token rows in one MLP chunk. Larger chunks may be faster but require more activation memory.
